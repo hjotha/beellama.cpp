@@ -2,6 +2,7 @@
 
 #include "build-info.h"
 #include "common.h"
+#include "gguf.h"
 #include "log.h"
 #include "download.h"
 #include "file-lock.h"
@@ -9,18 +10,32 @@
 #include "json.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <future>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <regex>
+#include <unordered_map>
 #include <unordered_set>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "http.h"
+
+#ifdef _WIN32
+#include <io.h>
+#include <fcntl.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 #ifndef __EMSCRIPTEN__
 #ifdef __linux__
@@ -171,6 +186,314 @@ public:
     ProgressBar(const ProgressBar &) = delete;
     ProgressBar & operator=(const ProgressBar &) = delete;
 };
+
+// resolve redirects manually so parallel Range workers can hit the final CDN URL directly
+// and never leak Authorization: Bearer across origins.
+struct common_resolved_remote_file {
+    std::string final_url;
+    std::string etag;
+    size_t      total_size = 0;
+    bool        supports_ranges = false;
+    bool        same_origin = true;
+    int         status = -1;
+};
+
+static bool pwrite_all_fd(int fd, const void * data, size_t len, size_t offset) {
+#ifdef _WIN32
+    static std::mutex win_io_mtx;
+    std::lock_guard<std::mutex> lock(win_io_mtx);
+    if (_lseeki64(fd, static_cast<__int64>(offset), SEEK_SET) < 0) {
+        return false;
+    }
+    const char * p = static_cast<const char *>(data);
+    size_t rem = len;
+    while (rem > 0) {
+        int n = _write(fd, p, static_cast<unsigned int>(std::min<size_t>(rem, size_t(1) << 30)));
+        if (n <= 0) {
+            return false;
+        }
+        p += n;
+        rem -= static_cast<size_t>(n);
+    }
+    return true;
+#else
+    const char * p = static_cast<const char *>(data);
+    size_t rem = len;
+    size_t off = offset;
+    while (rem > 0) {
+        ssize_t n = ::pwrite(fd, p, rem, static_cast<off_t>(off));
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        if (n == 0) {
+            return false;
+        }
+        p   += static_cast<size_t>(n);
+        off += static_cast<size_t>(n);
+        rem -= static_cast<size_t>(n);
+    }
+    return true;
+#endif
+}
+
+static bool ftruncate_fd(int fd, size_t size) {
+#ifdef _WIN32
+    return _chsize_s(fd, static_cast<__int64>(size)) == 0;
+#else
+    return ::ftruncate(fd, static_cast<off_t>(size)) == 0;
+#endif
+}
+
+static int open_rw_fd(const std::string & path) {
+#ifdef _WIN32
+    return _open(path.c_str(), _O_CREAT | _O_RDWR | _O_BINARY, 0644);
+#else
+    return ::open(path.c_str(), O_CREAT | O_RDWR, 0644);
+#endif
+}
+
+static void close_rw_fd(int & fd) {
+    if (fd >= 0) {
+#ifdef _WIN32
+        _close(fd);
+#else
+        ::close(fd);
+#endif
+        fd = -1;
+    }
+}
+
+static httplib::Headers build_common_headers(const common_download_opts & opts, bool include_auth) {
+    httplib::Headers headers;
+    for (const auto & h : opts.headers) {
+        headers.emplace(h.first, h.second);
+    }
+    if (headers.find("User-Agent") == headers.end()) {
+        headers.emplace("User-Agent", "llama-cpp/" + std::string(llama_build_info()));
+    }
+    if (include_auth && !opts.bearer_token.empty()) {
+        headers.emplace("Authorization", "Bearer " + opts.bearer_token);
+    }
+    return headers;
+}
+
+static bool common_resolve_remote_file(
+        const std::string & url,
+        const common_download_opts & opts,
+        common_resolved_remote_file & out) {
+    const common_http_url initial_parts = common_http_parse_url(url);
+    std::string cur_url = url;
+    out = {};
+
+    for (int hop = 0; hop < 8; ++hop) {
+        auto [cli, parts] = common_http_client(cur_url);
+        cli.set_follow_location(false);
+        const bool same_origin = (parts.host == initial_parts.host && parts.port == initial_parts.port);
+        httplib::Headers hdrs = build_common_headers(opts, same_origin);
+
+        auto res = cli.Head(parts.path, hdrs);
+        if (!res) {
+            out.status = -1;
+            return false;
+        }
+        out.status = res->status;
+
+        if ((res->status == 301 || res->status == 302 || res->status == 303 || res->status == 307 || res->status == 308) &&
+            res->has_header("Location")) {
+            std::string loc = res->get_header_value("Location");
+            if (!loc.empty() && loc[0] == '/') {
+                cur_url = parts.scheme + "://" + common_http_format_host(parts.host) + ":" + std::to_string(parts.port) + loc;
+            } else {
+                cur_url = loc;
+            }
+            continue;
+        }
+
+        if (res->status >= 200 && res->status < 300) {
+            out.final_url = cur_url;
+            out.same_origin = same_origin;
+            if (res->has_header("ETag")) {
+                out.etag = res->get_header_value("ETag");
+            }
+            if (res->has_header("Content-Length")) {
+                try {
+                    out.total_size = std::stoull(res->get_header_value("Content-Length"));
+                } catch (...) {}
+            }
+            if (res->has_header("Accept-Ranges")) {
+                out.supports_ranges = res->get_header_value("Accept-Ranges") != "none";
+            }
+            return true;
+        }
+
+        // Some S3/CDN backends disallow HEAD or require Range GET 0-0
+        httplib::Headers rhdrs = hdrs;
+        rhdrs.emplace("Range", "bytes=0-0");
+        auto gres = cli.Get(parts.path, rhdrs, [](const char *, size_t) { return true; });
+        if (gres && (gres->status == 301 || gres->status == 302 || gres->status == 303 || gres->status == 307 || gres->status == 308) &&
+            gres->has_header("Location")) {
+            std::string loc = gres->get_header_value("Location");
+            if (!loc.empty() && loc[0] == '/') {
+                cur_url = parts.scheme + "://" + common_http_format_host(parts.host) + ":" + std::to_string(parts.port) + loc;
+            } else {
+                cur_url = loc;
+            }
+            continue;
+        }
+        if (gres && (gres->status == 206 || gres->status == 200)) {
+            out.status = gres->status;
+            out.final_url = cur_url;
+            out.same_origin = same_origin;
+            if (gres->has_header("ETag")) {
+                out.etag = gres->get_header_value("ETag");
+            }
+            if (gres->status == 206 && gres->has_header("Content-Range")) {
+                std::string cr = gres->get_header_value("Content-Range");
+                auto slash = cr.rfind('/');
+                if (slash != std::string::npos) {
+                    try {
+                        out.total_size = std::stoull(cr.substr(slash + 1));
+                        out.supports_ranges = true;
+                    } catch (...) {}
+                }
+            } else if (gres->has_header("Content-Length")) {
+                try {
+                    out.total_size = std::stoull(gres->get_header_value("Content-Length"));
+                } catch (...) {}
+            }
+            return true;
+        }
+        return false;
+    }
+    return false;
+}
+
+static bool http_fetch_range_into(
+        httplib::Client & cli,
+        const std::string & req_path,
+        const httplib::Headers & base_hdrs,
+        size_t offset,
+        size_t len,
+        uint8_t * dst,
+        size_t * out_received) {
+    httplib::Headers hdrs = base_hdrs;
+    hdrs.emplace("Range", "bytes=" + std::to_string(offset) + "-" + std::to_string(offset + len - 1));
+    size_t received = 0;
+    bool overflow = false;
+    int status = -1;
+    auto res = cli.Get(req_path, hdrs,
+        [&](const httplib::Response & resp) {
+            status = resp.status;
+            return resp.status == 206 || (offset == 0 && resp.status == 200);
+        },
+        [&](const char * data, size_t n) {
+            if (received + n > len) {
+                overflow = true;
+                return false;
+            }
+            std::memcpy(dst + received, data, n);
+            received += n;
+            return true;
+        });
+    if (out_received) {
+        *out_received = received;
+    }
+    if (!res || overflow || (status != 206 && !(offset == 0 && status == 200)) || received != len) {
+        LOG_WRN("%s: failed url_path=%s offset=%zu len=%zu status=%d received=%zu overflow=%d err=%s\n",
+                __func__, req_path.c_str(), offset, len, status, received, (int)overflow,
+                res ? "none" : httplib::to_string(res.error()).c_str());
+        return false;
+    }
+    return true;
+}
+
+static bool common_pull_file_parallel(
+        const common_resolved_remote_file & resolved,
+        const common_download_opts & opts,
+        const std::string & path_tmp,
+        common_download_progress & p) {
+    const size_t total = resolved.total_size;
+    if (!resolved.supports_ranges || total < size_t(16) * 1024 * 1024 || opts.n_threads <= 1) {
+        return false;
+    }
+    int fd = open_rw_fd(path_tmp);
+    if (fd < 0) {
+        return false;
+    }
+    if (!ftruncate_fd(fd, total)) {
+        close_rw_fd(fd);
+        return false;
+    }
+
+    const size_t chunk_sz = size_t(8) * 1024 * 1024;
+    const size_t n_chunks = (total + chunk_sz - 1) / chunk_sz;
+    const int n_workers = std::min<int>(std::max(2, opts.n_threads), static_cast<int>(std::min<size_t>(n_chunks, 32)));
+
+    std::atomic<size_t> next_chunk{0};
+    std::atomic<size_t> done_bytes{0};
+    std::atomic<bool> failed{false};
+    std::mutex cb_mtx;
+
+    auto parts = common_http_parse_url(resolved.final_url);
+    httplib::Headers base_hdrs = build_common_headers(opts, resolved.same_origin);
+
+    std::vector<std::thread> threads;
+    threads.reserve(n_workers);
+    for (int w = 0; w < n_workers; ++w) {
+        threads.emplace_back([&]() {
+            std::vector<uint8_t> buf(chunk_sz);
+            auto [cli, _] = common_http_client(resolved.final_url);
+            cli.set_follow_location(false);
+            cli.set_keep_alive(true);
+            cli.set_read_timeout(60, 0);
+            while (!failed.load(std::memory_order_relaxed)) {
+                if (opts.callback && opts.callback->is_cancelled()) {
+                    failed.store(true, std::memory_order_relaxed);
+                    break;
+                }
+                const size_t idx = next_chunk.fetch_add(1, std::memory_order_relaxed);
+                if (idx >= n_chunks) {
+                    break;
+                }
+                const size_t off = idx * chunk_sz;
+                const size_t len = std::min(chunk_sz, total - off);
+                bool ok = false;
+                for (int attempt = 0; attempt < 4; ++attempt) {
+                    if (attempt > 0) {
+                        std::this_thread::sleep_for(std::chrono::seconds(1 << (attempt - 1)));
+                        auto [fresh_cli, __] = common_http_client(resolved.final_url);
+                        fresh_cli.set_follow_location(false);
+                        fresh_cli.set_keep_alive(true);
+                        fresh_cli.set_read_timeout(60, 0);
+                        cli = std::move(fresh_cli);
+                    }
+                    if (http_fetch_range_into(cli, parts.path, base_hdrs, off, len, buf.data(), nullptr)) {
+                        ok = true;
+                        break;
+                    }
+                }
+                if (!ok || !pwrite_all_fd(fd, buf.data(), len, off)) {
+                    failed.store(true, std::memory_order_relaxed);
+                    break;
+                }
+                const size_t cur_done = done_bytes.fetch_add(len, std::memory_order_relaxed) + len;
+                if (opts.callback) {
+                    std::lock_guard<std::mutex> lock(cb_mtx);
+                    p.downloaded = cur_done;
+                    opts.callback->on_update(p);
+                }
+            }
+        });
+    }
+    for (auto & t : threads) {
+        t.join();
+    }
+    close_rw_fd(fd);
+    return !failed.load();
+}
 
 static bool common_pull_file(httplib::Client & cli,
                              const std::string & resolve_path,
@@ -439,6 +762,30 @@ static int common_download_file_single_online(const std::string & url,
         LOG_DBG("%s: downloading from %s to %s (etag:%s)...\n",
                 __func__, common_http_show_masked_url(parts).c_str(),
                 path_temporary.c_str(), etag.c_str());
+
+        if (existing_size == 0 && supports_ranges && opts.n_threads > 1 && p.total >= size_t(16) * 1024 * 1024) {
+            common_resolved_remote_file resolved;
+            if (common_resolve_remote_file(url, opts, resolved) &&
+                resolved.supports_ranges && resolved.total_size >= size_t(16) * 1024 * 1024 &&
+                common_pull_file_parallel(resolved, opts, path_temporary, p)) {
+                if (std::rename(path_temporary.c_str(), path.c_str()) != 0) {
+                    LOG_ERR("%s: unable to rename file: %s to %s\n", __func__, path_temporary.c_str(), path.c_str());
+                    break;
+                }
+                if (!etag.empty() && !skip_etag) {
+                    write_etag(path, etag);
+                    remove((path_temporary + ".etag").c_str());
+                }
+                success = true;
+                break;
+            }
+            if (opts.callback && opts.callback->is_cancelled()) {
+                break;
+            }
+            LOG_WRN("%s: parallel range download failed, falling back to single-stream\n", __func__);
+            remove(path_temporary.c_str());
+            p.downloaded = 0;
+        }
 
         if (common_pull_file(cli, parts.path, path_temporary, supports_ranges, p, opts.callback)) {
             if (std::rename(path_temporary.c_str(), path.c_str()) != 0) {
@@ -1219,4 +1566,524 @@ bool common_download_remove_sidecars(const std::string & hf_repo_with_tag, const
     }
 
     return remove_snapshot_entries(common_download_split_repo_tag(hf_repo_with_tag).first, to_remove);
+}
+
+//
+// Direct HTTP Range -> VRAM streaming (+ Disk Tee)
+//
+
+namespace {
+
+struct stream_file_state {
+    common_download_task        task;
+    common_resolved_remote_file resolved;
+    std::string                 temp_path;
+    std::string                 lock_path;
+    std::unique_ptr<common_file_lock> lock;
+    int                         fd = -1;
+    size_t                      header_end = 0;
+};
+
+struct stream_session {
+    common_download_stream_opts              opts;
+    std::vector<std::unique_ptr<stream_file_state>> files;
+    bool                                     consumed = false;
+};
+
+struct bg_write_item {
+    int fd = -1;
+    size_t offset = 0;
+    std::vector<uint8_t> data;
+};
+
+std::mutex g_stream_mtx;
+std::unordered_map<std::string, std::shared_ptr<stream_session>> g_stream_sessions;
+std::vector<std::thread> g_bg_threads;
+
+static void finalize_stream_file(stream_file_state & fs, enum common_hf_stream_disk_mode disk_mode) {
+    close_rw_fd(fs.fd);
+    bool renamed_ok = false;
+    if (disk_mode == COMMON_HF_STREAM_DISK_NONE) {
+        std::error_code ec;
+        std::filesystem::remove(std::filesystem::u8path(fs.temp_path), ec);
+    } else {
+        if (std::rename(fs.temp_path.c_str(), fs.task.local_path.c_str()) != 0) {
+            LOG_ERR("%s: unable to rename streamed file '%s' -> '%s'\n",
+                    __func__, fs.temp_path.c_str(), fs.task.local_path.c_str());
+        } else {
+            if (!fs.task.is_hf && !fs.resolved.etag.empty()) {
+                write_etag(fs.task.local_path, fs.resolved.etag);
+            }
+            renamed_ok = true;
+        }
+        std::error_code ec;
+        std::filesystem::remove(std::filesystem::u8path(fs.temp_path + ".etag"), ec);
+    }
+    // Release stream lock before invoking on_done(), because HF finalization acquires the same lock file.
+    if (fs.lock) {
+        fs.lock->close();
+        fs.lock.reset();
+    }
+    if (renamed_ok && fs.task.on_done) {
+        fs.task.on_done();
+    }
+}
+
+} // namespace
+
+void common_download_wait_background() {
+    std::vector<std::thread> to_join;
+    {
+        std::lock_guard<std::mutex> lock(g_stream_mtx);
+        to_join.swap(g_bg_threads);
+    }
+    for (auto & t : to_join) {
+        if (t.joinable()) {
+            t.join();
+        }
+    }
+}
+
+static bool probe_gguf_data_offset(const std::string & path, size_t & out_offset) {
+    struct ggml_context * ggml_ctx = nullptr;
+    struct gguf_init_params params = {
+        /*.no_alloc = */ true,
+        /*.ctx      = */ &ggml_ctx,
+    };
+    struct gguf_context * gctx = gguf_init_from_file(path.c_str(), params);
+    if (!gctx) {
+        if (ggml_ctx) {
+            ggml_free(ggml_ctx);
+        }
+        return false;
+    }
+    out_offset = gguf_get_data_offset(gctx);
+    gguf_free(gctx);
+    if (ggml_ctx) {
+        ggml_free(ggml_ctx);
+    }
+    return true;
+}
+
+bool common_download_prepare_stream(
+        const std::vector<common_download_task> & tasks,
+        const common_download_stream_opts & opts,
+        std::vector<std::string> & out_paths) {
+    common_download_wait_background();
+    out_paths.clear();
+    if (tasks.empty()) {
+        return false;
+    }
+
+    auto sess = std::make_shared<stream_session>();
+    sess->opts = opts;
+    if (sess->opts.n_threads < 1) {
+        sess->opts.n_threads = 1;
+    }
+    if (sess->opts.chunk_bytes < 1024 * 1024) {
+        sess->opts.chunk_bytes = 1024 * 1024;
+    }
+
+    auto cleanup_on_abort = [&]() {
+        for (auto & fs : sess->files) {
+            if (!fs) {
+                continue;
+            }
+            close_rw_fd(fs->fd);
+            std::error_code ec;
+            std::filesystem::remove(std::filesystem::u8path(fs->temp_path), ec);
+            if (fs->lock) {
+                fs->lock->close();
+                fs->lock.reset();
+            }
+        }
+    };
+
+    for (const auto & task : tasks) {
+        if (task.url.empty() || task.local_path.empty() || task.opts.offline) {
+            cleanup_on_abort();
+            return false;
+        }
+        // If already cached on disk (local blob or finalized HF snapshot), do not stream from network.
+        if (std::filesystem::exists(std::filesystem::u8path(task.local_path)) ||
+            (!task.alt_path.empty() && std::filesystem::exists(std::filesystem::u8path(task.alt_path)))) {
+            cleanup_on_abort();
+            return false;
+        }
+        // If another download left a partial file for resume when disk saving is requested, use regular resume.
+        const std::string temp_path = task.local_path + PARTIAL_SUFFIX;
+        if (std::filesystem::exists(std::filesystem::u8path(temp_path)) && opts.disk_mode != COMMON_HF_STREAM_DISK_NONE) {
+            cleanup_on_abort();
+            return false;
+        }
+
+        auto fs = std::make_unique<stream_file_state>();
+        fs->task      = task;
+        fs->temp_path = temp_path;
+        fs->lock_path = task.lock_path.empty() ? (task.local_path + ".lock") : task.lock_path;
+        fs->lock      = std::make_unique<common_file_lock>(fs->lock_path);
+
+        if (!fs->lock->acquire([&]() {
+                return !(task.opts.callback && task.opts.callback->is_cancelled());
+            })) {
+            cleanup_on_abort();
+            return false;
+        }
+        // Re-check cache after acquiring lock
+        if (std::filesystem::exists(std::filesystem::u8path(task.local_path)) ||
+            (!task.alt_path.empty() && std::filesystem::exists(std::filesystem::u8path(task.alt_path)))) {
+            fs->lock->close();
+            cleanup_on_abort();
+            return false;
+        }
+
+        if (!common_resolve_remote_file(task.url, task.opts, fs->resolved) ||
+            !fs->resolved.supports_ranges ||
+            fs->resolved.total_size < size_t(1024) * 1024) {
+            cleanup_on_abort();
+            return false;
+        }
+
+        {
+            std::error_code ec;
+            std::filesystem::create_directories(std::filesystem::path(fs->temp_path).parent_path(), ec);
+        }
+
+        fs->fd = open_rw_fd(fs->temp_path);
+        if (fs->fd < 0 || !ftruncate_fd(fs->fd, fs->resolved.total_size)) {
+            cleanup_on_abort();
+            return false;
+        }
+
+        // Fetch GGUF header incrementally until gguf_init_from_file succeeds and reports data_offset
+        auto [cli, url_parts] = common_http_client(fs->resolved.final_url);
+        cli.set_follow_location(false);
+        cli.set_keep_alive(true);
+        cli.set_read_timeout(60, 0);
+        const httplib::Headers hdrs = build_common_headers(task.opts, fs->resolved.same_origin);
+
+        size_t fetched = 0;
+        const size_t max_header_probe = std::min<size_t>(fs->resolved.total_size, size_t(64) * 1024 * 1024);
+        size_t data_offset = 0;
+        bool parsed_header = false;
+        std::vector<uint8_t> hbuf;
+
+        while (fetched < max_header_probe) {
+            const size_t step = (fetched == 0) ? size_t(2) * 1024 * 1024 : size_t(4) * 1024 * 1024;
+            const size_t req_end = std::min<size_t>(max_header_probe, fetched + step);
+            const size_t req_len = req_end - fetched;
+            hbuf.resize(req_len);
+            if (!http_fetch_range_into(cli, url_parts.path, hdrs, fetched, req_len, hbuf.data(), nullptr) ||
+                !pwrite_all_fd(fs->fd, hbuf.data(), req_len, fetched)) {
+                cleanup_on_abort();
+                return false;
+            }
+            fetched = req_end;
+            if (probe_gguf_data_offset(fs->temp_path, data_offset)) {
+                if (data_offset <= fetched) {
+                    parsed_header = true;
+                    break;
+                }
+                // Metadata knows exact data_offset; fetch remaining gap if needed
+                const size_t need_end = std::min<size_t>(fs->resolved.total_size, data_offset);
+                if (need_end > fetched) {
+                    const size_t rem_len = need_end - fetched;
+                    hbuf.resize(rem_len);
+                    if (!http_fetch_range_into(cli, url_parts.path, hdrs, fetched, rem_len, hbuf.data(), nullptr) ||
+                        !pwrite_all_fd(fs->fd, hbuf.data(), rem_len, fetched)) {
+                        cleanup_on_abort();
+                        return false;
+                    }
+                    fetched = need_end;
+                }
+                parsed_header = true;
+                break;
+            }
+        }
+
+        if (!parsed_header) {
+            cleanup_on_abort();
+            return false;
+        }
+        fs->header_end = fetched;
+        out_paths.push_back(fs->temp_path);
+        sess->files.push_back(std::move(fs));
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_stream_mtx);
+        g_stream_sessions[out_paths.front()] = sess;
+    }
+    LOG_INF("%s: prepared %zu GGUF file(s) for direct HF->VRAM streaming (%d threads, %zu MiB chunks)\n",
+            __func__, sess->files.size(), sess->opts.n_threads, sess->opts.chunk_bytes / (1024 * 1024));
+    return true;
+}
+
+void * common_download_get_stream_session_ud(const std::string & first_path) {
+    std::lock_guard<std::mutex> lock(g_stream_mtx);
+    auto it = g_stream_sessions.find(first_path);
+    if (it == g_stream_sessions.end() || it->second->consumed) {
+        return nullptr;
+    }
+    return it->second.get();
+}
+
+bool common_download_stream_loader(
+        const struct llama_model_stream_loader_ops * ops,
+        void * ops_ctx,
+        uint16_t n_files,
+        const size_t * file_data_offsets,
+        void * user_data) {
+    auto * raw_sess = static_cast<stream_session *>(user_data);
+    if (!ops || !raw_sess || n_files != raw_sess->files.size()) {
+        return false;
+    }
+
+    std::shared_ptr<stream_session> sess;
+    {
+        std::lock_guard<std::mutex> lock(g_stream_mtx);
+        for (auto it = g_stream_sessions.begin(); it != g_stream_sessions.end(); ++it) {
+            if (it->second.get() == raw_sess) {
+                sess = it->second;
+                g_stream_sessions.erase(it);
+                break;
+            }
+        }
+    }
+    if (!sess) {
+        LOG_ERR("%s: session not found for stream user_data\n", __func__);
+        return false;
+    }
+    sess->consumed = true;
+
+    struct stream_chunk {
+        uint16_t file_idx;
+        size_t   offset;
+        size_t   len;
+    };
+
+    // Determine effective buffer capacity from worker 0
+    void * probe_ptr = nullptr;
+    size_t buf_cap = sess->opts.chunk_bytes;
+    int probe_buf_id = 0;
+    if (!ops->acquire_buffer(ops_ctx, 0, &probe_buf_id, &probe_ptr, &buf_cap) || buf_cap == 0) {
+        LOG_ERR("%s: acquire_buffer probe failed (cap=%zu)\n", __func__, buf_cap);
+        return false;
+    }
+    const size_t chunk_sz = std::min<size_t>(sess->opts.chunk_bytes, buf_cap);
+
+    std::vector<stream_chunk> chunks;
+    size_t total_stream_bytes = 0;
+    for (uint16_t fi = 0; fi < n_files; ++fi) {
+        const auto & fs = *sess->files[fi];
+        // Stream starting from min(data_offset, header_end) so any gap between data_offset and first tensor is covered
+        const size_t start_off = std::min(file_data_offsets ? file_data_offsets[fi] : fs.header_end, fs.header_end);
+        for (size_t off = start_off; off < fs.resolved.total_size; off += chunk_sz) {
+            const size_t len = std::min(chunk_sz, fs.resolved.total_size - off);
+            chunks.push_back({fi, off, len});
+            total_stream_bytes += len;
+        }
+    }
+
+    const int n_workers = std::min<int>(std::max(1, sess->opts.n_threads),
+                                        static_cast<int>(std::min<size_t>(std::max<size_t>(1, chunks.size()), 32)));
+
+    // Optional bounded background Disk Tee writer
+    std::mutex bg_mtx;
+    std::condition_variable bg_cv_nonempty;
+    std::condition_variable bg_cv_space;
+    std::deque<bg_write_item> bg_queue;
+    size_t bg_queued_bytes = 0;
+    constexpr size_t BG_MAX_QUEUE_BYTES = size_t(512) * 1024 * 1024;
+    bool bg_stop = false;
+    std::atomic<bool> bg_error{false};
+    std::vector<std::thread> bg_writers;
+
+    if (sess->opts.disk_mode == COMMON_HF_STREAM_DISK_BACKGROUND) {
+        for (int dw = 0; dw < 2; ++dw) {
+            bg_writers.emplace_back([&]() {
+                while (true) {
+                    bg_write_item item;
+                    {
+                        std::unique_lock<std::mutex> lock(bg_mtx);
+                        bg_cv_nonempty.wait(lock, [&]() { return bg_stop || !bg_queue.empty(); });
+                        if (bg_queue.empty() && bg_stop) {
+                            break;
+                        }
+                        item = std::move(bg_queue.front());
+                        bg_queue.pop_front();
+                        bg_queued_bytes -= item.data.size();
+                        bg_cv_space.notify_all();
+                    }
+                    if (!pwrite_all_fd(item.fd, item.data.data(), item.data.size(), item.offset)) {
+                        bg_error.store(true, std::memory_order_relaxed);
+                    }
+                }
+            });
+        }
+    }
+
+    std::atomic<size_t> next_chunk{0};
+    std::atomic<bool> failed{false};
+
+    std::vector<std::thread> workers;
+    workers.reserve(n_workers);
+    for (int w = 0; w < n_workers; ++w) {
+        workers.emplace_back([&, w]() {
+            int cur_file = -1;
+            std::unique_ptr<httplib::Client> cli_ptr;
+            common_http_url cur_parts;
+            httplib::Headers cur_hdrs;
+
+            auto connect_for_file = [&](uint16_t fi) {
+                const auto & fs = *sess->files[fi];
+                auto [cli, parts] = common_http_client(fs.resolved.final_url);
+                cli.set_follow_location(false);
+                cli.set_keep_alive(true);
+                cli.set_read_timeout(60, 0);
+                cli_ptr = std::make_unique<httplib::Client>(std::move(cli));
+                cur_parts = std::move(parts);
+                cur_hdrs = build_common_headers(fs.task.opts, fs.resolved.same_origin);
+                cur_file = static_cast<int>(fi);
+            };
+
+            while (!failed.load(std::memory_order_relaxed)) {
+                const size_t cidx = next_chunk.fetch_add(1, std::memory_order_relaxed);
+                if (cidx >= chunks.size()) {
+                    break;
+                }
+                const auto & ch = chunks[cidx];
+                const auto & fs = *sess->files[ch.file_idx];
+                if (fs.task.opts.callback && fs.task.opts.callback->is_cancelled()) {
+                    failed.store(true, std::memory_order_relaxed);
+                    break;
+                }
+                if (cur_file != static_cast<int>(ch.file_idx) || !cli_ptr) {
+                    connect_for_file(ch.file_idx);
+                }
+
+                int buf_id = 0;
+                void * raw_ptr = nullptr;
+                size_t cap = 0;
+                if (!ops->acquire_buffer(ops_ctx, w, &buf_id, &raw_ptr, &cap) || cap < ch.len) {
+                    LOG_ERR("%s: worker %d acquire_buffer failed (cap=%zu, len=%zu)\n", __func__, w, cap, ch.len);
+                    failed.store(true, std::memory_order_relaxed);
+                    break;
+                }
+                uint8_t * dst = static_cast<uint8_t *>(raw_ptr);
+
+                bool fetch_ok = false;
+                for (int attempt = 0; attempt < 4; ++attempt) {
+                    if (attempt > 0) {
+                        std::this_thread::sleep_for(std::chrono::seconds(1 << (attempt - 1)));
+                        connect_for_file(ch.file_idx);
+                    }
+                    if (http_fetch_range_into(*cli_ptr, cur_parts.path, cur_hdrs, ch.offset, ch.len, dst, nullptr)) {
+                        fetch_ok = true;
+                        break;
+                    }
+                }
+                if (!fetch_ok) {
+                    LOG_ERR("%s: worker %d http_fetch_range_into failed at offset=%zu len=%zu\n", __func__, w, ch.offset, ch.len);
+                    failed.store(true, std::memory_order_relaxed);
+                    break;
+                }
+
+                // 1. Schedule direct VRAM H2D DMA (and host memcpy) first
+                if (!ops->submit_chunk(ops_ctx, w, buf_id, ch.file_idx, ch.offset, ch.len)) {
+                    LOG_ERR("%s: worker %d submit_chunk failed at offset=%zu len=%zu\n", __func__, w, ch.offset, ch.len);
+                    failed.store(true, std::memory_order_relaxed);
+                    break;
+                }
+
+                // 2. Concurrent Disk Tee while GPU PCIe DMA runs
+                if (sess->opts.disk_mode == COMMON_HF_STREAM_DISK_SYNC) {
+                    if (!pwrite_all_fd(fs.fd, dst, ch.len, ch.offset)) {
+                        LOG_ERR("%s: worker %d pwrite_all_fd failed at offset=%zu len=%zu errno=%d\n", __func__, w, ch.offset, ch.len, errno);
+                        failed.store(true, std::memory_order_relaxed);
+                        break;
+                    }
+                } else if (sess->opts.disk_mode == COMMON_HF_STREAM_DISK_BACKGROUND) {
+                    bg_write_item item;
+                    item.fd     = fs.fd;
+                    item.offset = ch.offset;
+                    item.data.assign(dst, dst + ch.len);
+                    {
+                        std::unique_lock<std::mutex> lock(bg_mtx);
+                        bg_cv_space.wait(lock, [&]() {
+                            return bg_queued_bytes + item.data.size() <= BG_MAX_QUEUE_BYTES || failed.load(std::memory_order_relaxed);
+                        });
+                        if (failed.load(std::memory_order_relaxed)) {
+                            break;
+                        }
+                        bg_queued_bytes += item.data.size();
+                        bg_queue.push_back(std::move(item));
+                    }
+                    bg_cv_nonempty.notify_one();
+                }
+            }
+        });
+    }
+
+    for (auto & t : workers) {
+        t.join();
+    }
+
+    if (sess->opts.disk_mode == COMMON_HF_STREAM_DISK_BACKGROUND) {
+        // Move queued background writers + session ownership into background completion thread
+        // ONLY if streaming succeeded; on failure join/drain synchronously and discard.
+        if (failed.load() || bg_error.load()) {
+            {
+                std::lock_guard<std::mutex> lock(bg_mtx);
+                bg_stop = true;
+            }
+            bg_cv_nonempty.notify_all();
+            for (auto & t : bg_writers) {
+                t.join();
+            }
+            for (auto & fs : sess->files) {
+                close_rw_fd(fs->fd);
+                std::error_code ec;
+                std::filesystem::remove(std::filesystem::u8path(fs->temp_path), ec);
+                if (fs->lock) {
+                    fs->lock->close();
+                }
+            }
+            return false;
+        }
+        {
+            std::lock_guard<std::mutex> lock(bg_mtx);
+            bg_stop = true;
+        }
+        bg_cv_nonempty.notify_all();
+        for (auto & t : bg_writers) {
+            t.join();
+        }
+        // Finalize file renames & snapshot symlinks asynchronously after VRAM load completes
+        std::thread fin_thread([sess]() {
+            for (auto & fs : sess->files) {
+                finalize_stream_file(*fs, COMMON_HF_STREAM_DISK_BACKGROUND);
+            }
+        });
+        std::lock_guard<std::mutex> lock(g_stream_mtx);
+        g_bg_threads.push_back(std::move(fin_thread));
+        return true;
+    }
+
+    if (failed.load()) {
+        for (auto & fs : sess->files) {
+            close_rw_fd(fs->fd);
+            std::error_code ec;
+            std::filesystem::remove(std::filesystem::u8path(fs->temp_path), ec);
+            if (fs->lock) {
+                fs->lock->close();
+            }
+        }
+        return false;
+    }
+
+    for (auto & fs : sess->files) {
+        finalize_stream_file(*fs, sess->opts.disk_mode);
+    }
+    return true;
 }

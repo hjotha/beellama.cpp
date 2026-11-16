@@ -117,6 +117,7 @@ struct llama_model_loader {
     } lazy;
 
     llama_files files;
+    std::vector<size_t> file_data_offsets;
     llama_ftype ftype;
     llama_fver  fver;
 
@@ -270,6 +271,15 @@ struct llama_model_loader {
             llama_mlocks * lmlocks,
             llama_progress_callback progress_callback,
             void * progress_callback_user_data);
+
+    // Stream tensor bytes directly from a caller-provided provider into GPU/Host buffers.
+    bool load_all_data_streaming(
+            const std::vector<std::pair<struct ggml_context *, std::vector<ggml_backend_buffer_t>>> & ctx_bufs,
+            llama_model_stream_loader_fn stream_fn,
+            void * stream_user_data,
+            llama_progress_callback progress_callback,
+            void * progress_callback_user_data,
+            uint32_t chunk_bytes);
 
     std::string ftype_name() const;
 

@@ -2184,10 +2184,19 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // load tensor data
     ++pimpl->model_load_count;
-    for (auto & [ctx, bufs] : ctx_bufs) {
-        if (!ml.load_all_data(ctx, bufs, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
+    if (params.stream_loader != nullptr && !ml.no_alloc && !ml.files.empty()) {
+        if (!ml.load_all_data_streaming(ctx_bufs, params.stream_loader, params.stream_loader_user_data,
+                params.progress_callback, params.progress_callback_user_data, params.stream_chunk_bytes)) {
             return false;
         }
+    } else {
+        for (auto & [ctx, bufs] : ctx_bufs) {
+            if (!ml.load_all_data(ctx, bufs, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
+                return false;
+            }
+        }
+    }
+    for (auto & [ctx, bufs] : ctx_bufs) {
         const bool mtp = std::any_of(pimpl->mtp_groups.begin(), pimpl->mtp_groups.end(), [&](const auto & group) {
             return pimpl->ctxs_bufs[group.context_index].first.get() == ctx;
         });
@@ -4130,6 +4139,9 @@ llama_model_params llama_model_default_params() {
         /*.paged_attn_cuda             =*/ false,
         /*.split_mtp_weights           =*/ false,
         /*.dspark_head_source          =*/ nullptr,
+        /*.stream_loader               =*/ nullptr,
+        /*.stream_loader_user_data     =*/ nullptr,
+        /*.stream_chunk_bytes          =*/ 0,
     };
 
     return result;

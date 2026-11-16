@@ -1424,6 +1424,9 @@ if (TARGET cpp-httplib)
         target_link_libraries(test-quant-type-selection PRIVATE gguf-model-data)
         target_compile_definitions(test-quant-type-selection PRIVATE
             SNAPSHOT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/snapshots")
+
+        llama_build_and_test(test-hf-stream-vram.cpp LABEL main LINK llama llama-common cpp-httplib)
+        target_include_directories(test-hf-stream-vram PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/common)
     endif()
 endif()
 

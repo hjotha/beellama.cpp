@@ -8,10 +8,12 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cinttypes>
 #include <cstdint>
 #include <cstring>
 #include <future>
+#include <mutex>
 #include <regex>
 #include <unordered_set>
 
@@ -591,6 +593,7 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
         files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
+        file_data_offsets.push_back(gguf_get_data_offset(metadata));
         contexts.emplace_back(ctx);
 
         // Save tensors data offset of the main file.
@@ -659,6 +662,7 @@ llama_model_loader::llama_model_loader(
                 }
 
                 files.emplace_back(new llama_file(fname_split, "rb", use_direct_io));
+                file_data_offsets.push_back(gguf_get_data_offset(ctx_gguf.get()));
                 contexts.emplace_back(ctx);
 
                 // Save tensors data offset info of the shard.
@@ -710,6 +714,7 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
         files.emplace_back(new llama_file(file));
+        file_data_offsets.push_back(gguf_get_data_offset(metadata));
         contexts.emplace_back(ctx);
 
         // Save tensors data offset info of the main file.
@@ -1899,6 +1904,335 @@ bool llama_model_loader::load_all_data(
         }
     }
 
+    return true;
+}
+
+bool llama_model_loader::load_all_data_streaming(
+        const std::vector<std::pair<struct ggml_context *, std::vector<ggml_backend_buffer_t>>> & ctx_bufs,
+        llama_model_stream_loader_fn stream_fn,
+        void * stream_user_data,
+        llama_progress_callback progress_callback,
+        void * progress_callback_user_data,
+        uint32_t chunk_bytes) {
+    if (files.empty() || !stream_fn) {
+        return false;
+    }
+
+    const size_t n_files = files.size();
+    struct tensor_target {
+        size_t                               file_offs;
+        size_t                               nbytes;
+        size_t                               prefix_max_end;
+        ggml_tensor *                        tensor;
+        bool                                 is_host;
+        bool                                 needs_full_staging;
+        ggml_backend_dev_t                   dev;
+        std::shared_ptr<std::vector<uint8_t>> staging;
+        std::shared_ptr<std::atomic<size_t>> remaining;
+    };
+
+    std::vector<std::vector<tensor_target>> targets_by_file(n_files);
+    ggml_backend_dev_t async_dev  = nullptr;
+    ggml_backend_buffer_type_t host_buft = nullptr;
+
+    for (const auto & [ctx, bufs] : ctx_bufs) {
+        for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != nullptr; cur = ggml_get_next_tensor(ctx, cur)) {
+            const auto * weight = get_weight(ggml_get_name(cur));
+            if (weight == nullptr) {
+                continue;
+            }
+            const bool is_host = !cur->buffer || ggml_backend_buffer_is_host(cur->buffer);
+            ggml_backend_dev_t dev = nullptr;
+            if (!is_host) {
+                auto * buft = ggml_backend_buffer_get_type(cur->buffer);
+                dev = ggml_backend_buft_get_device(buft);
+                if (!async_dev && dev && buft == ggml_backend_dev_buffer_type(dev)) {
+                    ggml_backend_dev_props props;
+                    ggml_backend_dev_get_props(dev, &props);
+                    if (props.caps.async && props.caps.host_buffer && props.caps.events) {
+                        auto * hbuft = ggml_backend_dev_host_buffer_type(dev);
+                        if (hbuft) {
+                            async_dev = dev;
+                            host_buft = hbuft;
+                        }
+                    }
+                }
+            }
+            const bool needs_full_staging = !is_host && !(async_dev && dev == async_dev);
+            std::shared_ptr<std::vector<uint8_t>> staging;
+            std::shared_ptr<std::atomic<size_t>> remaining;
+            if (needs_full_staging) {
+                staging   = std::make_shared<std::vector<uint8_t>>(ggml_nbytes(cur));
+                remaining = std::make_shared<std::atomic<size_t>>(ggml_nbytes(cur));
+            }
+            targets_by_file[weight->idx].push_back({
+                weight->offs,
+                ggml_nbytes(cur),
+                0,
+                cur,
+                is_host,
+                needs_full_staging,
+                dev,
+                std::move(staging),
+                std::move(remaining),
+            });
+        }
+    }
+
+    for (auto & vec : targets_by_file) {
+        std::sort(vec.begin(), vec.end(), [](const tensor_target & a, const tensor_target & b) {
+            return a.file_offs < b.file_offs;
+        });
+        size_t max_end = 0;
+        for (auto & t : vec) {
+            max_end = std::max(max_end, t.file_offs + t.nbytes);
+            t.prefix_max_end = max_end;
+        }
+    }
+
+    const size_t staging_cap = chunk_bytes > 0
+        ? std::max<size_t>(1024 * 1024, chunk_bytes)
+        : size_t(8) * 1024 * 1024;
+
+    static constexpr int MAX_WORKERS = 32;
+    struct worker_slot {
+        std::array<ggml_backend_buffer_t, 2> pinned_bufs    = {nullptr, nullptr};
+        std::array<std::vector<uint8_t>, 2>  fallback_bufs;
+        std::array<void *, 2>                ptrs           = {nullptr, nullptr};
+        std::array<ggml_backend_event_t, 2>  events         = {nullptr, nullptr};
+        std::array<bool, 2>                  event_recorded = {false, false};
+        ggml_backend_t                       upload_backend = nullptr;
+        int                                  next_buf       = 0;
+        bool                                 initialized    = false;
+    };
+
+    struct stream_state {
+        std::vector<std::vector<tensor_target>> & targets_by_file;
+        ggml_backend_dev_t                        async_dev;
+        ggml_backend_buffer_type_t                host_buft;
+        size_t                                    staging_cap;
+        std::array<worker_slot, MAX_WORKERS>      slots;
+        std::mutex                                init_mtx;
+        std::mutex                                progress_mtx;
+        std::atomic<size_t>                       bytes_transferred{0};
+        size_t                                    total_stream_bytes = 0;
+        llama_progress_callback                   progress_cb;
+        void *                                    progress_ud;
+        bool                                      cancelled = false;
+
+        ~stream_state() {
+            for (auto & s : slots) {
+                if (!s.initialized) {
+                    continue;
+                }
+                for (int b = 0; b < 2; ++b) {
+                    if (s.events[b]) {
+                        if (s.event_recorded[b]) {
+                            ggml_backend_event_synchronize(s.events[b]);
+                        }
+                        ggml_backend_event_free(s.events[b]);
+                    }
+                    if (s.pinned_bufs[b]) {
+                        ggml_backend_buffer_free(s.pinned_bufs[b]);
+                    }
+                }
+                if (s.upload_backend) {
+                    ggml_backend_free(s.upload_backend);
+                }
+            }
+        }
+    };
+
+    size_t total_stream_bytes = 0;
+    std::vector<size_t> data_offsets(n_files, 0);
+    for (size_t i = 0; i < n_files; ++i) {
+        data_offsets[i] = i < file_data_offsets.size() ? file_data_offsets[i] : 0;
+        if (files[i]->size() > data_offsets[i]) {
+            total_stream_bytes += files[i]->size() - data_offsets[i];
+        }
+    }
+
+    stream_state state {
+        targets_by_file,
+        async_dev,
+        host_buft,
+        staging_cap,
+        {},
+        {},
+        {},
+        0,
+        total_stream_bytes,
+        progress_callback,
+        progress_callback_user_data,
+        false,
+    };
+
+    llama_model_stream_loader_ops ops = {};
+    ops.acquire_buffer = [](void * raw_ctx, int worker_id, int * out_buf_id, void ** out_ptr, size_t * out_cap) -> bool {
+        auto * st = static_cast<stream_state *>(raw_ctx);
+        if (worker_id < 0 || worker_id >= MAX_WORKERS) {
+            return false;
+        }
+        auto & slot = st->slots[worker_id];
+        if (!slot.initialized) {
+            std::lock_guard<std::mutex> lock(st->init_mtx);
+            if (!slot.initialized) {
+                bool pinned_ok = false;
+                if (st->async_dev && st->host_buft) {
+                    slot.upload_backend = ggml_backend_dev_init(st->async_dev, nullptr);
+                    if (slot.upload_backend) {
+                        pinned_ok = true;
+                        for (int b = 0; b < 2; ++b) {
+                            slot.pinned_bufs[b] = ggml_backend_buft_alloc_buffer(st->host_buft, st->staging_cap);
+                            slot.events[b]      = ggml_backend_event_new(st->async_dev);
+                            if (!slot.pinned_bufs[b] || !slot.events[b]) {
+                                pinned_ok = false;
+                                break;
+                            }
+                            slot.ptrs[b] = ggml_backend_buffer_get_base(slot.pinned_bufs[b]);
+                        }
+                    }
+                    if (!pinned_ok) {
+                        for (int b = 0; b < 2; ++b) {
+                            if (slot.events[b])      { ggml_backend_event_free(slot.events[b]); slot.events[b] = nullptr; }
+                            if (slot.pinned_bufs[b]) { ggml_backend_buffer_free(slot.pinned_bufs[b]); slot.pinned_bufs[b] = nullptr; }
+                            slot.ptrs[b] = nullptr;
+                        }
+                        if (slot.upload_backend) {
+                            ggml_backend_free(slot.upload_backend);
+                            slot.upload_backend = nullptr;
+                        }
+                    }
+                }
+                if (!pinned_ok) {
+                    for (int b = 0; b < 2; ++b) {
+                        slot.fallback_bufs[b].resize(st->staging_cap);
+                        slot.ptrs[b] = slot.fallback_bufs[b].data();
+                    }
+                }
+                slot.initialized = true;
+            }
+        }
+
+        const int buf_id = slot.next_buf;
+        slot.next_buf ^= 1;
+        if (slot.event_recorded[buf_id] && slot.events[buf_id]) {
+            ggml_backend_event_synchronize(slot.events[buf_id]);
+            slot.event_recorded[buf_id] = false;
+        }
+        *out_buf_id = buf_id;
+        *out_ptr    = slot.ptrs[buf_id];
+        *out_cap    = st->staging_cap;
+        return true;
+    };
+
+    ops.submit_chunk = [](void * raw_ctx, int worker_id, int buf_id, uint16_t file_idx, size_t file_offset, size_t n_bytes) -> bool {
+        auto * st = static_cast<stream_state *>(raw_ctx);
+        if (worker_id < 0 || worker_id >= MAX_WORKERS || buf_id < 0 || buf_id > 1 || file_idx >= st->targets_by_file.size()) {
+            return false;
+        }
+        auto & slot = st->slots[worker_id];
+        const auto & targets = st->targets_by_file[file_idx];
+        const uint8_t * src_base = static_cast<const uint8_t *>(slot.ptrs[buf_id]);
+        const size_t chunk_end = file_offset + n_bytes;
+
+        if (n_bytes > 0 && !targets.empty()) {
+            auto it = std::lower_bound(targets.begin(), targets.end(), file_offset,
+                [](const tensor_target & t, size_t off) {
+                    return t.prefix_max_end <= off;
+                });
+
+            bool used_async = false;
+            for (; it != targets.end(); ++it) {
+                if (it->file_offs >= chunk_end) {
+                    break;
+                }
+                const size_t t_end = it->file_offs + it->nbytes;
+                const size_t slice_start = std::max(file_offset, it->file_offs);
+                const size_t slice_end   = std::min(chunk_end, t_end);
+                if (slice_start >= slice_end) {
+                    continue;
+                }
+                const size_t copy_len       = slice_end - slice_start;
+                const size_t in_chunk_off   = slice_start - file_offset;
+                const size_t tensor_rel_off = slice_start - it->file_offs;
+                const void * src_ptr        = src_base + in_chunk_off;
+
+                if (it->is_host) {
+                    std::memcpy(static_cast<uint8_t *>(it->tensor->data) + tensor_rel_off, src_ptr, copy_len);
+                } else if (it->needs_full_staging) {
+                    std::memcpy(it->staging->data() + tensor_rel_off, src_ptr, copy_len);
+                    if (it->remaining->fetch_sub(copy_len, std::memory_order_acq_rel) == copy_len) {
+                        ggml_backend_tensor_set(it->tensor, it->staging->data(), 0, it->nbytes);
+                    }
+                } else if (slot.upload_backend && it->dev == st->async_dev) {
+                    ggml_backend_tensor_set_async(slot.upload_backend, it->tensor, src_ptr, tensor_rel_off, copy_len);
+                    used_async = true;
+                } else {
+                    ggml_backend_tensor_set(it->tensor, src_ptr, tensor_rel_off, copy_len);
+                }
+            }
+
+            if (used_async && slot.events[buf_id]) {
+                ggml_backend_event_record(slot.events[buf_id], slot.upload_backend);
+                slot.event_recorded[buf_id] = true;
+            }
+        }
+
+        const size_t done = st->bytes_transferred.fetch_add(n_bytes, std::memory_order_relaxed) + n_bytes;
+        if (st->progress_cb && st->total_stream_bytes > 0) {
+            std::lock_guard<std::mutex> lock(st->progress_mtx);
+            const float prog = std::min(1.0f, static_cast<float>(done) / static_cast<float>(st->total_stream_bytes));
+            if (!st->progress_cb(prog, st->progress_ud)) {
+                st->cancelled = true;
+                return false;
+            }
+        }
+        return true;
+    };
+
+    const bool stream_ok = stream_fn(&ops, &state, static_cast<uint16_t>(n_files), data_offsets.data(), stream_user_data);
+
+    // Synchronize all outstanding async GPU DMAs before returning
+    for (auto & s : state.slots) {
+        if (!s.initialized) {
+            continue;
+        }
+        for (int b = 0; b < 2; ++b) {
+            if (s.events[b] && s.event_recorded[b]) {
+                ggml_backend_event_synchronize(s.events[b]);
+                s.event_recorded[b] = false;
+            }
+        }
+    }
+
+    if (!stream_ok || state.cancelled) {
+        return false;
+    }
+
+    if (check_tensors) {
+        std::vector<uint8_t> tmp;
+        for (const auto & vec : targets_by_file) {
+            for (const auto & t : vec) {
+                const void * ptr = nullptr;
+                if (t.is_host) {
+                    ptr = t.tensor->data;
+                } else {
+                    tmp.resize(t.nbytes);
+                    ggml_backend_tensor_get(t.tensor, tmp.data(), 0, t.nbytes);
+                    ptr = tmp.data();
+                }
+                if (!ggml_validate_row_data(t.tensor->type, ptr, t.nbytes)) {
+                    throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(t.tensor)));
+                }
+            }
+        }
+    }
+
+    size_done = size_data;
+    if (progress_callback) {
+        return progress_callback(1.0f, progress_callback_user_data);
+    }
     return true;
 }
 

@@ -608,6 +608,7 @@ common_models_handler common_models_handler_init(const common_params & params, l
     opts.download_eagle3 = spec_type_draft_eagle3;
     opts.download_dflash = spec_type_draft_dflash;
     opts.download_dspark = spec_type_draft_dspark;
+    opts.n_threads       = std::max(1, params.hf_download_threads);
     opts.download_mmproj = use_mmproj && !params.no_mmproj
                         && params.mmproj.path.empty() && params.mmproj.url.empty();
 
@@ -708,6 +709,7 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
     }
 
     // handle plain "url" tasks (non-hf)
+    std::vector<common_download_task> stream_candidate_tasks;
     if (!params.model.url.empty()) {
         auto url_tasks = build_url_tasks(params.model, opts);
         // the first part is what gets loaded, so point params.model.path at it
@@ -716,7 +718,12 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
             url_tasks.front().on_done = [&, first_path]() { params.model.path = first_path; };
         }
         for (auto & task : url_tasks) {
-            tasks.push_back(std::move(task));
+            if (params.hf_stream_vram) {
+                stream_candidate_tasks.push_back(task);
+                stream_candidate_tasks.back().on_done = nullptr;
+            } else {
+                tasks.push_back(std::move(task));
+            }
         }
     }
     if (!params.mmproj.url.empty()) {
@@ -737,20 +744,29 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
     }
 
     // handle hf_plan tasks
-    auto add_tasks = [&opts, &tasks, &finalize](const hf_cache::hf_files  & model_files,
+    auto add_tasks = [&opts, &tasks, &finalize, &params, &stream_candidate_tasks](
+                                    const hf_cache::hf_files  & model_files,
                                     const hf_cache::hf_file    & primary,
-                                    common_params_model        & model) {
+                                    common_params_model        & model,
+                                    bool                         allow_stream) {
         for (size_t i = 0; i < model_files.size(); ++i) {
             auto & model_file = model_files[i];
             bool is_primary = (model_file.path == primary.path);
-            tasks.emplace_back(model_file, opts, [&, is_primary]() {
-                if (is_primary) {
-                    // the primary file is the first split (00001-of), use it as model path
-                    model.path = finalize(model_file);
-                } else {
-                    finalize(model_file);
-                }
-            });
+            if (allow_stream && params.hf_stream_vram) {
+                common_download_task stask(model_file, opts, [model_file]() {
+                    hf_cache::finalize_file(model_file);
+                });
+                stream_candidate_tasks.push_back(std::move(stask));
+            } else {
+                tasks.emplace_back(model_file, opts, [&, is_primary]() {
+                    if (is_primary) {
+                        // the primary file is the first split (00001-of), use it as model path
+                        model.path = finalize(model_file);
+                    } else {
+                        finalize(model_file);
+                    }
+                });
+            }
         }
     };
 
@@ -844,12 +860,12 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
 
     // handle plan_spec (e.g. --spec-draft-hf)
     if (!plan_spec.model_files.empty() && !had_spec_url && !spec_sidecar_found) {
-        add_tasks(plan_spec.model_files, plan_spec.primary, params.speculative.draft.mparams);
+        add_tasks(plan_spec.model_files, plan_spec.primary, params.speculative.draft.mparams, false);
         had_spec_url = true;
     }
 
     if (!plan.model_files.empty()) {
-        add_tasks(plan.model_files, plan.primary, params.model);
+        add_tasks(plan.model_files, plan.primary, params.model, true);
     }
     if (!plan.mmproj.local_path.empty()) {
         tasks.emplace_back(plan.mmproj, opts, [&]() {
@@ -908,8 +924,56 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
         });
     }
 
+    // If HF->VRAM direct streaming is requested for main model GGUF(s), try preparing
+    // header-only temp files first; otherwise fall back to regular disk download tasks.
+    if (!params.offline && !stream_candidate_tasks.empty()) {
+        common_download_stream_opts sopts;
+        sopts.n_threads   = std::max(1, params.hf_download_threads);
+        sopts.chunk_bytes = static_cast<size_t>(std::max(1, params.hf_stream_chunk_mb)) * 1024u * 1024u;
+        if (params.hf_stream_disk_mode == "background") {
+            sopts.disk_mode = COMMON_HF_STREAM_DISK_BACKGROUND;
+        } else if (params.hf_stream_disk_mode == "none") {
+            sopts.disk_mode = COMMON_HF_STREAM_DISK_NONE;
+        } else {
+            sopts.disk_mode = COMMON_HF_STREAM_DISK_SYNC;
+        }
+
+        std::vector<std::string> stream_paths;
+        if (common_download_prepare_stream(stream_candidate_tasks, sopts, stream_paths) && !stream_paths.empty()) {
+            params.model.path = stream_paths.front();
+            if (stream_paths.size() > 1) {
+                params.model.splits = stream_paths;
+            }
+            params.load_mode = LLAMA_LOAD_MODE_NONE;
+        } else {
+            // Fall back to regular download for all candidate tasks
+            if (!params.model.url.empty()) {
+                for (size_t i = 0; i < stream_candidate_tasks.size(); ++i) {
+                    auto & t = stream_candidate_tasks[i];
+                    if (i == 0) {
+                        const std::string first_path = t.local_path;
+                        t.on_done = [&params, first_path]() { params.model.path = first_path; };
+                    }
+                    tasks.push_back(std::move(t));
+                }
+            } else if (!plan.model_files.empty()) {
+                for (size_t i = 0; i < plan.model_files.size(); ++i) {
+                    const auto & model_file = plan.model_files[i];
+                    const bool is_primary = (model_file.path == plan.primary.path);
+                    tasks.emplace_back(model_file, opts, [&, is_primary]() {
+                        if (is_primary) {
+                            params.model.path = finalize(model_file);
+                        } else {
+                            finalize(model_file);
+                        }
+                    });
+                }
+            }
+        }
+    }
+
     // run all tasks in parallel
-    if (!params.offline) {
+    if (!params.offline && !tasks.empty()) {
         // if duplicated files are found, only download once (but still call on_done for each task)
         std::unordered_map<std::string, common_download_task *> unique_tasks;
         for (auto & task : tasks) {
@@ -4870,6 +4934,43 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.hf_token = value;
         }
     ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_DOWNLOAD, LLAMA_EXAMPLE_TOKENIZE}).set_env("HF_TOKEN").set_sensitive());
+    add_opt(common_arg(
+        {"--hf-download-threads"}, "N",
+        string_format("parallel HTTP range connections for remote model downloads (default: %d)", params.hf_download_threads),
+        [](common_params & params, int value) {
+            if (value < 1 || value > 32) {
+                throw std::invalid_argument("--hf-download-threads must be in [1, 32]");
+            }
+            params.hf_download_threads = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_DOWNLOAD}).set_env("LLAMA_ARG_HF_THREADS"));
+    add_opt(common_arg(
+        {"--hf-stream-vram"},
+        "stream uncached GGUF weights from Hugging Face/HTTP directly to VRAM via pinned buffers while persisting to disk simultaneously (default: false)",
+        [](common_params & params) {
+            params.hf_stream_vram = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMMON}).set_env("LLAMA_ARG_HF_STREAM_VRAM"));
+    add_opt(common_arg(
+        {"--hf-stream-chunk-mb"}, "N",
+        string_format("HTTP range chunk and CUDA pinned staging buffer size in MiB for --hf-stream-vram (default: %d)", params.hf_stream_chunk_mb),
+        [](common_params & params, int value) {
+            if (value < 1 || value > 64) {
+                throw std::invalid_argument("--hf-stream-chunk-mb must be in [1, 64]");
+            }
+            params.hf_stream_chunk_mb = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMMON}).set_env("LLAMA_ARG_HF_STREAM_CHUNK_MB"));
+    add_opt(common_arg(
+        {"--hf-stream-disk-mode"}, "MODE",
+        "disk persistence mode for --hf-stream-vram: sync (default), background, or none",
+        [](common_params & params, const std::string & value) {
+            if (value != "sync" && value != "background" && value != "none") {
+                throw std::invalid_argument("--hf-stream-disk-mode must be sync, background, or none");
+            }
+            params.hf_stream_disk_mode = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMMON}).set_env("LLAMA_ARG_HF_STREAM_DISK_MODE"));
     add_opt(common_arg(
         {"--mtp"},
         "also download the multi-token prediction (MTP) head, if available (default: unused)",
