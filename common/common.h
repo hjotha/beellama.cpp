@@ -313,6 +313,7 @@ struct common_params_model {
     std::string hf_repo     = ""; // HF repo
     std::string hf_file     = ""; // HF file
     std::string docker_repo = ""; // Docker repo
+    std::vector<std::string> splits; // optional split paths (populated by HF stream prepare)
 
     std::string get_name() const {
         if (!hf_repo.empty()) {
@@ -749,6 +750,10 @@ struct common_params {
     int32_t control_vector_layer_start = -1; // layer range for control vector
     int32_t control_vector_layer_end   = -1; // layer range for control vector
     bool    offline                    = false;
+    int32_t hf_download_threads        = 8;     // parallel HTTP range connections for model downloads
+    bool    hf_stream_vram             = false; // stream GGUF weights from HF/HTTP directly to VRAM + disk tee
+    int32_t hf_stream_chunk_mb         = 8;     // staging buffer / HTTP range chunk size in MiB
+    std::string hf_stream_disk_mode    = "sync"; // disk tee mode: sync | background | none
 
     int32_t ppl_stride      = 0;     // stride for perplexity calculations. If left at 0, the pre-existing approach will be used.
     int32_t ppl_output_type = 0;     // = 0 -> ppl output is as usual, = 1 -> ppl output is num_tokens, ppl, one per line

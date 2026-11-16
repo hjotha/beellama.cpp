@@ -378,6 +378,20 @@ extern "C" {
         ggml_backend_buffer_type_t buft;
     };
 
+    // Host-side streaming data provider for loading model tensors directly from network
+    // into GPU/Host buffers while optionally persisting to disk concurrently.
+    struct llama_model_stream_loader_ops {
+        bool (*acquire_buffer)(void * ctx, int worker_id, int * out_buf_id, void ** out_ptr, size_t * out_cap);
+        bool (*submit_chunk)(void * ctx, int worker_id, int buf_id, uint16_t file_idx, size_t file_offset, size_t n_bytes);
+    };
+
+    typedef bool (*llama_model_stream_loader_fn)(
+        const struct llama_model_stream_loader_ops * ops,
+        void * ops_ctx,
+        uint16_t n_files,
+        const size_t * file_data_offsets,
+        void * user_data);
+
     struct llama_model_params {
         // NULL-terminated list of devices to use for offloading (if NULL, all available devices are used)
         ggml_backend_dev_t * devices;
@@ -421,6 +435,12 @@ extern "C" {
         // Opt-in DSpark head borrowing. Caller guarantees the bound target and keeps it alive
         // until the drafter and all drafter contexts are destroyed. No head weights are copied.
         const struct llama_model * dspark_head_source;
+
+        // Optional streaming loader callback: when non-NULL (and !no_alloc), invoked instead of
+        // reading tensor bytes sequentially from local disk files.
+        llama_model_stream_loader_fn stream_loader;
+        void * stream_loader_user_data;
+        uint32_t stream_chunk_bytes; // preferred staging buffer capacity in bytes (0 = default 8 MiB)
     };
 
     struct llama_sampler_seq_config {

@@ -11,6 +11,7 @@
 #include "../src/llama-ext.h"
 
 #include "fit.h"
+#include "download.h"
 #include "log.h"
 #include "llama.h"
 #include "../src/llama-model.h"
@@ -41,6 +42,7 @@
 #include <iostream>
 #include <iterator>
 #include <limits>
+#include <mutex>
 #include <random>
 #include <regex>
 #include <sstream>
@@ -2381,7 +2383,28 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         }
     }
 
-    llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
+    if (void * stream_ud = common_download_get_stream_session_ud(params.model.path)) {
+        static std::once_flag atexit_flag;
+        std::call_once(atexit_flag, []() {
+            std::atexit(common_download_wait_background);
+        });
+        mparams.stream_loader           = common_download_stream_loader;
+        mparams.stream_loader_user_data = stream_ud;
+        mparams.stream_chunk_bytes      = static_cast<uint32_t>(std::max(1, params.hf_stream_chunk_mb)) * 1024u * 1024u;
+        mparams.load_mode               = LLAMA_LOAD_MODE_NONE;
+    }
+
+    llama_model * model = nullptr;
+    if (params.model.splits.size() > 1) {
+        std::vector<const char *> c_splits;
+        c_splits.reserve(params.model.splits.size());
+        for (const auto & s : params.model.splits) {
+            c_splits.push_back(s.c_str());
+        }
+        model = llama_model_load_from_splits(c_splits.data(), c_splits.size(), mparams);
+    } else {
+        model = llama_model_load_from_file(params.model.path.c_str(), mparams);
+    }
     if (model == NULL) {
         return;
     }

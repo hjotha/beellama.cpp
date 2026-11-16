@@ -1,7 +1,9 @@
 #pragma once
 
 #include "hf-cache.h"
+#include "llama.h"
 
+#include <cstdint>
 #include <string>
 #include <vector>
 #include <functional>
@@ -60,6 +62,7 @@ struct common_download_opts {
     bool download_eagle3  = false;
     bool download_dflash  = false;
     bool download_dspark  = false;
+    int  n_threads        = 8;
     common_download_callback * callback = nullptr;
 };
 
@@ -163,3 +166,36 @@ struct common_download_partial {
 
 // the partials the download of `plan` writes, for the files not in the cache yet
 std::vector<common_download_partial> common_download_plan_partials(const common_download_hf_plan & plan);
+
+enum common_hf_stream_disk_mode {
+    COMMON_HF_STREAM_DISK_SYNC       = 0,
+    COMMON_HF_STREAM_DISK_BACKGROUND = 1,
+    COMMON_HF_STREAM_DISK_NONE       = 2,
+};
+
+struct common_download_stream_opts {
+    int n_threads = 8;
+    size_t chunk_bytes = size_t(8) * 1024 * 1024;
+    enum common_hf_stream_disk_mode disk_mode = COMMON_HF_STREAM_DISK_SYNC;
+};
+
+// Prepare GGUF model download tasks for direct HTTP Range streaming to VRAM (+ Disk Tee).
+// If all tasks fit streaming preconditions (uncached, server supports byte ranges), downloads
+// only the GGUF header [0, data_offset) to `.downloadInProgress`, pre-sizes the temp file,
+// registers the stream session under out_paths.front(), and returns true.
+// Returns false if already cached or range streaming is inapplicable (fall back to regular download).
+bool common_download_prepare_stream(
+    const std::vector<common_download_task> & tasks,
+    const common_download_stream_opts & opts,
+    std::vector<std::string> & out_paths);
+
+void * common_download_get_stream_session_ud(const std::string & first_path);
+
+bool common_download_stream_loader(
+    const struct llama_model_stream_loader_ops * ops,
+    void * ops_ctx,
+    uint16_t n_files,
+    const size_t * file_data_offsets,
+    void * user_data);
+
+void common_download_wait_background();
