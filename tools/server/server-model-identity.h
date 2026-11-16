@@ -31,4 +31,5 @@ private:
     static bool equal(const source & a, const source & b);
     std::vector<source> sources;
     std::string digest;
+    bool streamed = false;
 };
