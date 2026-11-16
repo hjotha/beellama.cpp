@@ -1,6 +1,7 @@
 #include "fit.h"
 #include "fit-kvarn-tail.h"
 
+#include "download.h"
 #include "json.h"
 #include "log.h"
 
@@ -64,7 +65,18 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     mparams_copy.no_alloc  = true;
     mparams_copy.load_mode = LLAMA_LOAD_MODE_NONE;
 
-    llama_model * model = llama_model_load_from_file(path_model, mparams_copy);
+    const auto stream_splits = path_model ? common_download_get_stream_splits(path_model) : std::vector<std::string>{};
+    llama_model * model = nullptr;
+    if (stream_splits.size() > 1) {
+        std::vector<const char *> c_splits;
+        c_splits.reserve(stream_splits.size());
+        for (const auto & s : stream_splits) {
+            c_splits.push_back(s.c_str());
+        }
+        model = llama_model_load_from_splits(c_splits.data(), c_splits.size(), mparams_copy);
+    } else {
+        model = llama_model_load_from_file(path_model, mparams_copy);
+    }
     if (model == nullptr) {
         llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
         throw std::runtime_error("failed to load model");

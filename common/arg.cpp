@@ -926,6 +926,7 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
 
     // If HF->VRAM direct streaming is requested for main model GGUF(s), try preparing
     // header-only temp files first; otherwise fall back to regular disk download tasks.
+    std::string prepared_stream_first_path;
     if (!params.offline && !stream_candidate_tasks.empty()) {
         common_download_stream_opts sopts;
         sopts.n_threads   = std::max(1, params.hf_download_threads);
@@ -940,6 +941,7 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
 
         std::vector<std::string> stream_paths;
         if (common_download_prepare_stream(stream_candidate_tasks, sopts, stream_paths) && !stream_paths.empty()) {
+            prepared_stream_first_path = stream_paths.front();
             params.model.path = stream_paths.front();
             if (stream_paths.size() > 1) {
                 params.model.splits = stream_paths;
@@ -987,7 +989,14 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
             LOG_DBG("download task: %s -> %s\n", pair.second->url.c_str(), pair.second->local_path.c_str());
             unique_tasks_vec.push_back(*pair.second);
         }
-        common_download_run_tasks(unique_tasks_vec);
+        try {
+            common_download_run_tasks(unique_tasks_vec);
+        } catch (...) {
+            if (!prepared_stream_first_path.empty()) {
+                common_download_stream_abort(prepared_stream_first_path);
+            }
+            throw;
+        }
     }
 
     // download successful, update params with the downloaded paths

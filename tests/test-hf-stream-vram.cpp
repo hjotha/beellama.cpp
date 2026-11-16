@@ -237,14 +237,17 @@ int main() {
     const int32_t test_ngl = ref_mparams.n_gpu_layers;
     llama_model_free(ref_model);
 
-    // Local HTTP Range server simulating HF Hub redirect + CDN Range + transient 503 failure
+    // Local HTTP Range server simulating HF Hub redirect + CDN Range + transient 503 + expired 403 signed URL refresh
     httplib::Server svr;
     std::atomic<int> range_reqs{0};
     std::atomic<int> injected_503{0};
+    std::atomic<int> injected_403{0};
+    std::atomic<int> redirect_gen{1};
     const std::string etag = "\"test-hf-stream-etag\"";
 
     svr.Get("/redirect/model.gguf", [&](const httplib::Request &, httplib::Response & res) {
-        res.set_redirect("/cdn/model.gguf", 302);
+        const int g = redirect_gen.load();
+        res.set_redirect("/cdn/model.gguf?gen=" + std::to_string(g), 302);
     });
     svr.Get("/cdn/model.gguf", [&](const httplib::Request & req, httplib::Response & res) {
         res.set_header("ETag", etag);
@@ -268,6 +271,12 @@ int main() {
         if (s > 0 && rnum == 3 && injected_503.exchange(1) == 0) {
             res.status = 503;
             res.set_content("transient error", "text/plain");
+            return;
+        }
+        if (s > 0 && rnum == 5 && req.get_param_value("gen") == "1" && injected_403.exchange(1) == 0) {
+            redirect_gen.store(2);
+            res.status = 403;
+            res.set_content("expired signed URL", "text/plain");
             return;
         }
         // cpp-httplib::Server handles Range slicing + 206 Partial Content natively on the full payload
@@ -314,14 +323,23 @@ int main() {
             sopts.disk_mode   = COMMON_HF_STREAM_DISK_SYNC;
 
             std::vector<std::string> stream_paths;
+            // Verify prepare + abort cleans up temp file & lock and allows immediate re-prepare
+            require(common_download_prepare_stream({t}, sopts, stream_paths), "prepare_stream(abort-test) failed");
+            require(stream_paths.size() == 1 && fs::exists(stream_paths[0]), "expected temp file after prepare");
+            common_download_stream_abort(stream_paths[0]);
+            require(!fs::exists(stream_paths[0]), "temp file should be removed by common_download_stream_abort");
+            require(common_download_get_stream_session_ud(stream_paths[0]) == nullptr, "session should be cleared after abort");
+
             require(common_download_prepare_stream({t}, sopts, stream_paths), "prepare_stream(sync) failed");
             require(stream_paths.size() == 1, "expected 1 stream path");
+            require(common_download_stream_final_path(stream_paths[0]) == sync_path.string(), "unexpected final path mapping");
             void * ud = common_download_get_stream_session_ud(stream_paths[0]);
             require(ud != nullptr, "missing stream session ud");
 
             llama_model_params mp = llama_model_default_params();
             mp.load_mode               = LLAMA_LOAD_MODE_NONE;
             mp.n_gpu_layers            = test_ngl;
+            mp.check_tensors           = true;
             mp.stream_loader           = common_download_stream_loader;
             mp.stream_loader_user_data = ud;
             mp.stream_chunk_bytes      = 2 * 1024 * 1024;
@@ -331,6 +349,7 @@ int main() {
             llama_model_free(m);
 
             require(injected_503.load() == 1, "expected transient 503 injection to have triggered and recovered");
+            require(injected_403.load() == 1 && redirect_gen.load() == 2, "expected expired 403 signed URL refresh to have triggered");
             require(range_reqs.load() > 6, "expected multiple parallel HTTP Range requests");
             require(fs::exists(sync_path), "sync.gguf should exist on disk");
             require(read_file_bytes(sync_path) == ref_bytes, "sync.gguf byte mismatch vs ref.gguf");
@@ -404,6 +423,7 @@ int main() {
 
             require(!fs::exists(none_path), "none.gguf should not persist in disk-mode=none");
             require(!fs::exists(none_path.string() + ".downloadInProgress"), "temp partial should be removed");
+            require(!fs::exists(none_path.string() + ".hfstream.tmp"), "stream temp should be removed");
             printf("PASS: disk-mode=none kept VRAM/RAM intact with zero persistent file\n");
         }
 
