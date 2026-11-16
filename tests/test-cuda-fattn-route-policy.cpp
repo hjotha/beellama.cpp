@@ -75,6 +75,8 @@ int main(int argc, char ** argv) {
     const std::string kvarn_store = read_file(root + "/ggml/src/ggml-cuda/kvarn.cu");
     const std::string kvarn_wide_instance = read_file(
         root + "/ggml/src/ggml-cuda/template-instances/fattn-mma-kvarn-instance-ncols1_16-ncols2_8.cu");
+    const std::string kvarn_32x2_instance = read_file(
+        root + "/ggml/src/ggml-cuda/template-instances/fattn-mma-kvarn-instance-ncols1_32-ncols2_2.cu");
     const std::string release = read_file(root + "/.github/workflows/release.yml");
 
     const auto expect_route = [&](const ggml_cuda_fattn_kvarn_route_input & base,
@@ -129,6 +131,14 @@ int main(int argc, char ** argv) {
                  !ggml_cuda_fattn_kvarn_use_wide_mma(16, 4, true) &&
                  !ggml_cuda_fattn_kvarn_use_wide_mma(16, 6, false),
         "wide MMA tile must retain shape and device-resource fallbacks");
+    ok &= expect(ggml_cuda_fattn_kvarn_prompt_tile_32_2_applies(256, 256, 6, true, true),
+        "Q256/GQA6 D256 prompt block did not select the 32x2 window tile");
+    ok &= expect(!ggml_cuda_fattn_kvarn_prompt_tile_32_2_applies(128, 256, 6, true, true) &&
+                 !ggml_cuda_fattn_kvarn_prompt_tile_32_2_applies(256, 128, 6, true, true) &&
+                 !ggml_cuda_fattn_kvarn_prompt_tile_32_2_applies(256, 256, 4, true, true) &&
+                 !ggml_cuda_fattn_kvarn_prompt_tile_32_2_applies(256, 256, 6, false, true) &&
+                 !ggml_cuda_fattn_kvarn_prompt_tile_32_2_applies(256, 256, 6, true, false),
+        "32x2 prompt tile must retain its head, query, GQA and window guards");
 
     const auto cuda_caps = ggml_cuda_fattn_kvarn_select_capabilities({
         GGML_CUDA_FATTN_KVARN_BACKEND_CUDA, 32, true, true, 1024, 48*1024, 4*1024,
@@ -412,6 +422,26 @@ int main(int argc, char ** argv) {
     ok &= expect(kvarn.find("ggml_cuda_fattn_kvarn_wide_mma_supported") != std::string::npos &&
                  kvarn.find("ggml_cuda_flash_attn_ext_mma_kvarn_launch_case<DKQ, DV, 16, 8>") != std::string::npos,
         "multi-token GQA verification must use the adaptive wide KVarN MMA tile when the device supports it");
+    ok &= expect(kvarn.find("ggml_cuda_fattn_kvarn_prompt_tile_32_2_applies") != std::string::npos &&
+                 kvarn.find("ggml_cuda_fattn_kvarn_windowed_try<256, 256, 32, 2>") != std::string::npos &&
+                 kvarn_mma_case.find("ggml_cuda_fattn_kvarn_windowed_try") != std::string::npos &&
+                 kvarn_32x2_instance.find(
+                     "ggml_cuda_fattn_kvarn_windowed_try<256, 256, 32, 2>") != std::string::npos,
+        "the Q256 D256 KVarN prompt path must expose the 32x2 window-only entry");
+    const std::string prompt32 = slice_between(
+        kvarn, "D256/32x2 prompt tile", "#if !defined(GGML_USE_MUSA)");
+    ok &= expect(!prompt32.empty() && prompt32.find("cudaMemGetInfo") == std::string::npos &&
+                 prompt32.find("windowed_lse_applies") != std::string::npos,
+        "the optional prompt tile must confirm its window contract without a free-memory query");
+    const size_t first_optional = kvarn_mma_case.find("if constexpr (optional_attempt)");
+    const size_t second_optional = first_optional == std::string::npos ? std::string::npos :
+        kvarn_mma_case.find("if constexpr (optional_attempt)", first_optional + 1);
+    const size_t recoverable = kvarn_mma_case.find("cudaErrorMemoryAllocation");
+    ok &= expect(second_optional != std::string::npos && recoverable != std::string::npos &&
+                 second_optional < recoverable &&
+                 kvarn_mma_case.find("cudaPeekAtLastError()") != std::string::npos &&
+                 kvarn_mma_case.find("windowed_case<DKQ, DV, ncols1, ncols2, true>") != std::string::npos,
+        "the recoverable allocation path must be limited to the optional tile and surface prior errors");
     ok &= expect(kvarn_wide_instance.find("!defined(GGML_USE_HIP)") == std::string::npos &&
                  kvarn_wide_instance.find("!defined(GGML_USE_MUSA)") != std::string::npos,
         "wide KVarN MMA instances must compile for AMD HIP while MUSA stays portable");

@@ -1039,6 +1039,41 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_switch_ncols2(
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
     const int gqa_ratio = Q->ne[2] / K->ne[2];
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if constexpr (DKQ == 256 && DV == 256) {
+        // D256/32x2 prompt tile: 32 query rows fill both MMA row halves and a
+        // 32:2 split of six GQA heads fills the three column groups, unlike the
+        // default 8x8 tile that pads eight query rows to sixteen and two GQA
+        // columns past the six real heads. Only the validated Qwen-shaped
+        // prompt block opts in; it reuses the same FP32 window accumulation and
+        // returns false when the tile cannot be prepared or does not fit, so
+        // the default window/prefill route still runs unchanged. The optional
+        // entry owns the only recoverable allocation handling; the shape gate
+        // deliberately performs no free-memory query.
+        if (ggml_cuda_fattn_kvarn_prompt_tile_32_2_applies(
+                (int) Q->ne[0], (int) Q->ne[1], gqa_ratio, use_gqa_opt,
+                ggml_cuda_fattn_kvarn_windowed_lse_applies(dst)) &&
+                ggml_cuda_fattn_kvarn_mma_case_eligible<256, 256, 32, 2>(ctx)) {
+#if defined(GGML_KVARN_TEST_PRIOR_CUDA_ERROR)
+            if (getenv("GGML_KVARN_TEST_PRIOR_CUDA_ERROR") != nullptr) {
+                // Test-only latch of an unrelated CUDA error. The optional entry
+                // must surface it instead of treating it as its own allocation
+                // failure. Build with -DGGML_KVARN_TEST_PRIOR_CUDA_ERROR only.
+                (void) cudaMalloc(nullptr, 1);
+            }
+#endif
+            const bool applied = ggml_cuda_fattn_kvarn_windowed_try<256, 256, 32, 2>(ctx, dst);
+            if (getenv("GGML_CUDA_FA_ROUTE_DEBUG") != nullptr) {
+                fprintf(stderr, "KVARN_AUTO32 attempted=1 applied=%d\n", int(applied));
+                fflush(stderr);
+            }
+            if (applied) {
+                return true;
+            }
+        }
+    }
+#endif
+
 #if !defined(GGML_USE_MUSA)
     if constexpr ((DKQ == 128 && DV == 128) || (DKQ == 256 && DV == 256)) {
         const bool use_wide_shape = ggml_cuda_fattn_kvarn_use_wide_mma(

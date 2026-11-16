@@ -5,3 +5,6 @@
 DECL_FATTN_MMA_KVARN_CASE(128, 128, 32, 2);
 DECL_FATTN_MMA_KVARN_CASE(256, 256, 32, 2);
 DECL_FATTN_MMA_KVARN_CASE(512, 512, 32, 2);
+
+template bool ggml_cuda_fattn_kvarn_windowed_try<256, 256, 32, 2>(
+        ggml_backend_cuda_context & ctx, ggml_tensor * dst);

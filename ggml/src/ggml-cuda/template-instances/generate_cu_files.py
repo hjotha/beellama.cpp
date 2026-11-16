@@ -204,6 +204,13 @@ for ncols in [8, 16, 32, 64]:
             for head_size in KVARN_MMA_HEAD_SIZES:
                 f.write(SOURCE_FATTN_MMA_KVARN_CASE.format(
                     head_size=head_size, ncols1=ncols1, ncols2=ncols2))
+            # The D256 32x2 tile is an opt-in prompt-prefill geometry: the
+            # generated unit also instantiates the windowed-only entry that the
+            # dispatcher retries before its default column split.
+            if ncols1 == 32 and ncols2 == 2:
+                f.write(
+                    "\ntemplate bool ggml_cuda_fattn_kvarn_windowed_try<256, 256, 32, 2>(\n"
+                    "        ggml_backend_cuda_context & ctx, ggml_tensor * dst);\n")
 
 with open("fattn-mma-kvarn-instance-ncols1_16-ncols2_8.cu", "w") as f:
     f.write(SOURCE_FATTN_MMA_KVARN_START)

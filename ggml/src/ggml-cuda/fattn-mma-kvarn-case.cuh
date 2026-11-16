@@ -323,7 +323,7 @@ static __global__ void ggml_cuda_fattn_kvarn_window_single_finalize_kernel(
     }
 }
 
-template <int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap>
+template <int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool optional_attempt = false>
 static bool ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case_impl(
         ggml_backend_cuda_context & ctx,
         ggml_tensor * dst,
@@ -349,10 +349,32 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case_impl(
 #if !defined(GGML_USE_MUSA)
     // The partial kernel does not share the FlashAttention signature, so it is
     // passed as an opaque entry pointer instead of being cast to fattn_kernel_t.
-    CUDA_CHECK(cudaFuncSetAttribute(
+    // Only the optional prompt tile treats a failure to prepare the kernel as a
+    // recoverable decline; every other caller keeps the original fail-closed
+    // contract. Before the optional attempt, surface any error already latched
+    // on this thread so a previous CUDA failure cannot be mistaken for a fresh
+    // local allocation failure. The peek does not clear the error.
+#if !defined(GGML_USE_HIP)
+    if constexpr (optional_attempt) {
+        const cudaError_t prior_status = cudaPeekAtLastError();
+        if (prior_status != cudaSuccess) {
+            CUDA_CHECK(prior_status);
+        }
+    }
+#endif
+    const cudaError_t attr_status = cudaFuncSetAttribute(
         reinterpret_cast<const void *>(
             ggml_cuda_fattn_kvarn_window_f16_partial_kernel<DKQ, DV, ncols1, ncols2, use_logit_softcap>),
-        cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
+        cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total);
+#if !defined(GGML_USE_HIP)
+    if constexpr (optional_attempt) {
+        if (attr_status == cudaErrorMemoryAllocation) {
+            (void) cudaGetLastError();
+            return false;
+        }
+    }
+#endif
+    CUDA_CHECK(attr_status);
 #endif
 
     ggml_cuda_pool & pool = ctx.pool();
@@ -669,7 +691,7 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case_impl(
     return true;
 }
 
-template <int DKQ, int DV, int ncols1, int ncols2>
+template <int DKQ, int DV, int ncols1, int ncols2, bool optional_attempt = false>
 static bool ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case(
         ggml_backend_cuda_context & ctx,
         ggml_tensor * dst,
@@ -681,12 +703,41 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case(
         return false;
     } else {
         if (use_logit_softcap) {
-            return ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case_impl<DKQ, DV, ncols1, ncols2, true>(
+            return ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case_impl<DKQ, DV, ncols1, ncols2, true, optional_attempt>(
                 ctx, dst, plan, nbytes_shared_total);
         }
-        return ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case_impl<DKQ, DV, ncols1, ncols2, false>(
+        return ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case_impl<DKQ, DV, ncols1, ncols2, false, optional_attempt>(
             ctx, dst, plan, nbytes_shared_total);
     }
+}
+
+// Shared-memory footprint of the F16 window partial kernel. The windowed
+// sub-path converts the compressed records into transient F16 tiles, so it
+// uses the dense FlashAttention shared layout instead of the descriptor one.
+template <int DKQ, int DV, int ncols1, int ncols2>
+static size_t ggml_cuda_fattn_kvarn_window_shared_bytes_f16(
+        int cc,
+        int warp_size_host) {
+    constexpr int ncols = ncols1 * ncols2;
+    const int nthreads       = ggml_cuda_fattn_mma_get_nthreads      (DKQ, DV, ncols, cc);
+    const int nbatch_fa      = ggml_cuda_fattn_mma_get_nbatch_fa     (DKQ, DV, ncols, cc);
+    const int nbatch_K2      = ggml_cuda_fattn_mma_get_nbatch_K2     (DKQ, DV, ncols, cc);
+    const int nbatch_V2      = ggml_cuda_fattn_mma_get_nbatch_V2     (DKQ, DV, ncols, cc);
+    const int nbatch_combine = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols, cc);
+    const bool Q_in_reg      = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols, cc);
+    const int nstages        = ggml_cuda_fattn_mma_get_nstages       (DKQ, DV, ncols1, ncols2, cc);
+    const int nwarps         = nthreads / warp_size_host;
+    const int cols_per_warp  = std::min(ncols, get_cols_per_warp(cc));
+
+    const size_t nbytes_shared_KV_f16_1stage = nbatch_fa * std::max(nbatch_K2 + 4, nbatch_V2 + 4) * sizeof(half2);
+    const size_t nbytes_shared_KV_f16_2stage = nbatch_fa * (nbatch_K2 + 4 + nbatch_V2 + 4) * sizeof(half2);
+    const size_t nbytes_shared_KV_f16 = nstages <= 1 ? nbytes_shared_KV_f16_1stage : nbytes_shared_KV_f16_2stage;
+    const size_t nbytes_shared_Q = ncols * (DKQ/2 + 4) * sizeof(half2);
+    const size_t nbytes_shared_mask = ncols1 * (nbatch_fa/2 + 4) * sizeof(half2);
+    const size_t nbytes_shared_combine = nwarps * cols_per_warp * (nbatch_combine + 4) * sizeof(half2);
+    return std::max(nbytes_shared_combine, Q_in_reg ?
+        std::max(nbytes_shared_Q, nbytes_shared_KV_f16 + nbytes_shared_mask) :
+                 nbytes_shared_Q + nbytes_shared_KV_f16 + nbytes_shared_mask);
 }
 
 template <int DKQ, int DV, int ncols1, int ncols2>
@@ -720,6 +771,27 @@ static size_t ggml_cuda_fattn_kvarn_mma_shared_bytes(
     return std::max(nbytes_shared_combine, Q_in_reg ?
         std::max(nbytes_shared_Q, nbytes_shared_KV_mask_kvarn) :
                  nbytes_shared_Q + nbytes_shared_KV_mask_kvarn);
+}
+
+// Runs only the windowed sub-path for an explicit tile geometry. The caller
+// keeps its normal geometry when the window is disabled or the VRAM planner
+// declines it, so a declined experiment cannot replace a route that fits.
+template <int DKQ, int DV, int ncols1, int ncols2>
+bool ggml_cuda_fattn_kvarn_windowed_try(
+        ggml_backend_cuda_context & ctx,
+        ggml_tensor * dst) {
+    ggml_cuda_fattn_kvarn_plan plan;
+    if (!ggml_cuda_fattn_kvarn_view_supported(ctx.device, dst, &plan)) {
+        return false;
+    }
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    const int warp_size_host = ggml_cuda_info().devices[ctx.device].warp_size;
+    const size_t nbytes_shared_total_f16 =
+        ggml_cuda_fattn_kvarn_window_shared_bytes_f16<DKQ, DV, ncols1, ncols2>(cc, warp_size_host);
+    float logit_softcap;
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+    return ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case<DKQ, DV, ncols1, ncols2, true>(
+        ctx, dst, plan, nbytes_shared_total_f16, logit_softcap != 0.0f);
 }
 
 #if !defined(GGML_USE_MUSA)
@@ -782,31 +854,17 @@ void ggml_cuda_flash_attn_ext_mma_kvarn_case(ggml_backend_cuda_context & ctx, gg
 
     const int  nthreads       = ggml_cuda_fattn_mma_get_nthreads      (DKQ, DV, ncols, cc);
     const int  nbatch_fa      = ggml_cuda_fattn_mma_get_nbatch_fa     (DKQ, DV, ncols, cc);
-    const int  nbatch_K2      = ggml_cuda_fattn_mma_get_nbatch_K2     (DKQ, DV, ncols, cc);
-    const int  nbatch_V2      = ggml_cuda_fattn_mma_get_nbatch_V2     (DKQ, DV, ncols, cc);
-    const int  nbatch_combine = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols, cc);
-    const bool Q_in_reg       = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols, cc);
 
-    const int cols_per_warp = std::min(ncols, get_cols_per_warp(cc));
     const int warp_size_host = ggml_cuda_info().devices[ctx.device].warp_size;
     const int nwarps = nthreads / warp_size_host;
     const bool k_original_domain = ggml_cuda_fattn_kvarn_k_original_domain(dst);
     const bool v_original_domain = ggml_cuda_fattn_kvarn_v_original_domain(dst);
     const bool has_original_domain = k_original_domain || v_original_domain;
 
-    const size_t nbytes_shared_KV = nbatch_fa * std::max(nbatch_K2 + 4, nbatch_V2 + 4) * sizeof(half2);
-    const size_t nbytes_shared_Q = ncols * (DKQ/2 + 4) * sizeof(half2);
-    const size_t nbytes_shared_mask = ncols1 * (nbatch_fa/2 + 4) * sizeof(half2);
-    const size_t nbytes_shared_combine = nwarps * cols_per_warp * (nbatch_combine + 4) * sizeof(half2);
     const size_t nbytes_shared_total = ggml_cuda_fattn_kvarn_mma_shared_bytes<DKQ, DV, ncols1, ncols2>(
         cc, warp_size_host, has_original_domain);
-    const int nstages = ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2, cc);
-    const size_t nbytes_shared_KV_f16_1stage = nbatch_fa * std::max(nbatch_K2 + 4, nbatch_V2 + 4) * sizeof(half2);
-    const size_t nbytes_shared_KV_f16_2stage = nbatch_fa * (nbatch_K2 + 4 + nbatch_V2 + 4) * sizeof(half2);
-    const size_t nbytes_shared_KV_f16 = nstages <= 1 ? nbytes_shared_KV_f16_1stage : nbytes_shared_KV_f16_2stage;
-    const size_t nbytes_shared_total_f16 = std::max(nbytes_shared_combine, Q_in_reg ?
-        std::max(nbytes_shared_Q, nbytes_shared_KV_f16 + nbytes_shared_mask) :
-                 nbytes_shared_Q + nbytes_shared_KV_f16 + nbytes_shared_mask);
+    const size_t nbytes_shared_total_f16 =
+        ggml_cuda_fattn_kvarn_window_shared_bytes_f16<DKQ, DV, ncols1, ncols2>(cc, warp_size_host);
 
     ggml_cuda_pool & pool = ctx.pool();
     cudaStream_t stream = ctx.stream();

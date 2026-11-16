@@ -171,6 +171,15 @@ DECL_FATTN_MMA_KVARN_CASE_EXTERN(128, 128, 16, 8);
 DECL_FATTN_MMA_KVARN_CASE_EXTERN(256, 256, 16, 8);
 
 template <int DKQ, int DV, int ncols1, int ncols2>
+bool ggml_cuda_fattn_kvarn_windowed_try(
+        ggml_backend_cuda_context & ctx,
+        ggml_tensor * dst);
+
+extern template bool ggml_cuda_fattn_kvarn_windowed_try<256, 256, 32, 2>(
+        ggml_backend_cuda_context & ctx,
+        ggml_tensor * dst);
+
+template <int DKQ, int DV, int ncols1, int ncols2>
 bool ggml_cuda_fattn_kvarn_wide_mma_supported(
         ggml_backend_cuda_context & ctx,
         const ggml_tensor * dst);

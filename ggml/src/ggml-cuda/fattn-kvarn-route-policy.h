@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 
@@ -256,4 +257,19 @@ inline bool ggml_cuda_fattn_kvarn_use_wide_mma(
     bool wide_kernel_supported) {
     return wide_kernel_supported && n_q > 8 &&
         n_q <= GGML_CUDA_FATTN_KVARN_SPECIALIZED_DECODE_MAX_Q && gqa > 4;
+}
+
+// Prompt-only opt-in for the D256 32x2 window tile. The tile is qualified for
+// the Qwen-shaped 256-token prefill block, where 32 query rows fill both MMA
+// row halves and six GQA heads split into three two-column groups. All checks
+// here are host-side shape/contract tests: the optional attempt itself handles
+// a fresh allocation failure, so the dispatcher does not need to query free
+// memory before every eligible call.
+inline bool ggml_cuda_fattn_kvarn_prompt_tile_32_2_applies(
+    int  head_dim,
+    int  n_q,
+    int  gqa,
+    bool gqa_opt,
+    bool windowed_lse) {
+    return head_dim == 256 && n_q == 256 && gqa == 6 && gqa_opt && windowed_lse;
 }
