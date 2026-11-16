@@ -1919,6 +1919,16 @@ bool llama_model_loader::load_all_data_streaming(
     }
 
     const size_t n_files = files.size();
+    static constexpr int MAX_ASYNC_DEVS = 16;
+    static constexpr int MAX_WORKERS    = 32;
+
+    struct full_staging_state {
+        std::mutex           mtx;
+        std::vector<uint8_t> buf;
+        std::atomic<size_t>  remaining{0};
+        explicit full_staging_state(size_t n) : remaining(n) {}
+    };
+
     struct tensor_target {
         size_t                               file_offs;
         size_t                               nbytes;
@@ -1926,55 +1936,67 @@ bool llama_model_loader::load_all_data_streaming(
         ggml_tensor *                        tensor;
         bool                                 is_host;
         bool                                 needs_full_staging;
-        ggml_backend_dev_t                   dev;
-        std::shared_ptr<std::vector<uint8_t>> staging;
-        std::shared_ptr<std::atomic<size_t>> remaining;
+        int                                  async_dev_idx;
+        std::shared_ptr<full_staging_state>  full_stage;
     };
 
     std::vector<std::vector<tensor_target>> targets_by_file(n_files);
-    ggml_backend_dev_t async_dev  = nullptr;
-    ggml_backend_buffer_type_t host_buft = nullptr;
+    std::vector<ggml_backend_dev_t>         async_devs;
+    ggml_backend_buffer_type_t              host_buft = nullptr;
 
     for (const auto & [ctx, bufs] : ctx_bufs) {
         for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != nullptr; cur = ggml_get_next_tensor(ctx, cur)) {
             const auto * weight = get_weight(ggml_get_name(cur));
-            if (weight == nullptr) {
+            if (weight == nullptr || weight->idx >= n_files) {
                 continue;
             }
-            const bool is_host = !cur->buffer || ggml_backend_buffer_is_host(cur->buffer);
-            ggml_backend_dev_t dev = nullptr;
+            const size_t nbytes  = ggml_nbytes(cur);
+            const bool   is_host = !cur->buffer || ggml_backend_buffer_is_host(cur->buffer);
+            bool is_default_dev_buft = false;
+            int  async_dev_idx       = -1;
+
             if (!is_host) {
                 auto * buft = ggml_backend_buffer_get_type(cur->buffer);
-                dev = ggml_backend_buft_get_device(buft);
-                if (!async_dev && dev && buft == ggml_backend_dev_buffer_type(dev)) {
-                    ggml_backend_dev_props props;
-                    ggml_backend_dev_get_props(dev, &props);
-                    if (props.caps.async && props.caps.host_buffer && props.caps.events) {
-                        auto * hbuft = ggml_backend_dev_host_buffer_type(dev);
-                        if (hbuft) {
-                            async_dev = dev;
-                            host_buft = hbuft;
+                ggml_backend_dev_t dev = buft ? ggml_backend_buft_get_device(buft) : nullptr;
+                is_default_dev_buft = (dev != nullptr && buft == ggml_backend_dev_buffer_type(dev));
+                if (is_default_dev_buft) {
+                    for (size_t di = 0; di < async_devs.size(); ++di) {
+                        if (async_devs[di] == dev) {
+                            async_dev_idx = static_cast<int>(di);
+                            break;
+                        }
+                    }
+                    if (async_dev_idx < 0 && static_cast<int>(async_devs.size()) < MAX_ASYNC_DEVS) {
+                        ggml_backend_dev_props props;
+                        ggml_backend_dev_get_props(dev, &props);
+                        if (props.caps.async && props.caps.host_buffer && props.caps.events) {
+                            if (auto * hbuft = ggml_backend_dev_host_buffer_type(dev)) {
+                                if (!host_buft) {
+                                    host_buft = hbuft;
+                                }
+                                async_dev_idx = static_cast<int>(async_devs.size());
+                                async_devs.push_back(dev);
+                            }
                         }
                     }
                 }
             }
-            const bool needs_full_staging = !is_host && !(async_dev && dev == async_dev);
-            std::shared_ptr<std::vector<uint8_t>> staging;
-            std::shared_ptr<std::atomic<size_t>> remaining;
+
+            // Repack/split/custom non-host buffer types require a single full-tensor set_tensor(0, nbytes) call.
+            const bool needs_full_staging = !is_host && !is_default_dev_buft;
+            std::shared_ptr<full_staging_state> full_stage;
             if (needs_full_staging) {
-                staging   = std::make_shared<std::vector<uint8_t>>(ggml_nbytes(cur));
-                remaining = std::make_shared<std::atomic<size_t>>(ggml_nbytes(cur));
+                full_stage = std::make_shared<full_staging_state>(nbytes);
             }
             targets_by_file[weight->idx].push_back({
                 weight->offs,
-                ggml_nbytes(cur),
+                nbytes,
                 0,
                 cur,
                 is_host,
                 needs_full_staging,
-                dev,
-                std::move(staging),
-                std::move(remaining),
+                async_dev_idx,
+                std::move(full_stage),
             });
         }
     }
@@ -1994,31 +2016,35 @@ bool llama_model_loader::load_all_data_streaming(
         ? std::max<size_t>(1024 * 1024, chunk_bytes)
         : size_t(8) * 1024 * 1024;
 
-    static constexpr int MAX_WORKERS = 32;
     struct worker_slot {
-        std::array<ggml_backend_buffer_t, 2> pinned_bufs    = {nullptr, nullptr};
-        std::array<std::vector<uint8_t>, 2>  fallback_bufs;
-        std::array<void *, 2>                ptrs           = {nullptr, nullptr};
-        std::array<ggml_backend_event_t, 2>  events         = {nullptr, nullptr};
-        std::array<bool, 2>                  event_recorded = {false, false};
-        ggml_backend_t                       upload_backend = nullptr;
-        int                                  next_buf       = 0;
-        bool                                 initialized    = false;
+        std::array<ggml_backend_buffer_t, 2>                              pinned_bufs     = {nullptr, nullptr};
+        std::array<std::vector<uint8_t>, 2>                               fallback_bufs;
+        std::array<void *, 2>                                             ptrs            = {nullptr, nullptr};
+        std::array<ggml_backend_t, MAX_ASYNC_DEVS>                        upload_backends = {};
+        std::array<bool, MAX_ASYNC_DEVS>                                  dev_attempted   = {};
+        std::array<std::array<ggml_backend_event_t, MAX_ASYNC_DEVS>, 2>   events          = {};
+        std::array<std::array<bool, MAX_ASYNC_DEVS>, 2>                   event_recorded  = {};
+        bool                                                              is_pinned       = false;
+        int                                                               next_buf        = 0;
+        bool                                                              initialized     = false;
     };
 
     struct stream_state {
         std::vector<std::vector<tensor_target>> & targets_by_file;
-        ggml_backend_dev_t                        async_dev;
+        const std::vector<ggml_backend_dev_t> &   async_devs;
         ggml_backend_buffer_type_t                host_buft;
         size_t                                    staging_cap;
         std::array<worker_slot, MAX_WORKERS>      slots;
         std::mutex                                init_mtx;
+        std::mutex                                sync_set_mtx;
         std::mutex                                progress_mtx;
         std::atomic<size_t>                       bytes_transferred{0};
         size_t                                    total_stream_bytes = 0;
         llama_progress_callback                   progress_cb;
         void *                                    progress_ud;
-        bool                                      cancelled = false;
+        bool                                      check_tensors = false;
+        std::atomic<bool>                         validation_failed{false};
+        std::atomic<bool>                         cancelled{false};
 
         ~stream_state() {
             for (auto & s : slots) {
@@ -2026,18 +2052,26 @@ bool llama_model_loader::load_all_data_streaming(
                     continue;
                 }
                 for (int b = 0; b < 2; ++b) {
-                    if (s.events[b]) {
-                        if (s.event_recorded[b]) {
-                            ggml_backend_event_synchronize(s.events[b]);
+                    for (size_t d = 0; d < async_devs.size(); ++d) {
+                        if (s.events[b][d]) {
+                            if (s.event_recorded[b][d]) {
+                                ggml_backend_event_synchronize(s.events[b][d]);
+                                s.event_recorded[b][d] = false;
+                            }
+                            ggml_backend_event_free(s.events[b][d]);
+                            s.events[b][d] = nullptr;
                         }
-                        ggml_backend_event_free(s.events[b]);
                     }
                     if (s.pinned_bufs[b]) {
                         ggml_backend_buffer_free(s.pinned_bufs[b]);
+                        s.pinned_bufs[b] = nullptr;
                     }
                 }
-                if (s.upload_backend) {
-                    ggml_backend_free(s.upload_backend);
+                for (size_t d = 0; d < async_devs.size(); ++d) {
+                    if (s.upload_backends[d]) {
+                        ggml_backend_free(s.upload_backends[d]);
+                        s.upload_backends[d] = nullptr;
+                    }
                 }
             }
         }
@@ -2054,9 +2088,10 @@ bool llama_model_loader::load_all_data_streaming(
 
     stream_state state {
         targets_by_file,
-        async_dev,
+        async_devs,
         host_buft,
         staging_cap,
+        {},
         {},
         {},
         {},
@@ -2064,6 +2099,8 @@ bool llama_model_loader::load_all_data_streaming(
         total_stream_bytes,
         progress_callback,
         progress_callback_user_data,
+        check_tensors,
+        false,
         false,
     };
 
@@ -2078,32 +2115,27 @@ bool llama_model_loader::load_all_data_streaming(
             std::lock_guard<std::mutex> lock(st->init_mtx);
             if (!slot.initialized) {
                 bool pinned_ok = false;
-                if (st->async_dev && st->host_buft) {
-                    slot.upload_backend = ggml_backend_dev_init(st->async_dev, nullptr);
-                    if (slot.upload_backend) {
-                        pinned_ok = true;
-                        for (int b = 0; b < 2; ++b) {
-                            slot.pinned_bufs[b] = ggml_backend_buft_alloc_buffer(st->host_buft, st->staging_cap);
-                            slot.events[b]      = ggml_backend_event_new(st->async_dev);
-                            if (!slot.pinned_bufs[b] || !slot.events[b]) {
-                                pinned_ok = false;
-                                break;
-                            }
-                            slot.ptrs[b] = ggml_backend_buffer_get_base(slot.pinned_bufs[b]);
+                if (!st->async_devs.empty() && st->host_buft) {
+                    pinned_ok = true;
+                    for (int b = 0; b < 2; ++b) {
+                        slot.pinned_bufs[b] = ggml_backend_buft_alloc_buffer(st->host_buft, st->staging_cap);
+                        if (!slot.pinned_bufs[b]) {
+                            pinned_ok = false;
+                            break;
                         }
+                        slot.ptrs[b] = ggml_backend_buffer_get_base(slot.pinned_bufs[b]);
                     }
                     if (!pinned_ok) {
                         for (int b = 0; b < 2; ++b) {
-                            if (slot.events[b])      { ggml_backend_event_free(slot.events[b]); slot.events[b] = nullptr; }
-                            if (slot.pinned_bufs[b]) { ggml_backend_buffer_free(slot.pinned_bufs[b]); slot.pinned_bufs[b] = nullptr; }
+                            if (slot.pinned_bufs[b]) {
+                                ggml_backend_buffer_free(slot.pinned_bufs[b]);
+                                slot.pinned_bufs[b] = nullptr;
+                            }
                             slot.ptrs[b] = nullptr;
-                        }
-                        if (slot.upload_backend) {
-                            ggml_backend_free(slot.upload_backend);
-                            slot.upload_backend = nullptr;
                         }
                     }
                 }
+                slot.is_pinned = pinned_ok;
                 if (!pinned_ok) {
                     for (int b = 0; b < 2; ++b) {
                         slot.fallback_bufs[b].resize(st->staging_cap);
@@ -2116,9 +2148,11 @@ bool llama_model_loader::load_all_data_streaming(
 
         const int buf_id = slot.next_buf;
         slot.next_buf ^= 1;
-        if (slot.event_recorded[buf_id] && slot.events[buf_id]) {
-            ggml_backend_event_synchronize(slot.events[buf_id]);
-            slot.event_recorded[buf_id] = false;
+        for (size_t d = 0; d < st->async_devs.size(); ++d) {
+            if (slot.event_recorded[buf_id][d] && slot.events[buf_id][d]) {
+                ggml_backend_event_synchronize(slot.events[buf_id][d]);
+                slot.event_recorded[buf_id][d] = false;
+            }
         }
         *out_buf_id = buf_id;
         *out_ptr    = slot.ptrs[buf_id];
@@ -2129,6 +2163,9 @@ bool llama_model_loader::load_all_data_streaming(
     ops.submit_chunk = [](void * raw_ctx, int worker_id, int buf_id, uint16_t file_idx, size_t file_offset, size_t n_bytes) -> bool {
         auto * st = static_cast<stream_state *>(raw_ctx);
         if (worker_id < 0 || worker_id >= MAX_WORKERS || buf_id < 0 || buf_id > 1 || file_idx >= st->targets_by_file.size()) {
+            return false;
+        }
+        if (st->cancelled.load(std::memory_order_relaxed) || st->validation_failed.load(std::memory_order_relaxed)) {
             return false;
         }
         auto & slot = st->slots[worker_id];
@@ -2142,12 +2179,12 @@ bool llama_model_loader::load_all_data_streaming(
                     return t.prefix_max_end <= off;
                 });
 
-            bool used_async = false;
+            std::array<bool, MAX_ASYNC_DEVS> used_async_dev = {};
             for (; it != targets.end(); ++it) {
                 if (it->file_offs >= chunk_end) {
                     break;
                 }
-                const size_t t_end = it->file_offs + it->nbytes;
+                const size_t t_end       = it->file_offs + it->nbytes;
                 const size_t slice_start = std::max(file_offset, it->file_offs);
                 const size_t slice_end   = std::min(chunk_end, t_end);
                 if (slice_start >= slice_end) {
@@ -2161,21 +2198,84 @@ bool llama_model_loader::load_all_data_streaming(
                 if (it->is_host) {
                     std::memcpy(static_cast<uint8_t *>(it->tensor->data) + tensor_rel_off, src_ptr, copy_len);
                 } else if (it->needs_full_staging) {
-                    std::memcpy(it->staging->data() + tensor_rel_off, src_ptr, copy_len);
-                    if (it->remaining->fetch_sub(copy_len, std::memory_order_acq_rel) == copy_len) {
-                        ggml_backend_tensor_set(it->tensor, it->staging->data(), 0, it->nbytes);
+                    if (tensor_rel_off == 0 && copy_len == it->nbytes) {
+                        // Fast path: entire tensor fits inside this chunk, no temporary buffer needed.
+                        if (st->check_tensors && !ggml_validate_row_data(it->tensor->type, src_ptr, it->nbytes)) {
+                            LLAMA_LOG_ERROR("%s: tensor '%s' has invalid data\n", __func__, ggml_get_name(it->tensor));
+                            st->validation_failed.store(true, std::memory_order_relaxed);
+                            return false;
+                        }
+                        ggml_backend_tensor_set(it->tensor, src_ptr, 0, it->nbytes);
+                        it->full_stage->remaining.store(0, std::memory_order_release);
+                    } else {
+                        uint8_t * stage_ptr = nullptr;
+                        {
+                            std::lock_guard<std::mutex> lock(it->full_stage->mtx);
+                            if (it->full_stage->buf.empty()) {
+                                it->full_stage->buf.resize(it->nbytes);
+                            }
+                            stage_ptr = it->full_stage->buf.data();
+                        }
+                        std::memcpy(stage_ptr + tensor_rel_off, src_ptr, copy_len);
+                        if (it->full_stage->remaining.fetch_sub(copy_len, std::memory_order_acq_rel) == copy_len) {
+                            const bool valid = !st->check_tensors ||
+                                               ggml_validate_row_data(it->tensor->type, stage_ptr, it->nbytes);
+                            if (valid) {
+                                ggml_backend_tensor_set(it->tensor, stage_ptr, 0, it->nbytes);
+                            }
+                            {
+                                std::lock_guard<std::mutex> lock(it->full_stage->mtx);
+                                std::vector<uint8_t>().swap(it->full_stage->buf);
+                            }
+                            if (!valid) {
+                                LLAMA_LOG_ERROR("%s: tensor '%s' has invalid data\n", __func__, ggml_get_name(it->tensor));
+                                st->validation_failed.store(true, std::memory_order_relaxed);
+                                return false;
+                            }
+                        }
                     }
-                } else if (slot.upload_backend && it->dev == st->async_dev) {
-                    ggml_backend_tensor_set_async(slot.upload_backend, it->tensor, src_ptr, tensor_rel_off, copy_len);
-                    used_async = true;
                 } else {
+                    const int d = it->async_dev_idx;
+                    if (slot.is_pinned && d >= 0 && static_cast<size_t>(d) < st->async_devs.size()) {
+                        if (!slot.dev_attempted[d]) {
+                            std::lock_guard<std::mutex> lock(st->init_mtx);
+                            if (!slot.dev_attempted[d]) {
+                                ggml_backend_dev_t dev = st->async_devs[d];
+                                slot.upload_backends[d] = ggml_backend_dev_init(dev, nullptr);
+                                if (slot.upload_backends[d]) {
+                                    for (int b = 0; b < 2; ++b) {
+                                        slot.events[b][d] = ggml_backend_event_new(dev);
+                                    }
+                                    if (!slot.events[0][d] || !slot.events[1][d]) {
+                                        for (int b = 0; b < 2; ++b) {
+                                            if (slot.events[b][d]) {
+                                                ggml_backend_event_free(slot.events[b][d]);
+                                                slot.events[b][d] = nullptr;
+                                            }
+                                        }
+                                        ggml_backend_free(slot.upload_backends[d]);
+                                        slot.upload_backends[d] = nullptr;
+                                    }
+                                }
+                                slot.dev_attempted[d] = true;
+                            }
+                        }
+                        if (slot.upload_backends[d]) {
+                            ggml_backend_tensor_set_async(slot.upload_backends[d], it->tensor, src_ptr, tensor_rel_off, copy_len);
+                            used_async_dev[d] = true;
+                            continue;
+                        }
+                    }
+                    std::lock_guard<std::mutex> lock(st->sync_set_mtx);
                     ggml_backend_tensor_set(it->tensor, src_ptr, tensor_rel_off, copy_len);
                 }
             }
 
-            if (used_async && slot.events[buf_id]) {
-                ggml_backend_event_record(slot.events[buf_id], slot.upload_backend);
-                slot.event_recorded[buf_id] = true;
+            for (size_t d = 0; d < st->async_devs.size(); ++d) {
+                if (used_async_dev[d] && slot.events[buf_id][d]) {
+                    ggml_backend_event_record(slot.events[buf_id][d], slot.upload_backends[d]);
+                    slot.event_recorded[buf_id][d] = true;
+                }
             }
         }
 
@@ -2184,7 +2284,7 @@ bool llama_model_loader::load_all_data_streaming(
             std::lock_guard<std::mutex> lock(st->progress_mtx);
             const float prog = std::min(1.0f, static_cast<float>(done) / static_cast<float>(st->total_stream_bytes));
             if (!st->progress_cb(prog, st->progress_ud)) {
-                st->cancelled = true;
+                st->cancelled.store(true, std::memory_order_relaxed);
                 return false;
             }
         }
@@ -2199,21 +2299,41 @@ bool llama_model_loader::load_all_data_streaming(
             continue;
         }
         for (int b = 0; b < 2; ++b) {
-            if (s.events[b] && s.event_recorded[b]) {
-                ggml_backend_event_synchronize(s.events[b]);
-                s.event_recorded[b] = false;
+            for (size_t d = 0; d < async_devs.size(); ++d) {
+                if (s.events[b][d] && s.event_recorded[b][d]) {
+                    ggml_backend_event_synchronize(s.events[b][d]);
+                    s.event_recorded[b][d] = false;
+                }
             }
         }
     }
 
-    if (!stream_ok || state.cancelled) {
+    if (state.validation_failed.load()) {
+        throw std::runtime_error("found tensors with invalid data");
+    }
+
+    if (!stream_ok || state.cancelled.load()) {
         return false;
+    }
+
+    for (const auto & vec : targets_by_file) {
+        for (const auto & t : vec) {
+            if (t.needs_full_staging && t.full_stage && t.full_stage->remaining.load(std::memory_order_acquire) != 0) {
+                LLAMA_LOG_ERROR("%s: incomplete streamed data for tensor '%s' (%zu bytes missing)\n",
+                                __func__, ggml_get_name(t.tensor), t.full_stage->remaining.load());
+                return false;
+            }
+        }
     }
 
     if (check_tensors) {
         std::vector<uint8_t> tmp;
         for (const auto & vec : targets_by_file) {
             for (const auto & t : vec) {
+                if (t.needs_full_staging) {
+                    // Already validated before repacking into device/CPU_REPACK buffer
+                    continue;
+                }
                 const void * ptr = nullptr;
                 if (t.is_host) {
                     ptr = t.tensor->data;

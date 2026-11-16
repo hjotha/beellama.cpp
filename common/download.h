@@ -191,6 +191,16 @@ bool common_download_prepare_stream(
 
 void * common_download_get_stream_session_ud(const std::string & first_path);
 
+// Release a prepared-but-unused stream session (lock, fd, temp file). No-op once the loader consumed it.
+void common_download_stream_abort(const std::string & first_path);
+
+// Return all shard temp paths for an active multi-part stream session (empty if not found or single-file).
+std::vector<std::string> common_download_get_stream_splits(const std::string & first_path);
+
+// Final on-disk path of a streamed temp file ("" if unknown or disk-mode=none).
+// In background mode the file appears there once common_download_wait_background() returns.
+std::string common_download_stream_final_path(const std::string & temp_path);
+
 bool common_download_stream_loader(
     const struct llama_model_stream_loader_ops * ops,
     void * ops_ctx,

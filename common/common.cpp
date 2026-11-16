@@ -2329,6 +2329,15 @@ common_gguf_info common_get_gguf_info(const std::string & fname) {
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
+    struct stream_session_guard {
+        std::string first_path;
+        ~stream_session_guard() {
+            if (!first_path.empty()) {
+                common_download_stream_abort(first_path);
+            }
+        }
+    } stream_guard { params.model.path };
+
     auto mparams = common_model_params_to_llama(params);
     const bool bee_tail_request = params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED ||
             params.kv_tail_tokens != "0";
@@ -2394,6 +2403,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         mparams.load_mode               = LLAMA_LOAD_MODE_NONE;
     }
 
+    const bool was_streamed = (mparams.stream_loader != nullptr);
     llama_model * model = nullptr;
     if (params.model.splits.size() > 1) {
         std::vector<const char *> c_splits;
@@ -2407,6 +2417,17 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     }
     if (model == NULL) {
         return;
+    }
+
+    if (was_streamed) {
+        if (const std::string final_main = common_download_stream_final_path(params.model.path); !final_main.empty()) {
+            params.model.path = final_main;
+        }
+        for (auto & s : params.model.splits) {
+            if (const std::string final_split = common_download_stream_final_path(s); !final_split.empty()) {
+                s = final_split;
+            }
+        }
     }
 
     pimpl->model.reset(model);
