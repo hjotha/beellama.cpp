@@ -11,6 +11,24 @@
 
 namespace server_native_slot {
 
+// Native streaming runs only with a single target sequence. Once a restore
+// has mutated it, clear the entire memory exactly once (which invokes the
+// remote reset hook), then forget the slot's bookkeeping. Calling the normal
+// slot prompt_clear first would also remove the sequence and send a second
+// reset to the peer.
+template <class Slot, class ClearMemory>
+void clear_failed_restore(Slot & slot, ClearMemory clear_memory) {
+    try {
+        clear_memory();
+    } catch (...) {
+        // A throwing clear may already have changed memory. Never leave slot
+        // metadata claiming the old state is still usable.
+        slot.prompt_forget_memory();
+        throw;
+    }
+    slot.prompt_forget_memory();
+}
+
 struct Eligibility {
     bool native_stream = false;
     bool adaptive = false;

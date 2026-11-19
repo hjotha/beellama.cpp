@@ -1476,13 +1476,9 @@ struct server_slot {
         return result == server_prompt_cache_result::hit || result == server_prompt_cache_result::unchanged;
     }
 
-    void prompt_clear() {
-        SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
-
-        if (!mem.seq_rm(id, -1, -1)) {
-            SRV_ERR("prompt_clear: failed to clear memory for slot %d; keeping prompt bookkeeping\n", id);
-            return;
-        }
+    // The caller already cleared the whole memory, including the remote
+    // owner. Only reset the associated speculative/prompt bookkeeping here.
+    void prompt_forget_memory() {
         common_speculative_set_state(spec, id, {});
         prompt_reset_after_memory_clear();
         just_restored = false;
@@ -1490,6 +1486,16 @@ struct server_slot {
         logits_last.clear();
         logits_last_n_tokens = -1;
         bootstrap_pending = false;
+    }
+
+    void prompt_clear() {
+        SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
+
+        if (!mem.seq_rm(id, -1, -1)) {
+            SRV_ERR("prompt_clear: failed to clear memory for slot %d; keeping prompt bookkeeping\n", id);
+            return;
+        }
+        prompt_forget_memory();
     }
 
     std::vector<common_adapter_lora_info> lora;
@@ -8418,15 +8424,17 @@ private:
             queue_results.send(std::move(res));
         } catch (const std::bad_alloc &) {
             if (mutated) {
-                slot.prompt_clear();
-                llama_memory_clear(llama_get_memory(ctx_tgt), true);
+                server_native_slot::clear_failed_restore(slot, [&]() {
+                    llama_memory_clear(llama_get_memory(ctx_tgt), true);
+                });
             }
             send_error(task, "Unable to restore slot: native streaming allocation failed",
                     ERROR_TYPE_INVALID_REQUEST);
         } catch (const std::exception & err) {
             if (mutated) {
-                slot.prompt_clear();
-                llama_memory_clear(llama_get_memory(ctx_tgt), true);
+                server_native_slot::clear_failed_restore(slot, [&]() {
+                    llama_memory_clear(llama_get_memory(ctx_tgt), true);
+                });
             }
             send_error(task, std::string("Unable to restore slot: ") + err.what(),
                     ERROR_TYPE_INVALID_REQUEST);

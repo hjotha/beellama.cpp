@@ -6937,6 +6937,7 @@ size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * file
 
     // save the context state using stream saving
     llama_io_write_file io(&file);
+    if (native_active) io.set_native_expected_tokens(uint32_t(n_token_count));
     state_seq_write_data(io, seq_id, 0);
 
     const size_t res = file.tell();
@@ -7324,8 +7325,11 @@ size_t llama_context::state_seq_load_file_streaming(llama_seq_id seq_id, const c
         bool require_native) {
     if (!count_out) { return 0; }
     *count_out = 0;
+    const bool can_restore_native = require_native && remote_native_kvarn_snapshot_supported() &&
+            !remote_native_kvarn_transient_active() && memory &&
+            memory->state_seq_can_restore(seq_id, LLAMA_STATE_SEQ_FLAGS_NATIVE_FULL);
     if (!tokens_out || !memory || seq_id < 0 || uint32_t(seq_id) >= cparams.n_seq_max ||
-            !memory->state_seq_can_restore(seq_id, 0)) { return 0; }
+            (!can_restore_native && !memory->state_seq_can_restore(seq_id, 0))) { return 0; }
     // These representations may materialize their own payloads while parsing;
     // do not claim a bounded streaming contract for them.
     if (!memory->state_streaming_restore_supported()) {
@@ -7340,7 +7344,6 @@ size_t llama_context::state_seq_load_file_streaming(llama_seq_id seq_id, const c
             return 0;
         }
     }
-    const bool native_before = remote_native_kvarn_transient_active();
     try {
         const bool remote_disk = remote_disk_snapshot_enabled();
         const bool native_remote = remote_native_kvarn_enabled();
@@ -7422,11 +7425,9 @@ size_t llama_context::state_seq_load_file_streaming(llama_seq_id seq_id, const c
         // Also covers a throwing publication callback. Tensor bytes become
         // unreachable, so a partial restore can never be advertised as a hit.
         abort_pending_native_restore();
+        // clear invokes the context's remote-reset hook exactly once; a
+        // refused reset poisons the remote backend rather than reusing it.
         memory->clear(false);
-        if (!native_before && backend_remote && remote_native_kvarn_enabled()) {
-            ggml_backend_remote_attn_native_kvarn_discard(backend_remote);
-            (void) ggml_backend_remote_attn_reset(backend_remote, remote_attn_session);
-        }
         LLAMA_LOG_ERROR("%s: %s; empty destination cleared\n", __func__, error.what());
         return 0;
     }
@@ -7582,13 +7583,27 @@ bool llama_context::commit_pending_native_restore(const uint8_t prefix_sha256[32
 size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags,
         uint32_t evaluated_tokens, bool require_native) {
     const bool partial = (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != 0;
+    // This bit is an internal promise made by the file reader, never a way
+    // for callers of the in-memory restore APIs to bypass overflow guards.
+    if (flags & LLAMA_STATE_SEQ_FLAGS_NATIVE_FULL) {
+        throw std::invalid_argument("native FULL restore flag is reserved for the sequence file reader");
+    }
+    const bool native_file_body = !partial && evaluated_tokens > cparams.kv_position_split_p &&
+            remote_native_kvarn_enabled();
     if (remote_native_kvarn_transient_active() && (!partial || !remote_native_kvarn_can_rewind())) {
         throw std::runtime_error("native KVarN4 overflow non-sequence restore is unsupported; use the sequence state file API");
     }
     nextn_decode_id = 0;
     abort_pending_native_restore();
     if (memory) {
-        memory->state_read(io, seq_id, flags);
+        // The memory reader stages writes but cannot see the RKVK trailer,
+        // which follows its frame. Only the file reader provides an evaluated
+        // token count; allow that candidate body and REQUIRE a verified native
+        // trailer below, before any staged writes can commit.
+        const llama_state_seq_flags memory_flags = native_file_body
+                ? llama_state_seq_flags(flags | LLAMA_STATE_SEQ_FLAGS_NATIVE_FULL) : flags;
+        if (native_file_body) io.set_native_expected_tokens(evaluated_tokens);
+        memory->state_read(io, seq_id, memory_flags);
 
         if (!partial) {
             // A native FULL state is an optional trailer after the memory
@@ -7678,7 +7693,7 @@ size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq
                     throw std::runtime_error("native KVarN4 overflow state reader cannot inspect the optional trailer");
                 }
             }
-            if (require_native && !native_trailer) {
+            if ((require_native || native_file_body) && !native_trailer) {
                 throw std::runtime_error("native streaming slot is not a native KVarN4 snapshot");
             }
             if (!native_trailer && remote_native_kvarn_enabled() &&
