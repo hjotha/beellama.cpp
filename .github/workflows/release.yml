@@ -1,6 +1,6 @@
 name: Build / Release
 
-run-name: ${{ inputs.publish_release && format('Release {0}', inputs.tag_name) || format('Build {0} Preview', inputs.source_ref) }}
+run-name: ${{ inputs.publish_release && format('Release {0}', inputs.tag_name) || format('Build {0} Preview', inputs.source_ref) }} [chain ${{ inputs.retry_root || github.run_id }} attempt ${{ inputs.retry_attempt || '0' }}]
 
 on:
   workflow_dispatch:
@@ -22,6 +22,15 @@ on:
         required: true
         default: false
         type: boolean
+      retry_attempt:
+        description: "Internal automatic retry number (0 is the initial run)"
+        type: choice
+        options: ["0", "1", "2"]
+        default: "0"
+      retry_root:
+        description: "Internal originating run ID for automatic retry deduplication"
+        type: string
+        default: ""
 
 concurrency:
   group: ${{ github.workflow }}-${{ inputs.source_ref }}-${{ inputs.publish_release && 'stable' || 'preview' }}
@@ -276,17 +285,21 @@ jobs:
     name: macOS arm64 Metal
     needs: release-meta
     if: ${{ needs.release-meta.outputs.build_packages == 'true' }}
-    runs-on: macos-14
+    runs-on: macos-26
     steps:
-      - name: Reserve cache save time
-        shell: bash
-        run: echo "CACHE_SAVE_DEADLINE=$(($(date +%s) + 330 * 60))" >> "$GITHUB_ENV"
-
       - name: Clone
         uses: actions/checkout@v6
         with:
           ref: ${{ needs.release-meta.outputs.source_sha }}
           fetch-depth: 0
+
+      - name: Clone workflow-owned build helpers
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci-workflow
+          sparse-checkout: .github
+          persist-credentials: false
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -294,17 +307,17 @@ jobs:
           node-version: "24"
 
       - name: ccache
-        uses: ./.github/actions/setup-ccache
+        uses: ./.ci-workflow/.github/actions/setup-ccache
         with:
           key: release-${{ needs.release-meta.outputs.cache_channel }}-macos-arm64
           restore-keys: release-${{ needs.release-meta.outputs.cache_parent_channel }}-macos-arm64
 
-      - name: Build
-        id: build
+      - name: Configure
         run: |
           cmake -B build \
             -DCMAKE_BUILD_TYPE=Release \
             -DGGML_METAL_EMBED_LIBRARY=ON \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3 \
             -DCMAKE_INSTALL_RPATH='@loader_path' \
             -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
             -DLLAMA_FATAL_WARNINGS=ON \
@@ -312,32 +325,20 @@ jobs:
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             ${{ env.CMAKE_ARGS }}
-          if python3 .github/scripts/cache-build-deadline.py -- cmake --build build --config Release -j "$(sysctl -n hw.logicalcpu)"; then
-            :
-          else
-            result=$?
-            if [ "$result" -eq 75 ]; then exit 0; fi
-            exit "$result"
-          fi
-          test -s build/tools/ui/dist/index.html
+
+      - name: Build with checkpoints
+        uses: ./.ci-workflow/.github/actions/build-with-ccache
+        with:
+          key: release-${{ needs.release-meta.outputs.cache_channel }}-macos-arm64
+          shell: bash
+          command: |
+              python3 .ci-workflow/.github/scripts/cache-build-deadline.py -- cmake --build build --config Release -j "$(sysctl -n hw.logicalcpu)"
+          verify-command: |
+            test -s build/tools/ui/dist/index.html
 
       - name: ccache stats
         if: always()
         run: ccache --show-stats
-
-      - name: Save ccache
-        # Only save once the build process tree has exited. A controlled build
-        # deadline keeps partial ccache progress without archiving live writes.
-        if: ${{ success() && !cancelled() }}
-        uses: ./.github/actions/save-rolling-ccache
-        with:
-          key: release-${{ needs.release-meta.outputs.cache_channel }}-macos-arm64
-          ref: refs/heads/main
-          evict-old-files: 1d
-
-      - name: Report incomplete build
-        if: ${{ !cancelled() && steps.build.outputs.timed_out == 'true' }}
-        run: exit 1
 
       - name: Smoke package binaries
         run: |
@@ -371,15 +372,19 @@ jobs:
           - build: arm64
             os: ubuntu-24.04-arm
     steps:
-      - name: Reserve cache save time
-        shell: bash
-        run: echo "CACHE_SAVE_DEADLINE=$(($(date +%s) + 330 * 60))" >> "$GITHUB_ENV"
-
       - name: Clone
         uses: actions/checkout@v6
         with:
           ref: ${{ needs.release-meta.outputs.source_sha }}
           fetch-depth: 0
+
+      - name: Clone workflow-owned build helpers
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci-workflow
+          sparse-checkout: .github
+          persist-credentials: false
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -387,7 +392,7 @@ jobs:
           node-version: "24"
 
       - name: ccache
-        uses: ./.github/actions/setup-ccache
+        uses: ./.ci-workflow/.github/actions/setup-ccache
         with:
           key: release-${{ needs.release-meta.outputs.cache_channel }}-${{ matrix.os }}-cpu
           restore-keys: release-${{ needs.release-meta.outputs.cache_parent_channel }}-${{ matrix.os }}-cpu
@@ -404,8 +409,7 @@ jobs:
           echo "CC=gcc-14" >> "${GITHUB_ENV}"
           echo "CXX=g++-14" >> "${GITHUB_ENV}"
 
-      - name: Build
-        id: build
+      - name: Configure
         run: |
           cmake -B build \
             -DCMAKE_BUILD_TYPE=Release \
@@ -418,32 +422,20 @@ jobs:
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             ${{ env.CMAKE_ARGS }}
-          if python3 .github/scripts/cache-build-deadline.py -- cmake --build build --config Release -j "$(nproc)"; then
-            :
-          else
-            result=$?
-            if [ "$result" -eq 75 ]; then exit 0; fi
-            exit "$result"
-          fi
-          test -s build/tools/ui/dist/index.html
+
+      - name: Build with checkpoints
+        uses: ./.ci-workflow/.github/actions/build-with-ccache
+        with:
+          key: release-${{ needs.release-meta.outputs.cache_channel }}-${{ matrix.os }}-cpu
+          shell: bash
+          command: |
+              python3 .ci-workflow/.github/scripts/cache-build-deadline.py -- cmake --build build --config Release -j "$(nproc)"
+          verify-command: |
+            test -s build/tools/ui/dist/index.html
 
       - name: ccache stats
         if: always()
         run: ccache --show-stats
-
-      - name: Save ccache
-        # Only save once the build process tree has exited. A controlled build
-        # deadline keeps partial ccache progress without archiving live writes.
-        if: ${{ success() && !cancelled() }}
-        uses: ./.github/actions/save-rolling-ccache
-        with:
-          key: release-${{ needs.release-meta.outputs.cache_channel }}-${{ matrix.os }}-cpu
-          ref: refs/heads/main
-          evict-old-files: 1d
-
-      - name: Report incomplete build
-        if: ${{ !cancelled() && steps.build.outputs.timed_out == 'true' }}
-        run: exit 1
 
       - name: Smoke package binaries
         run: |
@@ -470,15 +462,19 @@ jobs:
     if: ${{ needs.release-meta.outputs.build_packages == 'true' }}
     runs-on: ubuntu-22.04
     steps:
-      - name: Reserve cache save time
-        shell: bash
-        run: echo "CACHE_SAVE_DEADLINE=$(($(date +%s) + 330 * 60))" >> "$GITHUB_ENV"
-
       - name: Clone
         uses: actions/checkout@v6
         with:
           ref: ${{ needs.release-meta.outputs.source_sha }}
           fetch-depth: 0
+
+      - name: Clone workflow-owned build helpers
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci-workflow
+          sparse-checkout: .github
+          persist-credentials: false
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -486,7 +482,7 @@ jobs:
           node-version: "24"
 
       - name: ccache
-        uses: ./.github/actions/setup-ccache
+        uses: ./.ci-workflow/.github/actions/setup-ccache
         with:
           key: release-${{ needs.release-meta.outputs.cache_channel }}-ubuntu-vulkan-x64
           restore-keys: release-${{ needs.release-meta.outputs.cache_parent_channel }}-ubuntu-vulkan-x64
@@ -498,8 +494,7 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y build-essential mesa-vulkan-drivers vulkan-sdk libssl-dev
 
-      - name: Build
-        id: build
+      - name: Configure
         run: |
           cmake -B build \
             -DCMAKE_BUILD_TYPE=Release \
@@ -513,32 +508,20 @@ jobs:
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             ${{ env.CMAKE_ARGS }}
-          if python3 .github/scripts/cache-build-deadline.py -- cmake --build build --config Release -j "$(nproc)"; then
-            :
-          else
-            result=$?
-            if [ "$result" -eq 75 ]; then exit 0; fi
-            exit "$result"
-          fi
-          test -s build/tools/ui/dist/index.html
+
+      - name: Build with checkpoints
+        uses: ./.ci-workflow/.github/actions/build-with-ccache
+        with:
+          key: release-${{ needs.release-meta.outputs.cache_channel }}-ubuntu-vulkan-x64
+          shell: bash
+          command: |
+              python3 .ci-workflow/.github/scripts/cache-build-deadline.py -- cmake --build build --config Release -j "$(nproc)"
+          verify-command: |
+            test -s build/tools/ui/dist/index.html
 
       - name: ccache stats
         if: always()
         run: ccache --show-stats
-
-      - name: Save ccache
-        # Only save once the build process tree has exited. A controlled build
-        # deadline keeps partial ccache progress without archiving live writes.
-        if: ${{ success() && !cancelled() }}
-        uses: ./.github/actions/save-rolling-ccache
-        with:
-          key: release-${{ needs.release-meta.outputs.cache_channel }}-ubuntu-vulkan-x64
-          ref: refs/heads/main
-          evict-old-files: 1d
-
-      - name: Report incomplete build
-        if: ${{ !cancelled() && steps.build.outputs.timed_out == 'true' }}
-        run: exit 1
 
       - name: Smoke package binaries
         run: |
@@ -567,15 +550,19 @@ jobs:
       ROCM_VERSION: "7.2.1"
       GPU_TARGETS: "gfx908;gfx90a;gfx942;gfx1030;gfx1100;gfx1101;gfx1102;gfx1151;gfx1150;gfx1200;gfx1201"
     steps:
-      - name: Reserve cache save time
-        shell: bash
-        run: echo "CACHE_SAVE_DEADLINE=$(($(date +%s) + 330 * 60))" >> "$GITHUB_ENV"
-
       - name: Clone
         uses: actions/checkout@v6
         with:
           ref: ${{ needs.release-meta.outputs.source_sha }}
           fetch-depth: 0
+
+      - name: Clone workflow-owned build helpers
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci-workflow
+          sparse-checkout: .github
+          persist-credentials: false
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -588,7 +575,7 @@ jobs:
           tool-cache: true
 
       - name: ccache
-        uses: ./.github/actions/setup-ccache
+        uses: ./.ci-workflow/.github/actions/setup-ccache
         with:
           key: release-${{ needs.release-meta.outputs.cache_channel }}-ubuntu-rocm-${{ env.ROCM_VERSION }}-x64
           restore-keys: release-${{ needs.release-meta.outputs.cache_parent_channel }}-ubuntu-rocm-${{ env.ROCM_VERSION }}-x64
@@ -614,8 +601,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y rocm-hip-sdk
 
-      - name: Build
-        id: build
+      - name: Configure
         run: |
           cmake -B build -S . \
             -DCMAKE_HIP_COMPILER="$(hipconfig -l)/clang" \
@@ -634,32 +620,20 @@ jobs:
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DCMAKE_HIP_COMPILER_LAUNCHER=ccache \
             ${{ env.CMAKE_ARGS }}
-          if python3 .github/scripts/cache-build-deadline.py -- cmake --build build --config Release -j "$(nproc)"; then
-            :
-          else
-            result=$?
-            if [ "$result" -eq 75 ]; then exit 0; fi
-            exit "$result"
-          fi
-          test -s build/tools/ui/dist/index.html
+
+      - name: Build with checkpoints
+        uses: ./.ci-workflow/.github/actions/build-with-ccache
+        with:
+          key: release-${{ needs.release-meta.outputs.cache_channel }}-ubuntu-rocm-${{ env.ROCM_VERSION }}-x64
+          shell: bash
+          command: |
+              python3 .ci-workflow/.github/scripts/cache-build-deadline.py -- cmake --build build --config Release -j "$(nproc)"
+          verify-command: |
+            test -s build/tools/ui/dist/index.html
 
       - name: ccache stats
         if: always()
         run: ccache --show-stats
-
-      - name: Save ccache
-        # Only save once the build process tree has exited. A controlled build
-        # deadline keeps partial ccache progress without archiving live writes.
-        if: ${{ success() && !cancelled() }}
-        uses: ./.github/actions/save-rolling-ccache
-        with:
-          key: release-${{ needs.release-meta.outputs.cache_channel }}-ubuntu-rocm-${{ env.ROCM_VERSION }}-x64
-          ref: refs/heads/main
-          evict-old-files: 1d
-
-      - name: Report incomplete build
-        if: ${{ !cancelled() && steps.build.outputs.timed_out == 'true' }}
-        run: exit 1
 
       - name: Smoke package binaries
         run: |
@@ -692,15 +666,19 @@ jobs:
       LEVEL_ZERO_VERSION: "1.28.2"
       LEVEL_ZERO_UBUNTU_VERSION: "u24.04"
     steps:
-      - name: Reserve cache save time
-        shell: bash
-        run: echo "CACHE_SAVE_DEADLINE=$(($(date +%s) + 330 * 60))" >> "$GITHUB_ENV"
-
       - name: Clone
         uses: actions/checkout@v6
         with:
           ref: ${{ needs.release-meta.outputs.source_sha }}
           fetch-depth: 0
+
+      - name: Clone workflow-owned build helpers
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci-workflow
+          sparse-checkout: .github
+          persist-credentials: false
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -718,7 +696,7 @@ jobs:
           sudo chown -R "${USER}:${USER}" /opt/intel
 
       - name: ccache
-        uses: ./.github/actions/setup-ccache
+        uses: ./.ci-workflow/.github/actions/setup-ccache
         with:
           key: release-${{ needs.release-meta.outputs.cache_channel }}-ubuntu-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64
           restore-keys: release-${{ needs.release-meta.outputs.cache_parent_channel }}-ubuntu-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64
@@ -742,8 +720,7 @@ jobs:
           wget -q "https://github.com/oneapi-src/level-zero/releases/download/v${LEVEL_ZERO_VERSION}/level-zero-devel_${LEVEL_ZERO_VERSION}%2B${LEVEL_ZERO_UBUNTU_VERSION}_amd64.deb" -O level-zero-devel.deb
           sudo apt-get -o Dpkg::Options::="--force-overwrite" install -y ./level-zero.deb ./level-zero-devel.deb
 
-      - name: Build
-        id: build
+      - name: Configure
         run: |
           source "${ONEAPI_ROOT}/setvars.sh"
           cmake -B build -G "Ninja" \
@@ -760,32 +737,21 @@ jobs:
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             ${{ env.CMAKE_ARGS }}
-          if python3 .github/scripts/cache-build-deadline.py -- cmake --build build --config Release -j "$(nproc)"; then
-            :
-          else
-            result=$?
-            if [ "$result" -eq 75 ]; then exit 0; fi
-            exit "$result"
-          fi
-          test -s build/tools/ui/dist/index.html
+
+      - name: Build with checkpoints
+        uses: ./.ci-workflow/.github/actions/build-with-ccache
+        with:
+          key: release-${{ needs.release-meta.outputs.cache_channel }}-ubuntu-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64
+          shell: bash
+          command: |
+              source "${ONEAPI_ROOT}/setvars.sh"
+              python3 .ci-workflow/.github/scripts/cache-build-deadline.py -- cmake --build build --config Release -j "$(nproc)"
+          verify-command: |
+            test -s build/tools/ui/dist/index.html
 
       - name: ccache stats
         if: always()
         run: ccache --show-stats
-
-      - name: Save ccache
-        # Only save once the build process tree has exited. A controlled build
-        # deadline keeps partial ccache progress without archiving live writes.
-        if: ${{ success() && !cancelled() }}
-        uses: ./.github/actions/save-rolling-ccache
-        with:
-          key: release-${{ needs.release-meta.outputs.cache_channel }}-ubuntu-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64
-          ref: refs/heads/main
-          evict-old-files: 1d
-
-      - name: Report incomplete build
-        if: ${{ !cancelled() && steps.build.outputs.timed_out == 'true' }}
-        run: exit 1
 
       - name: Smoke package binaries
         run: |
@@ -820,11 +786,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - cuda: "12.4"
-            cuda_container: "12.4.1-devel-ubuntu22.04"
+          - cuda: "12.8"
+            cuda_container: "12.8.2-devel-ubuntu22.04"
             cuda_cmake_args: "-DGGML_CUDA_CUB_3DOT2=ON"
-          - cuda: "13.3"
-            cuda_container: "13.3.0-devel-ubuntu24.04"
+          - cuda: "13.5"
+            cuda_container: "13.5.0-devel-ubuntu24.04"
             cuda_cmake_args: "-DGGML_CUDA_CUB_3DOT2=OFF"
     steps:
       - name: Dependencies
@@ -832,15 +798,19 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends build-essential ca-certificates cmake ninja-build ccache git file libssl-dev libgomp1 python3
 
-      - name: Reserve cache save time
-        shell: bash
-        run: echo "CACHE_SAVE_DEADLINE=$(($(date +%s) + 330 * 60))" >> "$GITHUB_ENV"
-
       - name: Clone
         uses: actions/checkout@v6
         with:
           ref: ${{ needs.release-meta.outputs.source_sha }}
           fetch-depth: 0
+
+      - name: Clone workflow-owned build helpers
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci-workflow
+          sparse-checkout: .github
+          persist-credentials: false
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -848,14 +818,13 @@ jobs:
           node-version: "24"
 
       - name: ccache
-        uses: ./.github/actions/setup-ccache
+        uses: ./.ci-workflow/.github/actions/setup-ccache
         with:
           key: release-${{ needs.release-meta.outputs.cache_channel }}-ubuntu-cuda-${{ matrix.cuda }}-x64
           restore-keys: release-${{ needs.release-meta.outputs.cache_parent_channel }}-ubuntu-cuda-${{ matrix.cuda }}-x64
           sloppiness: time_macros
 
-      - name: Build
-        id: build
+      - name: Configure
         run: |
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
@@ -873,32 +842,20 @@ jobs:
             ${{ matrix.cuda_cmake_args }} \
             ${{ env.CMAKE_ARGS }} \
             -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined
-          if python3 .github/scripts/cache-build-deadline.py -- cmake --build build --config Release -j "$(nproc)"; then
-            :
-          else
-            result=$?
-            if [ "$result" -eq 75 ]; then exit 0; fi
-            exit "$result"
-          fi
-          test -s build/tools/ui/dist/index.html
+
+      - name: Build with checkpoints
+        uses: ./.ci-workflow/.github/actions/build-with-ccache
+        with:
+          key: release-${{ needs.release-meta.outputs.cache_channel }}-ubuntu-cuda-${{ matrix.cuda }}-x64
+          shell: bash
+          command: |
+              python3 .ci-workflow/.github/scripts/cache-build-deadline.py -- cmake --build build --config Release -j "$(nproc)"
+          verify-command: |
+            test -s build/tools/ui/dist/index.html
 
       - name: ccache stats
         if: always()
         run: ccache --show-stats
-
-      - name: Save ccache
-        # Only save once the build process tree has exited. A controlled build
-        # deadline keeps partial ccache progress without archiving live writes.
-        if: ${{ success() && !cancelled() }}
-        uses: ./.github/actions/save-rolling-ccache
-        with:
-          key: release-${{ needs.release-meta.outputs.cache_channel }}-ubuntu-cuda-${{ matrix.cuda }}-x64
-          ref: refs/heads/main
-          evict-old-files: 1d
-
-      - name: Report incomplete build
-        if: ${{ !cancelled() && steps.build.outputs.timed_out == 'true' }}
-        run: exit 1
 
       - name: Smoke package binaries
         run: |
@@ -923,17 +880,21 @@ jobs:
     name: Windows x64 CPU
     needs: release-meta
     if: ${{ needs.release-meta.outputs.build_packages == 'true' }}
-    runs-on: windows-2025
+    runs-on: windows-2022
     steps:
-      - name: Reserve cache save time
-        shell: bash
-        run: echo "CACHE_SAVE_DEADLINE=$(($(date +%s) + 330 * 60))" >> "$GITHUB_ENV"
-
       - name: Clone
         uses: actions/checkout@v6
         with:
           ref: ${{ needs.release-meta.outputs.source_sha }}
           fetch-depth: 0
+
+      - name: Clone workflow-owned build helpers
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci-workflow
+          sparse-checkout: .github
+          persist-credentials: false
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -941,7 +902,7 @@ jobs:
           node-version: "24"
 
       - name: ccache
-        uses: ./.github/actions/setup-ccache
+        uses: ./.ci-workflow/.github/actions/setup-ccache
         with:
           key: release-${{ needs.release-meta.outputs.cache_channel }}-windows-cpu-x64
           restore-keys: release-${{ needs.release-meta.outputs.cache_parent_channel }}-windows-cpu-x64
@@ -949,16 +910,18 @@ jobs:
       - name: Install Ninja
         run: choco install ninja -y
 
-      - name: Build
-        id: build
+      - name: Configure
         shell: cmd
         run: |
-          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VS_INSTALL_DIR=%%i"
+          for /f "usebackq tokens=*" %%i in (`call "%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -version "[17.0,18.0)" -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VS_INSTALL_DIR=%%i"
           if not defined VS_INSTALL_DIR (
-            echo No Visual Studio installation with the x64 C++ toolset was found
+            echo No Visual Studio 2022 installation with the x64 C++ toolset was found
             exit /b 1
           )
           call "%VS_INSTALL_DIR%\VC\Auxiliary\Build\vcvarsall.bat" x64 || exit /b 1
+          rem vcvarsall prepends bundled Clang 19; use standalone LLVM 20 for fetched libomp.
+          set "PATH=%ProgramFiles%\LLVM\bin;%PATH%"
+          "%ProgramFiles%\LLVM\bin\clang.exe" --version || exit /b 1
           cmake -S . -B build -G "Ninja Multi-Config" ^
             -D CMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake ^
             -DLLAMA_BUILD_BORINGSSL=ON ^
@@ -970,40 +933,38 @@ jobs:
             -DCMAKE_C_COMPILER_LAUNCHER=ccache ^
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache ^
             %CMAKE_ARGS%
-          python .github\scripts\cache-build-deadline.py -- cmake --build build --config Release -j %NUMBER_OF_PROCESSORS%
-          if %errorlevel%==75 exit /b 0
           if errorlevel 1 exit /b %errorlevel%
-          if not exist build\tools\ui\dist\index.html (
-            echo Source-built UI output is missing
-            exit /b 1
-          )
 
-      - name: Verify OpenMP is enabled
-        if: ${{ steps.build.outputs.timed_out != 'true' }}
-        shell: cmd
-        run: |
-          findstr /c:"GGML_OPENMP_ENABLED:INTERNAL=ON" build\CMakeCache.txt >nul || (
-            echo GGML_OPENMP=ON was requested but OpenMP was not found; the CPU backend would ship without it
-            exit /b 1
-          )
+      - name: Build with checkpoints
+        uses: ./.ci-workflow/.github/actions/build-with-ccache
+        with:
+          key: release-${{ needs.release-meta.outputs.cache_channel }}-windows-cpu-x64
+          shell: cmd
+          command: |
+              for /f "usebackq tokens=*" %%i in (`call "%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -version "[17.0,18.0)" -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VS_INSTALL_DIR=%%i"
+              if not defined VS_INSTALL_DIR (
+                echo No Visual Studio 2022 installation with the x64 C++ toolset was found
+                exit /b 1
+              )
+              call "%VS_INSTALL_DIR%\VC\Auxiliary\Build\vcvarsall.bat" x64 || exit /b 1
+              rem vcvarsall prepends bundled Clang 19; use standalone LLVM 20 for fetched libomp.
+              set "PATH=%ProgramFiles%\LLVM\bin;%PATH%"
+              "%ProgramFiles%\LLVM\bin\clang.exe" --version || exit /b 1
+              python .ci-workflow\.github\scripts\cache-build-deadline.py -- cmake --build build --config Release -j %NUMBER_OF_PROCESSORS%
+              if errorlevel 1 exit /b %errorlevel%
+          verify-command: |
+            if not exist build\tools\ui\dist\index.html (
+              echo Source-built UI output is missing
+              exit /b 1
+            )
+            findstr /c:"GGML_OPENMP_ENABLED:INTERNAL=ON" build\CMakeCache.txt >nul || (
+              echo GGML_OPENMP=ON was requested but OpenMP was not found; the CPU backend would ship without it
+              exit /b 1
+            )
 
       - name: ccache stats
         if: always()
         run: ccache --show-stats
-
-      - name: Save ccache
-        # Only save once the build process tree has exited. A controlled build
-        # deadline keeps partial ccache progress without archiving live writes.
-        if: ${{ success() && !cancelled() }}
-        uses: ./.github/actions/save-rolling-ccache
-        with:
-          key: release-${{ needs.release-meta.outputs.cache_channel }}-windows-cpu-x64
-          ref: refs/heads/main
-          evict-old-files: 1d
-
-      - name: Report incomplete build
-        if: ${{ !cancelled() && steps.build.outputs.timed_out == 'true' }}
-        run: exit 1
 
       - name: Pack artifacts
         shell: pwsh
@@ -1055,15 +1016,19 @@ jobs:
       ONEAPI_ROOT: 'C:\Program Files (x86)\Intel\oneAPI'
       ONEAPI_INSTALLER_VERSION: "2025.3.3"
     steps:
-      - name: Reserve cache save time
-        shell: bash
-        run: echo "CACHE_SAVE_DEADLINE=$(($(date +%s) + 330 * 60))" >> "$GITHUB_ENV"
-
       - name: Clone
         uses: actions/checkout@v6
         with:
           ref: ${{ needs.release-meta.outputs.source_sha }}
           fetch-depth: 0
+
+      - name: Clone workflow-owned build helpers
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci-workflow
+          sparse-checkout: .github
+          persist-credentials: false
 
       - name: Install oneAPI
         shell: cmd
@@ -1084,7 +1049,7 @@ jobs:
           "LEVEL_ZERO_V1_SDK_PATH=$($sdkRoot.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: ccache
-        uses: ./.github/actions/setup-ccache
+        uses: ./.ci-workflow/.github/actions/setup-ccache
         with:
           key: release-${{ needs.release-meta.outputs.cache_channel }}-windows-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64
           restore-keys: release-${{ needs.release-meta.outputs.cache_parent_channel }}-windows-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64
@@ -1092,8 +1057,7 @@ jobs:
       - name: Install Ninja
         run: choco install ninja -y
 
-      - name: Build
-        id: build
+      - name: Configure
         shell: cmd
         run: |
           call "%ONEAPI_ROOT%\setvars.bat" intel64 --force
@@ -1114,27 +1078,22 @@ jobs:
             -DLLAMA_BUILD_BORINGSSL=ON ^
             -DCMAKE_C_COMPILER_LAUNCHER=ccache ^
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
-          python .github\scripts\cache-build-deadline.py -- cmake --build build --config Release -j %NUMBER_OF_PROCESSORS% --target ggml-sycl
-          if %errorlevel%==75 exit /b 0
           if errorlevel 1 exit /b %errorlevel%
+
+      - name: Build with checkpoints
+        uses: ./.ci-workflow/.github/actions/build-with-ccache
+        with:
+          key: release-${{ needs.release-meta.outputs.cache_channel }}-windows-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64
+          shell: cmd
+          command: |
+              call "%ONEAPI_ROOT%\setvars.bat" intel64 --force
+              icx --version
+              python .ci-workflow\.github\scripts\cache-build-deadline.py -- cmake --build build --config Release -j %NUMBER_OF_PROCESSORS% --target ggml-sycl
+              if errorlevel 1 exit /b %errorlevel%
 
       - name: ccache stats
         if: always()
         run: ccache --show-stats
-
-      - name: Save ccache
-        # Only save once the build process tree has exited. A controlled build
-        # deadline keeps partial ccache progress without archiving live writes.
-        if: ${{ success() && !cancelled() }}
-        uses: ./.github/actions/save-rolling-ccache
-        with:
-          key: release-${{ needs.release-meta.outputs.cache_channel }}-windows-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64
-          ref: refs/heads/main
-          evict-old-files: 1d
-
-      - name: Report incomplete build
-        if: ${{ !cancelled() && steps.build.outputs.timed_out == 'true' }}
-        run: exit 1
 
       - name: Pack SYCL backend
         shell: pwsh
@@ -1194,15 +1153,19 @@ jobs:
     env:
       VULKAN_VERSION: 1.4.313.2
     steps:
-      - name: Reserve cache save time
-        shell: bash
-        run: echo "CACHE_SAVE_DEADLINE=$(($(date +%s) + 330 * 60))" >> "$GITHUB_ENV"
-
       - name: Clone
         uses: actions/checkout@v6
         with:
           ref: ${{ needs.release-meta.outputs.source_sha }}
           fetch-depth: 0
+
+      - name: Clone workflow-owned build helpers
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci-workflow
+          sparse-checkout: .github
+          persist-credentials: false
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -1220,7 +1183,7 @@ jobs:
           "C:\VulkanSDK\${env:VULKAN_VERSION}\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: ccache
-        uses: ./.github/actions/setup-ccache
+        uses: ./.ci-workflow/.github/actions/setup-ccache
         with:
           key: release-${{ needs.release-meta.outputs.cache_channel }}-windows-vulkan-${{ env.VULKAN_VERSION }}-x64
           restore-keys: release-${{ needs.release-meta.outputs.cache_parent_channel }}-windows-vulkan-${{ env.VULKAN_VERSION }}-x64
@@ -1228,8 +1191,7 @@ jobs:
       - name: Install Ninja
         run: choco install ninja -y
 
-      - name: Build
-        id: build
+      - name: Configure
         shell: cmd
         run: |
           for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VS_INSTALL_DIR=%%i"
@@ -1247,27 +1209,26 @@ jobs:
             -DLLAMA_BUILD_BORINGSSL=ON ^
             -DCMAKE_C_COMPILER_LAUNCHER=ccache ^
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
-          python .github\scripts\cache-build-deadline.py -- cmake --build build --config Release -j %NUMBER_OF_PROCESSORS% --target ggml-vulkan
-          if %errorlevel%==75 exit /b 0
           if errorlevel 1 exit /b %errorlevel%
+
+      - name: Build with checkpoints
+        uses: ./.ci-workflow/.github/actions/build-with-ccache
+        with:
+          key: release-${{ needs.release-meta.outputs.cache_channel }}-windows-vulkan-${{ env.VULKAN_VERSION }}-x64
+          shell: cmd
+          command: |
+              for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VS_INSTALL_DIR=%%i"
+              if not defined VS_INSTALL_DIR (
+                echo No Visual Studio installation with the x64 C++ toolset was found
+                exit /b 1
+              )
+              call "%VS_INSTALL_DIR%\VC\Auxiliary\Build\vcvarsall.bat" x64 || exit /b 1
+              python .ci-workflow\.github\scripts\cache-build-deadline.py -- cmake --build build --config Release -j %NUMBER_OF_PROCESSORS% --target ggml-vulkan
+              if errorlevel 1 exit /b %errorlevel%
 
       - name: ccache stats
         if: always()
         run: ccache --show-stats
-
-      - name: Save ccache
-        # Only save once the build process tree has exited. A controlled build
-        # deadline keeps partial ccache progress without archiving live writes.
-        if: ${{ success() && !cancelled() }}
-        uses: ./.github/actions/save-rolling-ccache
-        with:
-          key: release-${{ needs.release-meta.outputs.cache_channel }}-windows-vulkan-${{ env.VULKAN_VERSION }}-x64
-          ref: refs/heads/main
-          evict-old-files: 1d
-
-      - name: Report incomplete build
-        if: ${{ !cancelled() && steps.build.outputs.timed_out == 'true' }}
-        run: exit 1
 
       - name: Pack Vulkan backend
         run: |
@@ -1288,20 +1249,26 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - cuda: "12.4"
+          - cuda: "12.8"
             cuda_cmake_args: "-DGGML_CUDA_CUB_3DOT2=ON"
           - cuda: "13.3"
             cuda_cmake_args: "-DGGML_CUDA_CUB_3DOT2=OFF"
+          - cuda: "13.5"
+            cuda_cmake_args: "-DGGML_CUDA_CUB_3DOT2=OFF"
     steps:
-      - name: Reserve cache save time
-        shell: bash
-        run: echo "CACHE_SAVE_DEADLINE=$(($(date +%s) + 330 * 60))" >> "$GITHUB_ENV"
-
       - name: Clone
         uses: actions/checkout@v6
         with:
           ref: ${{ needs.release-meta.outputs.source_sha }}
           fetch-depth: 0
+
+      - name: Clone workflow-owned build helpers
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci-workflow
+          sparse-checkout: .github
+          persist-credentials: false
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -1309,14 +1276,14 @@ jobs:
           node-version: "24"
 
       - name: ccache
-        uses: ./.github/actions/setup-ccache
+        uses: ./.ci-workflow/.github/actions/setup-ccache
         with:
           key: release-${{ needs.release-meta.outputs.cache_channel }}-windows-cuda-${{ matrix.cuda }}
           restore-keys: release-${{ needs.release-meta.outputs.cache_parent_channel }}-windows-cuda-${{ matrix.cuda }}
           sloppiness: time_macros
 
       - name: Install CUDA Toolkit
-        uses: ./.github/actions/windows-setup-cuda
+        uses: ./.ci-workflow/.github/actions/windows-setup-cuda
         with:
           cuda_version: ${{ matrix.cuda }}
 
@@ -1343,8 +1310,7 @@ jobs:
       - name: Install Ninja
         run: choco install ninja -y
 
-      - name: Build
-        id: build
+      - name: Configure
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
@@ -1361,27 +1327,22 @@ jobs:
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache ^
             -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache ^
             ${{ matrix.cuda_cmake_args }}
-          python .github\scripts\cache-build-deadline.py -- cmake --build build --config Release -j %NUMBER_OF_PROCESSORS% --target ggml-cuda
-          if %errorlevel%==75 exit /b 0
           if errorlevel 1 exit /b %errorlevel%
+
+      - name: Build with checkpoints
+        uses: ./.ci-workflow/.github/actions/build-with-ccache
+        with:
+          key: release-${{ needs.release-meta.outputs.cache_channel }}-windows-cuda-${{ matrix.cuda }}
+          shell: cmd
+          command: |
+              call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+              nvcc --version || exit /b 1
+              python .ci-workflow\.github\scripts\cache-build-deadline.py -- cmake --build build --config Release -j %NUMBER_OF_PROCESSORS% --target ggml-cuda
+              if errorlevel 1 exit /b %errorlevel%
 
       - name: ccache stats
         if: always()
         run: ccache --show-stats
-
-      - name: Save ccache
-        # Only save once the build process tree has exited. A controlled build
-        # deadline keeps partial ccache progress without archiving live writes.
-        if: ${{ success() && !cancelled() }}
-        uses: ./.github/actions/save-rolling-ccache
-        with:
-          key: release-${{ needs.release-meta.outputs.cache_channel }}-windows-cuda-${{ matrix.cuda }}
-          ref: refs/heads/main
-          evict-old-files: 1d
-
-      - name: Report incomplete build
-        if: ${{ !cancelled() && steps.build.outputs.timed_out == 'true' }}
-        run: exit 1
 
       - name: Pack CUDA backend
         shell: pwsh
@@ -1435,15 +1396,19 @@ jobs:
       HIPSDK_INSTALLER_VERSION: "26.Q1"
       GPU_TARGETS: "gfx1150;gfx1151;gfx1200;gfx1201;gfx1100;gfx1101;gfx1102;gfx1030;gfx1031;gfx1032"
     steps:
-      - name: Reserve cache save time
-        shell: bash
-        run: echo "CACHE_SAVE_DEADLINE=$(($(date +%s) + 330 * 60))" >> "$GITHUB_ENV"
-
       - name: Clone
         uses: actions/checkout@v6
         with:
           ref: ${{ needs.release-meta.outputs.source_sha }}
           fetch-depth: 0
+
+      - name: Clone workflow-owned build helpers
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci-workflow
+          sparse-checkout: .github
+          persist-credentials: false
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -1457,7 +1422,7 @@ jobs:
           7z x data.tar
 
       - name: ccache
-        uses: ./.github/actions/setup-ccache
+        uses: ./.ci-workflow/.github/actions/setup-ccache
         with:
           key: release-${{ needs.release-meta.outputs.cache_channel }}-windows-hip-${{ env.HIPSDK_INSTALLER_VERSION }}-x64
           restore-keys: release-${{ needs.release-meta.outputs.cache_parent_channel }}-windows-hip-${{ env.HIPSDK_INSTALLER_VERSION }}-x64
@@ -1485,8 +1450,7 @@ jobs:
           }
           & $clangPath.FullName --version
 
-      - name: Build
-        id: build
+      - name: Configure
         run: |
           $ErrorActionPreference = "Stop"
           $env:HIP_PATH=$(Resolve-Path 'C:\Program Files\AMD\ROCm\*\bin\clang.exe' | Split-Path | Split-Path)
@@ -1507,43 +1471,42 @@ jobs:
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache `
             -DCMAKE_HIP_COMPILER_LAUNCHER=ccache `
             -DLLAMA_BUILD_BORINGSSL=ON
-          $buildJobs = [int]$env:NUMBER_OF_PROCESSORS
-          python .github/scripts/cache-build-deadline.py -- cmake --build build --target ggml-hip -j $buildJobs
-          if ($LASTEXITCODE -eq 75) { exit 0 }
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          New-Item -ItemType Directory -Force -Path "build\bin\rocblas\library" | Out-Null
-          New-Item -ItemType Directory -Force -Path "build\bin\hipblaslt\library" | Out-Null
-          Copy-Item "${env:HIP_PATH}\bin\libhipblas.dll" "build\bin\"
-          Copy-Item "${env:HIP_PATH}\bin\libhipblaslt.dll" "build\bin\"
-          Copy-Item "${env:HIP_PATH}\bin\rocblas.dll" "build\bin\"
-          Copy-Item "${env:HIP_PATH}\bin\amdhip64_7.dll" "build\bin\"
-          Copy-Item "${env:HIP_PATH}\bin\amd_comgr_3.dll" "build\bin\"
-          $kpack = Join-Path $env:HIP_PATH "bin\rocm_kpack.dll"
-          if (Test-Path $kpack) {
-            Copy-Item $kpack "build\bin\"
-          } else {
-            Write-Host "ROCm SDK does not supply rocm_kpack.dll; verifying that packaged binaries do not import it"
-          }
-          Copy-Item "${env:HIP_PATH}\bin\rocblas\library\*" "build\bin\rocblas\library\"
-          Copy-Item "${env:HIP_PATH}\bin\hipblaslt\library\*" "build\bin\hipblaslt\library\"
+
+      - name: Build with checkpoints
+        uses: ./.ci-workflow/.github/actions/build-with-ccache
+        with:
+          key: release-${{ needs.release-meta.outputs.cache_channel }}-windows-hip-${{ env.HIPSDK_INSTALLER_VERSION }}-x64
+          shell: pwsh
+          command: |
+              $ErrorActionPreference = "Stop"
+              $env:HIP_PATH=$(Resolve-Path 'C:\Program Files\AMD\ROCm\*\bin\clang.exe' | Split-Path | Split-Path)
+              $env:CMAKE_PREFIX_PATH="${env:HIP_PATH}"
+              $buildJobs = [int]$env:NUMBER_OF_PROCESSORS
+              python .ci-workflow/.github/scripts/cache-build-deadline.py -- cmake --build build --target ggml-hip -j $buildJobs
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          verify-command: |
+            $ErrorActionPreference = "Stop"
+            $env:HIP_PATH=$(Resolve-Path 'C:\Program Files\AMD\ROCm\*\bin\clang.exe' | Split-Path | Split-Path)
+            New-Item -ItemType Directory -Force -Path "build\bin\rocblas\library" | Out-Null
+            New-Item -ItemType Directory -Force -Path "build\bin\hipblaslt\library" | Out-Null
+            Copy-Item "${env:HIP_PATH}\bin\libhipblas.dll" "build\bin\"
+            Copy-Item "${env:HIP_PATH}\bin\libhipblaslt.dll" "build\bin\"
+            Copy-Item "${env:HIP_PATH}\bin\rocblas.dll" "build\bin\"
+            Copy-Item "${env:HIP_PATH}\bin\amdhip64_7.dll" "build\bin\"
+            Copy-Item "${env:HIP_PATH}\bin\amd_comgr_3.dll" "build\bin\"
+            $kpack = Join-Path $env:HIP_PATH "bin\rocm_kpack.dll"
+            if (Test-Path $kpack) {
+              Copy-Item $kpack "build\bin\"
+            } else {
+              Write-Host "ROCm SDK does not supply rocm_kpack.dll; verifying that packaged binaries do not import it"
+            }
+            Copy-Item "${env:HIP_PATH}\bin\rocblas\library\*" "build\bin\rocblas\library\"
+            Copy-Item "${env:HIP_PATH}\bin\hipblaslt\library\*" "build\bin\hipblaslt\library\"
 
       - name: ccache stats
         if: always()
         run: ccache --show-stats
-
-      - name: Save ccache
-        # Only save once the build process tree has exited. A controlled build
-        # deadline keeps partial ccache progress without archiving live writes.
-        if: ${{ success() && !cancelled() }}
-        uses: ./.github/actions/save-rolling-ccache
-        with:
-          key: release-${{ needs.release-meta.outputs.cache_channel }}-windows-hip-${{ env.HIPSDK_INSTALLER_VERSION }}-x64
-          ref: refs/heads/main
-          evict-old-files: 1d
-
-      - name: Report incomplete build
-        if: ${{ !cancelled() && steps.build.outputs.timed_out == 'true' }}
-        run: exit 1
 
       - name: Pack artifacts
         run: |
@@ -1561,9 +1524,57 @@ jobs:
           path: beellama-bin-win-hip-radeon-x64.zip
           name: beellama-bin-win-hip-radeon-x64.zip
 
+  retry-builds:
+    name: Check incomplete builds
+    needs:
+      - release-meta
+      - macos-arm64
+      - ubuntu-cpu
+      - ubuntu-vulkan
+      - ubuntu-rocm
+      - ubuntu-sycl
+      - ubuntu-cuda
+      - windows-cpu
+      - windows-sycl
+      - windows-vulkan
+      - windows-cuda
+      - windows-hip
+    # This stage must run after failed/cancelled lanes, before downstream jobs.
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+      checks: read
+      contents: read
+    outputs:
+      proceed: ${{ steps.retry.outputs.proceed }}
+    steps:
+      - name: Clone workflow-owned retry controller
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - name: Evaluate builds and dispatch a fresh run if incomplete
+        id: retry
+        uses: actions/github-script@v8
+        env:
+          RELEASE_INPUTS: ${{ toJSON(inputs) }}
+          BUILD_RESULTS: ${{ toJSON(needs) }}
+        with:
+          script: |
+            await require('./.github/scripts/retry-release.cjs')({
+              github, context, core,
+              inputs: JSON.parse(process.env.RELEASE_INPUTS),
+              results: JSON.parse(process.env.BUILD_RESULTS),
+            });
+
   package-assets:
     name: Assemble release assets
+    if: ${{ needs.retry-builds.outputs.proceed == 'true' }}
     needs:
+      - retry-builds
       - release-meta
       - macos-arm64
       - ubuntu-cpu
@@ -1649,7 +1660,7 @@ jobs:
             --require-name "libomp.dll" \
             --forbid-name "libomp140.x86_64.dll" \
             release/beellama-${TAG_NAME}-bin-win-*.zip
-          for cuda_version in 12.4 13.3; do
+          for cuda_version in 12.8 13.5; do
             package_zip="release/beellama-${TAG_NAME}-bin-win-cuda-${cuda_version}-x64.zip"
             runtime_zip="release/beellama-${TAG_NAME}-cudart-win-cuda-${cuda_version}-x64.zip"
             if [[ -f "${package_zip}" && -f "${runtime_zip}" ]]; then
@@ -1717,8 +1728,9 @@ jobs:
 
   docker-build:
     name: Docker (${{ matrix.config.display }})
-    if: ${{ needs.release-meta.outputs.publish_docker == 'true' }}
+    if: ${{ needs.retry-builds.outputs.proceed == 'true' && needs.release-meta.outputs.publish_docker == 'true' }}
     needs:
+      - retry-builds
       - release-meta
       - ubuntu-cpu
       - ubuntu-vulkan
@@ -1751,23 +1763,23 @@ jobs:
             runtime_packages: ca-certificates curl ffmpeg libgomp1
             runs_on: ubuntu-24.04-arm
           - name: cuda12
-            display: CUDA 12.4
+            display: CUDA 12.8
             group: cuda12
             arch: amd64
             platform: linux/amd64
-            artifact: beellama-bin-ubuntu-cuda-12.4-x64.tar.gz
+            artifact: beellama-bin-ubuntu-cuda-12.8-x64.tar.gz
             dockerfile: .devops/runtime-server.Dockerfile
-            base_image: nvidia/cuda:12.4.1-runtime-ubuntu22.04
+            base_image: nvidia/cuda:12.8.2-runtime-ubuntu22.04
             runtime_packages: ca-certificates curl ffmpeg libgomp1
             runs_on: ubuntu-24.04
           - name: cuda13
-            display: CUDA 13.3
+            display: CUDA 13.5
             group: cuda13
             arch: amd64
             platform: linux/amd64
-            artifact: beellama-bin-ubuntu-cuda-13.3-x64.tar.gz
+            artifact: beellama-bin-ubuntu-cuda-13.5-x64.tar.gz
             dockerfile: .devops/runtime-server.Dockerfile
-            base_image: nvidia/cuda:13.3.0-runtime-ubuntu24.04
+            base_image: nvidia/cuda:13.5.0-runtime-ubuntu24.04
             runtime_packages: ca-certificates curl ffmpeg libgomp1
             runs_on: ubuntu-24.04
           - name: rocm
@@ -1911,11 +1923,11 @@ jobs:
             platforms: linux/amd64 linux/arm64
             tag_suffixes: none -cpu
           - group: cuda12
-            display: CUDA 12.4
+            display: CUDA 12.8
             platforms: linux/amd64
             tag_suffixes: -cuda -cuda12
           - group: cuda13
-            display: CUDA 13.3
+            display: CUDA 13.5
             platforms: linux/amd64
             tag_suffixes: -cuda13
           - group: rocm

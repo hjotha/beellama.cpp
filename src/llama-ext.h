@@ -8,10 +8,12 @@
 
 #include <string>
 #include "llama-kv-memory-stats.h"
+#include "llama-arch.h"
 
 #include <array>
 #include <cstdint>
 #include <map>
+#include <string>
 #include <vector>
 
 struct ggml_remote_attn_kvarn_stage;
@@ -207,6 +209,28 @@ struct llama_prompt_cache_profile {
 // Context owner thread only. Allocation size and recurrent rollback capacity do not change KV semantics.
 LLAMA_API llama_prompt_cache_profile llama_get_prompt_cache_profile(const llama_context * ctx, llama_seq_id seq_id = -1);
 
+//
+// llama architecture queries
+//
+
+// all the LLM architectures known to the library
+LLAMA_API std::vector<llm_arch> llama_arch_all();
+
+// the canonical name of an architecture (e.g. "llama"), or "unknown"
+LLAMA_API const char * llama_arch_name(llm_arch arch);
+
+// the architecture with the given canonical name, or LLM_ARCH_UNKNOWN
+LLAMA_API llm_arch llama_arch_from_string(const std::string & name);
+
+// the arch-resolved GGUF key of a KV id, e.g. LLM_KV_CONTEXT_LENGTH -> "llama.context_length"
+LLAMA_API std::string llama_arch_kv_name(llm_arch arch, llm_kv key);
+
+LLAMA_API bool llama_arch_supports_sm_tensor(llm_arch arch);
+
+LLAMA_API bool llama_arch_supports_mixed_batch(llm_arch arch);
+
+// FIXME temporary function for better error messages
+LLAMA_API bool llama_arch_supports_save(llm_arch arch);
 
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(

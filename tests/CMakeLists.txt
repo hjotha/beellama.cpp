@@ -430,6 +430,8 @@ function(llama_build_and_test source)
     set_property(TEST ${TEST_TARGET} PROPERTY LABELS ${LLAMA_TEST_LABEL})
 endfunction()
 
+llama_build_and_test(test-io-write-host.cpp LINK ggml)
+
 # build test-tokenizer-0 target once and add many tests
 llama_build(test-tokenizer-0.cpp)
 
@@ -497,8 +499,12 @@ target_compile_features(test-position-split-capacity PRIVATE cxx_std_17)
 llama_build(test-position-split-teacher-pair.cpp)
 target_include_directories(test-position-split-teacher-pair PRIVATE ${PROJECT_SOURCE_DIR}/src)
 target_compile_features(test-position-split-teacher-pair PRIVATE cxx_std_17)
+llama_build(test-llama-archs.cpp)
+set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
+file(MAKE_DIRECTORY "${MODEL_DIR}")
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+    target_compile_definitions(test-llama-archs PRIVATE TEST_LLAMA_ARCHS_INTERNAL)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
     llama_build_and_test(test-kv-tail-input.cpp)
     target_include_directories(test-kv-tail-input PRIVATE ${PROJECT_SOURCE_DIR}/src)
@@ -570,7 +576,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         target_include_directories(test-json-schema-to-grammar PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     endif()
     llama_build_and_test(test-server-component.cpp  LABEL behavior)
-    target_include_directories(test-server-component PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    target_include_directories(test-server-component PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/tools/mtmd)
     target_link_libraries(test-server-component PRIVATE server-context)
 
     if (NOT GGML_BACKEND_DL)
@@ -600,9 +606,6 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
     # llama_build_and_test(test-double-float.cpp) # SLOW
 
-    # TODO: after `test-llama-archs` is refactored to not link internal symbols, we can move all related tests out of
-    #       this branch and run them on all platforms
-    llama_build(test-llama-archs.cpp)
     llama_test(test-llama-archs NAME test-lilicorr-state ARGS --test-lilicorr-state)
     llama_test(
         test-llama-archs
@@ -817,9 +820,71 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build(test-fusion.cpp)
 endif()
 
+if (GGML_CPU AND (NOT WIN32 OR NOT BUILD_SHARED_LIBS))
+    llama_build(test-fp8.cpp)
+    set(FP8_MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models-fp8")
+    file(MAKE_DIRECTORY "${FP8_MODEL_DIR}")
+    llama_test(test-llama-archs NAME test-generate-fp8-models LABEL "main behavior backend"
+        ARGS -a llama -s 1 -o "${FP8_MODEL_DIR}")
+    set_tests_properties(test-generate-fp8-models PROPERTIES FIXTURES_SETUP fp8-models)
+    llama_test(test-fp8 NAME test-fp8-requantize LABEL "main behavior backend"
+        ARGS --models "${FP8_MODEL_DIR}")
+    set_tests_properties(test-fp8-requantize PROPERTIES FIXTURES_REQUIRED fp8-models)
+endif()
+
+llama_test(
+    test-llama-archs
+    NAME test-generate-models
+    LABEL "main behavior backend"
+    ARGS -o "${MODEL_DIR}"
+)
+set_tests_properties(test-generate-models PROPERTIES
+    FIXTURES_SETUP generate-models
+)
+
+# Target model for test-speculative-rejection-sampling
+set(SPEC_TARGET_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-speculative-models/target")
+file(MAKE_DIRECTORY "${SPEC_TARGET_DIR}")
+llama_test(
+    test-llama-archs
+    NAME test-generate-speculative-target
+    LABEL main
+    ARGS -a llama -s 999 -o "${SPEC_TARGET_DIR}"
+)
+set_tests_properties(
+    test-generate-speculative-target
+    PROPERTIES FIXTURES_SETUP speculative-model
+)
+
+# To avoid recreating the model use the fixture exclude any option:
+# -FA "^speculative-model$"
+llama_build_and_test(test-speculative-rejection-sampling.cpp ARGS
+    -m "${SPEC_TARGET_DIR}/llama-dense.gguf")
+set_tests_properties(test-speculative-rejection-sampling PROPERTIES FIXTURES_REQUIRED speculative-model)
+
+# Test context state handling across all architectures, using the generated dummy models
+llama_test(
+    test-llama-context
+    LABEL "main behavior backend"
+    ARGS --models "${MODEL_DIR}"
+)
+# abort on graph reallocations that the initial reserve should have covered
+set_tests_properties(test-llama-context PROPERTIES
+    FIXTURES_REQUIRED generate-models
+    ENVIRONMENT "GGML_SCHED_DEBUG_REALLOC=1"
+)
+
+llama_build(test-fusion.cpp)
+
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp  LABEL behavior)
 llama_build_and_test(test-jinja.cpp  LABEL behavior)
 llama_test(test-jinja  NAME test-jinja-py  ARGS -py  LABEL "python behavior")
+llama_test_cmd(python3
+    NAME test-conversion-fp8
+    LABEL "python behavior"
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+    ARGS -m unittest discover -s tests -p test_conversion_fp8.py -v
+)
 llama_build_and_test(test-json-schema.cpp  LABEL behavior)
 llama_build_and_test(test-chat-auto-parser.cpp  LABEL behavior  WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 llama_build_and_test(test-chat-template.cpp  LABEL behavior)
@@ -1138,6 +1203,8 @@ set_property(TEST test-kvarn-split-fused-scaffold PROPERTY LABELS main)
 
 llama_build_and_test(test-adaptive-dm.cpp)
 llama_build_and_test(test-perplexity-plumbing.cpp ARGS ${PROJECT_SOURCE_DIR})
+llama_build_and_test(test-kvarn-geometry-policy.cpp)
+llama_build_and_test(test-vulkan-kvarn-policy.cpp)
 llama_build_and_test(test-cuda-fattn-route-policy.cpp ARGS ${PROJECT_SOURCE_DIR})
 llama_build_and_test(test-cuda-fattn-vec-policy.cpp ARGS ${PROJECT_SOURCE_DIR})
 add_executable(test-cuda-pool-allocation-plan test-cuda-pool-allocation-plan.cpp)
@@ -1338,6 +1405,8 @@ if (GGML_CUDA)
     add_executable(test-custom-tail-model test-custom-tail-model.cpp)
     target_link_libraries(test-custom-tail-model PRIVATE llama ggml)
 endif()
+
+llama_build_and_test(test-backend-tensor.cpp LINK ggml)
 
 llama_build_and_test(test-tiled-mulmat.cpp  LABEL "main behavior backend"  LINK ggml)
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model behavior")

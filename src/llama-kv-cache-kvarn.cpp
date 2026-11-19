@@ -3182,7 +3182,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         uint32_t n_seq_max,
         uint32_t n_batch,
         uint32_t n_ubatch,
-        uint32_t n_pad,
+        uint32_t /*n_pad*/,
         uint32_t n_swa,
         llama_swa_type swa_type,
         const layer_filter_cb & filter,
@@ -3234,7 +3234,6 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     // for the tail offset when deciding whether a ring slot is live.
     n_groups_per_stream(kvarn_record_groups_per_stream(kv_size_local, n_ubatch, n_swa, swa, tail_groups)),
     exact_tail_tokens(tail_tokens),
-    metadata_n_pad(n_pad),
     metadata_n_swa(n_swa),
     metadata_swa_type(swa_type),
     metadata_n_ubatch(n_ubatch),
@@ -3243,7 +3242,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     exact_tail_type(tail_type_requested),
     state_owners(n_stream),
     metadata(std::make_unique<llama_kv_cache>(
-        model,
+        model, model.no_alloc(),
         hparams,
         GGML_TYPE_F16,
         GGML_TYPE_F16,
@@ -3252,7 +3251,6 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         unified,
         kv_size,
         n_seq_max,
-        n_pad,
         n_swa,
         swa_type,
         nullptr,
@@ -3292,8 +3290,8 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
             throw std::invalid_argument("mixed KVarN/standard KV currently requires non-SWA and one sequence or non-unified multi-sequence");
         }
         standard_cache = std::make_unique<llama_kv_cache>(
-                model, hparams, standard_type_k, standard_type_v, standard_v_trans,
-                offload, unified, kv_size_overflow, n_seq_max, n_pad, n_swa, swa_type,
+                model, model.no_alloc(), hparams, standard_type_k, standard_type_v, standard_v_trans,
+                offload, unified, kv_size_overflow, n_seq_max, n_swa, swa_type,
                 metadata.get(), standard_layer_filter, nullptr, nullptr, "remote_",
                 n_ubatch, 0, exact_tail_type_requested, 0, false, 0, 0,
                 position_split_p_ != 0 &&
@@ -3359,8 +3357,8 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
             throw std::invalid_argument("standard local KV with position-split currently requires non-SWA and one sequence or non-unified multi-sequence");
         }
         local_cache = std::make_unique<llama_kv_cache>(
-                model, hparams, local_type_k, local_type_v, standard_v_trans,
-                offload, unified, kv_size_local, n_seq_max, n_pad, n_swa, swa_type,
+                model, model.no_alloc(), hparams, local_type_k, local_type_v, standard_v_trans,
+                offload, unified, kv_size_local, n_seq_max, n_swa, swa_type,
                 metadata.get(), filter, nullptr, nullptr, "local_",
                 n_ubatch, 0, exact_tail_type_requested, 0, false, 0, 0, false,
                 device_for_layer, false, true, /*payload_row_origin=*/0);
@@ -3737,7 +3735,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     for (auto & [key, ctx] : ctx_map) {
         const auto buft = key.first;
         ggml_backend_buffer_t buf;
-        if (hparams.no_alloc) {
+        if (model.no_alloc()) {
             buf = ggml_backend_buft_alloc_buffer(buft, 0);
             for (auto * tensor = ggml_get_first_tensor(ctx.get()); tensor != nullptr; tensor = ggml_get_next_tensor(ctx.get(), tensor)) {
                 tensor->buffer = buf;
@@ -3798,7 +3796,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     if (exact_tail_tokens > 0) {
 
         for (const auto & layer_entry : map_layer_ids) {
-            // plain locals instead of structured bindings: fail_route below
+            // plain locals instead of structured bindings: route_error below
             // captures logical_il, which C++17 does not allow for structured bindings
             const auto logical_il  = layer_entry.first;
             const auto layer_index = layer_entry.second;
@@ -3808,8 +3806,8 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
             const char * backend = dev ? ggml_backend_dev_name(dev) : ggml_backend_buft_name(buft);
             const bool device_route = dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU;
             const bool explicit_bias = model.self_attention_uses_explicit_bias(uint32_t(logical_il));
-            const auto fail_route = [&](llama_kv_tail_operation operation) {
-                throw std::runtime_error(format(
+            const auto route_error = [&](llama_kv_tail_operation operation) {
+                return std::runtime_error(format(
                         "KVarN exact-tail route is unsupported for architecture %s group %s layer %u backend %s "
                         "body f16/f16 exact %s/%s: missing %s",
                         llm_arch_name(model.arch), swa ? "swa" : "full", uint32_t(logical_il),
@@ -3821,17 +3819,17 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
             if (device_route) {
                 if (!kvarn_backend_supports_tail_write(
                             dev, exact_tail_type, uint64_t(layer.head_dim_k)*layer.n_head_kv)) {
-                    fail_route(LLAMA_KV_TAIL_OP_WRITE_K);
+                    throw route_error(LLAMA_KV_TAIL_OP_WRITE_K);
                 }
                 if (!kvarn_backend_supports_tail_write(
                             dev, exact_tail_type, uint64_t(layer.head_dim_v)*layer.n_head_kv)) {
-                    fail_route(LLAMA_KV_TAIL_OP_WRITE_V);
+                    throw route_error(LLAMA_KV_TAIL_OP_WRITE_V);
                 }
             }
             if (layer.native_attention && !explicit_bias) {
                 if (!kvarn_backend_supports_native_tail(
                             dev, exact_tail_type, layer.head_dim_k, layer.head_dim_v)) {
-                    fail_route(LLAMA_KV_TAIL_OP_NATIVE_ATTENTION);
+                    throw route_error(LLAMA_KV_TAIL_OP_NATIVE_ATTENTION);
                 }
                 tail_route = LLAMA_KV_TAIL_ROUTE_NATIVE;
             }
@@ -3938,7 +3936,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
             for (auto & [key, ctx] : tail_ctx_map) {
                 const auto buft = key.first;
                 ggml_backend_buffer_t buf;
-                if (hparams.no_alloc) {
+                if (model.no_alloc()) {
                     buf = ggml_backend_buft_alloc_buffer(buft, 0);
                     for (auto * tensor = ggml_get_first_tensor(ctx.get()); tensor != nullptr; tensor = ggml_get_next_tensor(ctx.get(), tensor)) {
                         tensor->buffer = buf;
@@ -3987,7 +3985,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
                 throw std::runtime_error("KVarN prefill migration currently requires one CUDA/Vulkan device pair");
             }
         }
-        if (hparams.no_alloc || prefill_dev == nullptr || mirror_dev == nullptr ||
+        if (model.no_alloc() || prefill_dev == nullptr || mirror_dev == nullptr ||
                 strncmp(ggml_backend_dev_name(prefill_dev), "CUDA", 4) != 0 ||
                 strncmp(ggml_backend_dev_name(mirror_dev), "Vulkan", 6) != 0) {
             throw std::runtime_error(
@@ -4329,7 +4327,7 @@ bool llama_kv_cache_kvarn::drain_prefill_migration() {
 
 std::unique_ptr<llama_kv_cache> llama_kv_cache_kvarn::make_metadata_cache() const {
     auto result = std::make_unique<llama_kv_cache>(
-            model,
+            model, model.no_alloc(),
             hparams,
             GGML_TYPE_F16,
             GGML_TYPE_F16,
@@ -4338,7 +4336,6 @@ std::unique_ptr<llama_kv_cache> llama_kv_cache_kvarn::make_metadata_cache() cons
             n_stream == 1,
             kv_size,
             n_seq_max,
-            metadata_n_pad,
             metadata_n_swa,
             metadata_swa_type,
             nullptr,
@@ -4904,7 +4901,7 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_kvarn::memory_breakd
             continue;
         }
         auto * buft = storage.buft;
-        result[buft] += hparams.no_alloc
+        result[buft] += model.no_alloc()
             ? ggml_backend_alloc_ctx_tensors_from_buft_size(storage.ctx.get(), buft)
             : ggml_backend_buffer_get_size(storage.buffer.get());
     }
@@ -5194,7 +5191,7 @@ llama_kv_memory_stats llama_kv_cache_kvarn::kv_memory_stats() const {
         if (!storage.buffer) {
             continue;
         }
-        allocated_kvarn += hparams.no_alloc
+        allocated_kvarn += model.no_alloc()
             ? ggml_backend_alloc_ctx_tensors_from_buft_size(storage.ctx.get(), storage.buft)
             : ggml_backend_buffer_get_size(storage.buffer.get());
     }
@@ -8158,7 +8155,7 @@ ggml_tensor * llama_kv_cache_kvarn::get_materialization_source(int32_t il, bool 
 std::unique_ptr<llama_kv_cache> llama_kv_cache_kvarn::make_shared_metadata_cache(
         const llama_model & model_view) const {
     return std::make_unique<llama_kv_cache>(
-            model_view,
+            model_view, model_view.no_alloc(),
             model_view.hparams,
             GGML_TYPE_F16,
             GGML_TYPE_F16,
@@ -8167,7 +8164,6 @@ std::unique_ptr<llama_kv_cache> llama_kv_cache_kvarn::make_shared_metadata_cache
             n_stream == 1,
             kv_size,
             n_seq_max,
-            metadata_n_pad,
             metadata_n_swa,
             metadata_swa_type,
             metadata.get(),

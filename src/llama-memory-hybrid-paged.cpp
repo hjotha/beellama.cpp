@@ -50,6 +50,7 @@ llama_memory_hybrid_paged::llama_memory_hybrid_paged(
     )),
     mem_recr(new llama_memory_recurrent(
         model,
+        model.no_alloc(),
         type_r,
         type_s,
         offload_rs,

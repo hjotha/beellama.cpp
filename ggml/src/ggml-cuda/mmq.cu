@@ -169,11 +169,46 @@ static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggm
     return GGML_PREC_Q4;
 }
 
+
+// Tile width in ne11 (dense) / ne12 (MoE) direction with the fewest tiles that fits into shared memory, 0 if there is none.
+static int ggml_cuda_mmq_get_J_best(
+        const ggml_type type, const int64_t ncols, const bool fallback, const int cc, const size_t smpbo, const ggml_prec prec_src1,
+        int * nthreads_best = nullptr) {
+    int J_best        = 0;
+    int ntiles_J_best = INT_MAX;
+    const int env_cap = ggml_cuda_mmq_get_J_max_env();
+    const int J_limit = env_cap > 0 ? std::min(128, env_cap) : 128;
+    const int J_max = ggml_cuda_mmq_get_J_max(type, fallback, cc, J_limit, prec_src1);
+
+    for (int J = 8; J <= J_max && ntiles_J_best > 1; J += 8) {
+        const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc, prec_src1);
+        if (config.type == GGML_TYPE_COUNT) {
+            continue;
+        }
+        if (mmq_get_nbytes_shared(config, cc) > smpbo) {
+            continue;
+        }
+        const int ntiles_x = (ncols + config.J - 1) / config.J;
+        if (ntiles_x < ntiles_J_best) {
+            J_best = J;
+            if (nthreads_best) {
+                *nthreads_best = config.nthreads;
+            }
+            ntiles_J_best = ntiles_x;
+        }
+    }
+    return J_best;
+}
+
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
-        ggml_tensor * dst, const ggml_tensor * gate,
+        ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion, const ggml_tensor * input_scale,
+        const ggml_tensor * gate,
         const ggml_tensor * norm_weight, const ggml_tensor * norm_scale,
         void * external_q8, bool quantize_external, const float * external_norm_scale) {
+    // Upstream's fused gate/up/GLU MMQ is handled by ggml_cuda_should_fuse_mul_mat_q;
+    // this fork keeps its own GLU-in-quantization path below.
+    GGML_UNUSED(fusion);
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
@@ -310,6 +345,11 @@ void ggml_cuda_mul_mat_q(
                     quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_ptr, src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13, ne10_padded,
                                         ne11, ne12, ne13, stream);
 
+            } else if (input_scale) {
+                GGML_ASSERT(!ids && input_scale->type == GGML_TYPE_F32 && ggml_is_contiguous(input_scale));
+                GGML_ASSERT(ggml_nelements(input_scale) == ne10);
+                quantize_mmq_q8_1_scaled_cuda(src1_d, (const float *) input_scale->data, src1_q8_ptr, src0->type,
+                                              ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
             } else {
                 if (norm_weight) {
                     GGML_ASSERT(norm_weight->ne[0] == src1->ne[0] && ggml_nrows(norm_weight) == 1);
@@ -682,4 +722,21 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
     }
 
     return (!GGML_CUDA_CC_IS_CDNA(cc)) || ne11 < MMQ_DP4A_MAX_BATCH_SIZE;
+}
+
+bool ggml_cuda_mmq_fusion_is_efficient(const ggml_type type, const int64_t nrows_x, const int64_t ncols, const int64_t nchannels, const int device) {
+    const int    cc    = ggml_cuda_info().devices[device].cc;
+    const int    nsm   = ggml_cuda_info().devices[device].nsm;
+    const size_t smpbo = ggml_cuda_info().devices[device].smpbo;
+
+    const bool fallback = false;
+    const int  J_best   = ggml_cuda_mmq_get_J_best(type, ncols, fallback, cc, smpbo, GGML_PREC_Q8);
+    if (J_best == 0) {
+        return false;
+    }
+    const int64_t nrows_tile = ggml_cuda_mmq_get_config(type, J_best, fallback, cc, GGML_PREC_Q8).I / 2;
+    const int64_t ntiles     = (ncols + J_best - 1)/J_best * ((nrows_x + nrows_tile - 1)/nrows_tile) * nchannels;
+    const int64_t tiles_nwaves             = (ntiles + nsm - 1) / nsm;
+    const int64_t tiles_efficiency_percent = 100 * ntiles / (nsm*tiles_nwaves);
+    return tiles_efficiency_percent >= 90;
 }

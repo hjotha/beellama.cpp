@@ -28,6 +28,7 @@ See [split attention and RKVA](#split-attention-and-xbox-rkva) below and [tools/
 
 - **Variance-normalized KV-cache quantization (KVarN)**: provides higher precision at similar memory costs. Independent K and V bit widths at `kvarn2`, `kvarn3`, `kvarn4`, `kvarn5`, `kvarn6`, and `kvarn8`, set with `--cache-type-k` and `--cache-type-v`. Supports 64-, 128-, 256-, and 512-dimensional K/V heads.
 - **KV cache precision tail**: keep most of the KV cache quantized while storing recent tokens in F16/BF16, enabled with `--kv-tail-tokens`. A single global softmax merges the quantized body and the precision tail under FlashAttention, without materializing the whole cache.
+- **Sinkhorn-normalized quantization (SINQ)**: improves model quality using existing GGUF quantization recipes. Adding SINQ to Bartowski's [Qwen 3.5 9B](https://huggingface.co/Anbeeld/Qwen3.5-9B-GGUF-Bartowski-SINQ) and [Qwen 3.8 27B](https://huggingface.co/Anbeeld/Qwen3.8-27B-GGUF-Bartowski-SINQ) recipes resulted in up to 45% lower mean KLD.
 - **Standard low-bit KV cache types**: `q2_0`, `q2_1`, `q3_0`, `q3_1`, `q6_0`, and `q6_1`, usable for either target or draft caches alongside the upstream `q4`/`q5`/`q8` types.
 - **KVarN for speculative decoding**: compress supported owned MTP, DFlash, EAGLE3, and non-MLA DSpark caches independently of the target with `--spec-draft-type-k` and `--spec-draft-type-v`.
 - **Independent draft micro-batch sizing**: `--spec-draft-n-ubatch` controls the draft context separately. Omitted means automatic sizing with a floor of 128; `0` inherits the target ubatch. Smaller draft workspaces can save VRAM; measure the throughput trade-off for the selected drafter.
@@ -648,6 +649,7 @@ llama-server --models-preset presets.ini
 - [BeeLlama features and public repo diff](docs/beellama-features.md)
 - [BeeLlama args reference](docs/beellama-args.md)
 - [Build docs](docs/build.md)
+- [BeeLlama release process](docs/release.md)
 - [Server docs](tools/server/README.md)
 - [Docker docs](docs/docker.md)
 - [Performance troubleshooting](docs/development/token_generation_performance_tips.md)
