@@ -13,6 +13,8 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -34,6 +36,10 @@
 #include <fcntl.h>
 #else
 #include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #endif
 
@@ -60,6 +66,193 @@ static const std::string PARTIAL_SUFFIX = ".downloadInProgress";
 // sparse, pre-sized temp files written out of order; never resumable, always discarded on restart
 static const std::string PARALLEL_TMP_SUFFIX = ".parallel.tmp";
 static const std::string STREAM_TMP_SUFFIX   = ".hfstream.tmp";
+
+#ifndef _WIN32
+static pid_t g_xet_proxy_pid = -1;
+static int   g_xet_proxy_stdin = -1;
+
+static std::string find_xet_proxy_script() {
+    if (const char * env = std::getenv("BELLAMA_XET_PROXY")) {
+        if (*env) {
+            return env;
+        }
+    }
+
+    std::error_code ec;
+    const auto exe = std::filesystem::read_symlink("/proc/self/exe", ec);
+    if (!ec) {
+        const auto dir = exe.parent_path();
+        const std::filesystem::path candidates[] = {
+            dir / "xet_stream_proxy.py",
+            dir / "scripts" / "xet_stream_proxy.py",
+            dir.parent_path() / "scripts" / "xet_stream_proxy.py",
+        };
+        for (const auto & candidate : candidates) {
+            if (std::filesystem::is_regular_file(candidate, ec)) {
+                return candidate.string();
+            }
+        }
+    }
+
+    const std::filesystem::path cwd_candidates[] = {
+        "scripts/xet_stream_proxy.py",
+        "../scripts/xet_stream_proxy.py",
+    };
+    for (const auto & candidate : cwd_candidates) {
+        if (std::filesystem::is_regular_file(candidate, ec)) {
+            return std::filesystem::absolute(candidate, ec).string();
+        }
+    }
+    return {};
+}
+
+static bool read_line_with_timeout(FILE * f, std::string & line, int timeout_ms) {
+    struct pollfd pfd = { fileno(f), POLLIN, 0 };
+    const int rc = poll(&pfd, 1, timeout_ms);
+    if (rc <= 0) {
+        return false;
+    }
+    char buf[1024];
+    if (!std::fgets(buf, sizeof(buf), f)) {
+        return false;
+    }
+    line = buf;
+    while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
+        line.pop_back();
+    }
+    return true;
+}
+#endif
+
+bool common_download_start_xet_proxy(
+        const std::string & url,
+        const std::string & local_path,
+        bool disk,
+        std::string & local_url) {
+#ifdef _WIN32
+    (void) url;
+    (void) local_path;
+    (void) disk;
+    (void) local_url;
+    LOG_WRN("%s: --hf-stream-vram-xet is not available on Windows\n", __func__);
+    return false;
+#else
+    if (g_xet_proxy_pid > 0) {
+        LOG_WRN("%s: an Xet proxy is already running (pid %d)\n", __func__, (int) g_xet_proxy_pid);
+        return false;
+    }
+
+    const std::string script = find_xet_proxy_script();
+    if (script.empty()) {
+        LOG_WRN("%s: xet_stream_proxy.py not found; set BELLAMA_XET_PROXY or place it next to llama-server\n", __func__);
+        return false;
+    }
+
+    int out_pipe[2] = { -1, -1 };
+    int in_pipe[2]  = { -1, -1 };
+    if (pipe(out_pipe) != 0 || pipe(in_pipe) != 0) {
+        LOG_WRN("%s: pipe() failed\n", __func__);
+        if (out_pipe[0] >= 0) { close(out_pipe[0]); close(out_pipe[1]); }
+        if (in_pipe[0]  >= 0) { close(in_pipe[0]);  close(in_pipe[1]);  }
+        return false;
+    }
+
+    const pid_t pid = fork();
+    if (pid < 0) {
+        LOG_WRN("%s: fork() failed\n", __func__);
+        close(out_pipe[0]); close(out_pipe[1]);
+        close(in_pipe[0]);  close(in_pipe[1]);
+        return false;
+    }
+    if (pid == 0) {
+        dup2(out_pipe[1], STDOUT_FILENO);
+        dup2(in_pipe[0],  STDIN_FILENO);
+        close(out_pipe[0]); close(out_pipe[1]);
+        close(in_pipe[0]);  close(in_pipe[1]);
+        std::vector<const char *> argv = {
+            "python3", "-u", script.c_str(),
+            "--url", url.c_str(),
+            "--local-path", local_path.c_str(),
+            "--port", "0",
+            "--window-mb", "1024",
+        };
+        if (!disk) {
+            argv.push_back("--no-disk");
+        }
+        argv.push_back(nullptr);
+        execvp("python3", const_cast<char **>(argv.data()));
+        _exit(127);
+    }
+
+    close(out_pipe[1]);
+    close(in_pipe[0]);
+    g_xet_proxy_pid   = pid;
+    g_xet_proxy_stdin = in_pipe[1];
+
+    FILE * f = fdopen(out_pipe[0], "r");
+    if (!f) {
+        close(out_pipe[0]);
+        common_download_stop_xet_proxy();
+        return false;
+    }
+    // poll() below watches the fd, so stdio must not hide already-read lines
+    // in its own buffer.
+    setvbuf(f, nullptr, _IONBF, 0);
+
+    int port = -1;
+    size_t size = 0;
+    std::string path;
+    std::string line;
+    for (int i = 0; i < 3; ++i) {
+        if (!read_line_with_timeout(f, line, 60000)) {
+            break;
+        }
+        if (line.rfind("PORT ", 0) == 0) {
+            port = std::atoi(line.c_str() + 5);
+        } else if (line.rfind("SIZE ", 0) == 0) {
+            size = (size_t) std::strtoull(line.c_str() + 5, nullptr, 10);
+        } else if (line.rfind("PATH ", 0) == 0) {
+            path = line.substr(5);
+        }
+    }
+    std::fclose(f);
+
+    if (port <= 0 || size == 0) {
+        LOG_WRN("%s: Xet proxy did not publish a port/size (python3/hf_xet missing?)\n", __func__);
+        common_download_stop_xet_proxy();
+        return false;
+    }
+
+    static std::once_flag atexit_flag;
+    std::call_once(atexit_flag, []() { std::atexit(common_download_stop_xet_proxy); });
+
+    local_url = "http://127.0.0.1:" + std::to_string(port) + "/file";
+    LOG_INF("%s: Xet proxy pid %d on %s (%zu bytes, temp %s)\n",
+            __func__, (int) pid, local_url.c_str(), size, path.c_str());
+    return true;
+#endif
+}
+
+void common_download_stop_xet_proxy() {
+#ifndef _WIN32
+    if (g_xet_proxy_stdin >= 0) {
+        close(g_xet_proxy_stdin);
+        g_xet_proxy_stdin = -1;
+    }
+    if (g_xet_proxy_pid > 0) {
+        kill(g_xet_proxy_pid, SIGTERM);
+        int status = 0;
+        for (int i = 0; i < 50; ++i) {
+            const pid_t rc = waitpid(g_xet_proxy_pid, &status, WNOHANG);
+            if (rc == g_xet_proxy_pid || rc < 0) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        g_xet_proxy_pid = -1;
+    }
+#endif
+}
 
 static void write_etag(const std::string & path, const std::string & etag) {
     const std::string etag_path = path + ".etag";

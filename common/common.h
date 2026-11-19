@@ -752,6 +752,7 @@ struct common_params {
     bool    offline                    = false;
     int32_t hf_download_threads        = 8;     // parallel HTTP range connections for model downloads
     bool    hf_stream_vram             = false; // stream GGUF weights from HF/HTTP directly to VRAM + disk tee
+    bool    hf_stream_vram_xet         = false; // use a local Xet download proxy as the range source
     int32_t hf_stream_chunk_mb         = 8;     // staging buffer / HTTP range chunk size in MiB
     std::string hf_stream_disk_mode    = "sync"; // disk tee mode: sync | background | none
 

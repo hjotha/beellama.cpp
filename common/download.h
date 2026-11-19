@@ -224,3 +224,16 @@ bool common_download_stream_loader(
     void * user_data);
 
 void common_download_wait_background();
+
+// Start a local Xet -> HTTP Range proxy for a Hugging Face resolve URL.
+// The helper streams the file through hf_xet into a local sparse file and serves
+// byte ranges as they become available. Returns false when the helper is missing
+// or Python/hf_xet is not available, so the caller can fall back to plain ranges.
+bool common_download_start_xet_proxy(
+    const std::string & url,
+    const std::string & local_path,
+    bool disk,
+    std::string & local_url);
+
+// Stop the proxy started by common_download_start_xet_proxy, if any.
+void common_download_stop_xet_proxy();

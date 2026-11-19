@@ -2428,6 +2428,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                 s = final_split;
             }
         }
+        // the streaming loader has consumed every tensor; the Xet proxy is no longer needed
+        common_download_stop_xet_proxy();
     }
 
     pimpl->model.reset(model);

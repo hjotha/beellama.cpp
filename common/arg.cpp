@@ -682,6 +682,32 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
     auto opts = handler.opts; // copy
     opts.callback = callback;
 
+    // --hf-stream-vram-xet: replace the remote HF URL with a local range proxy fed by
+    // hf_xet.  The existing streaming engine then pulls ranges into VRAM as usual.
+    if (params.hf_stream_vram_xet && !params.model.url.empty()) {
+        const std::string & url = params.model.url;
+        if (url.rfind("https://huggingface.co/", 0) == 0 &&
+                url.find("/resolve/") != std::string::npos) {
+            std::string proxy_path = params.model.path;
+            if (proxy_path.empty()) {
+                proxy_path = get_default_local_path(url);
+            }
+            proxy_path += ".xet";
+            std::string local_url;
+            if (common_download_start_xet_proxy(url, proxy_path, params.hf_stream_disk_mode != "none", local_url)) {
+                params.model.url = local_url;
+                // the proxy already persists the download; do not write a second copy
+                params.hf_stream_disk_mode = "none";
+            } else {
+                LOG_WRN("%s: Xet proxy unavailable, falling back to plain HTTP range streaming\n", __func__);
+                params.hf_stream_vram_xet = false;
+            }
+        } else {
+            LOG_WRN("%s: --hf-stream-vram-xet needs a huggingface.co /resolve/ URL, using plain ranges\n", __func__);
+            params.hf_stream_vram_xet = false;
+        }
+    }
+
     // another process may hold the cache lock during finalization:
     // let the download callback cancel that wait too
     auto finalize = [callback](const hf_cache::hf_file & f) {
@@ -4960,6 +4986,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.hf_stream_vram = true;
         }
     ).set_examples({LLAMA_EXAMPLE_COMMON}).set_env("LLAMA_ARG_HF_STREAM_VRAM"));
+    add_opt(common_arg(
+        {"--hf-stream-vram-xet"},
+        "same as --hf-stream-vram, but source the ranges from a live Hugging Face Xet download instead of plain HTTP (default: false)",
+        [](common_params & params) {
+            params.hf_stream_vram     = true;
+            params.hf_stream_vram_xet = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMMON}).set_env("LLAMA_ARG_HF_STREAM_VRAM_XET"));
     add_opt(common_arg(
         {"--hf-stream-chunk-mb"}, "N",
         string_format("HTTP range chunk and CUDA pinned staging buffer size in MiB for --hf-stream-vram (default: %d)", params.hf_stream_chunk_mb),
