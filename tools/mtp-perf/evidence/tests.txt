@@ -1,0 +1,14 @@
+test_cycle_partition (test_model.Tests.test_cycle_partition) ... ok
+test_gpu_guard (test_model.Tests.test_gpu_guard) ... ok
+test_missing_instrumentation (test_model.Tests.test_missing_instrumentation) ... ok
+test_mixed_regime (test_model.Tests.test_mixed_regime) ... ok
+test_n0_effective (test_model.Tests.test_n0_effective) ... ok
+test_rank_deficient (test_model.Tests.test_rank_deficient) ... ok
+test_roofline (test_model.Tests.test_roofline) ... ok
+test_sparse (test_model.Tests.test_sparse) ... ok
+test_synthetic_fit_holdout (test_model.Tests.test_synthetic_fit_holdout) ... ok
+
+----------------------------------------------------------------------
+Ran 9 tests in 0.570s
+
+OK

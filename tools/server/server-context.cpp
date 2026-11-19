@@ -11787,6 +11787,8 @@ private:
                 slot.mtp_cycle_anchor = slot.prompt.tokens.pos_next();
                 ++slot.mtp_cycle_id;
                 slot.mtp_cycle_passes = slot.mtp_cycle_nq = slot.mtp_cycle_proposed = slot.mtp_cycle_accepted = 0;
+                fprintf(stderr, "MTPCYCLE_BEGIN request=%d slot=%d cycle=%llu\n",
+                        slot.task->id, slot.id, (unsigned long long) slot.mtp_cycle_id);
             }
 
             if (!slot.spec_is_replay && slot.uses_adaptive_dflash() && slot.adaptive_dm.dm_adaptive) {
@@ -13619,7 +13621,12 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
             llama_token id;
             {
                 scoped_timer timer(t_sampl, n_sampl);
+                const int64_t mtp_sample_start = getenv("GGML_MTP_PROF") ? ggml_time_us() : 0;
                 id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
+                if (mtp_sample_start) {
+                    const auto elapsed = (long long) (ggml_time_us() - mtp_sample_start);
+                    fprintf(stderr, "MTPPHASE phase=n0_sample us=%lld sample_accept_us=%lld\n", elapsed, elapsed);
+                }
             }
 #if defined(LLAMA_F4_TEST_LOGIT_CAPTURE)
             if (!just_finished_prompt && !slot.can_speculate() &&

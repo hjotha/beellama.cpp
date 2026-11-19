@@ -1,0 +1,40 @@
+test_cycle_partition (test_model.Tests.test_cycle_partition) ... ok
+test_gpu_guard (test_model.Tests.test_gpu_guard) ... ok
+test_missing_instrumentation (test_model.Tests.test_missing_instrumentation) ... ok
+test_mixed_regime (test_model.Tests.test_mixed_regime) ... ok
+test_n0_effective (test_model.Tests.test_n0_effective) ... ok
+test_rank_deficient (test_model.Tests.test_rank_deficient) ... ok
+test_roofline (test_model.Tests.test_roofline) ... ok
+test_sparse (test_model.Tests.test_sparse) ... ok
+test_synthetic_fit_holdout (test_model.Tests.test_synthetic_fit_holdout) ... ok
+test_calibration_requires_actual_evidence (test_revision.RevisionTests.test_calibration_requires_actual_evidence) ... ok
+test_communication_separate (test_revision.RevisionTests.test_communication_separate) ... ok
+test_counter_parse (test_revision.RevisionTests.test_counter_parse) ... ok
+test_cycle_coverage_and_bonus (test_revision.RevisionTests.test_cycle_coverage_and_bonus) ... ok
+test_hardware_bandwidth_host_compute (test_revision.RevisionTests.test_hardware_bandwidth_host_compute) ... ok
+test_identity_required_and_mixed (test_revision.RevisionTests.test_identity_required_and_mixed) ... ok
+test_identity_roundtrip_json_csv_cell (test_revision.RevisionTests.test_identity_roundtrip_json_csv_cell) ... ok
+test_measured_context_domain (test_revision.RevisionTests.test_measured_context_domain) ... ok
+test_n0_skips_draft (test_revision.RevisionTests.test_n0_skips_draft) ... ok
+test_plan_and_run_gate_use_no_gpu (test_revision.RevisionTests.test_plan_and_run_gate_use_no_gpu) ... usage: bench.py [-h] --out OUT [--binary BINARY] [--model MODEL]
+                [--prompt PROMPT] [--contexts CONTEXTS] [--ns NS]
+                [--batch BATCH] [--ubatch UBATCH] [--generate GENERATE]
+                [--repeats REPEATS] [--seed SEED] [--port PORT]
+                [--required-free REQUIRED_FREE] [--reserve RESERVE]
+                [--inputs INPUTS [INPUTS ...]] [--identity IDENTITY]
+                [--build-manifest BUILD_MANIFEST]
+                [--qualified-point QUALIFIED_POINT] [--window-authorized]
+                {plan,run,analyze}
+bench.py: error: authorized window and one explicitly qualified point required; no automatic matrix
+ok
+test_plan_default_holdouts (test_revision.RevisionTests.test_plan_default_holdouts) ... ok
+test_position_survival_and_cap (test_revision.RevisionTests.test_position_survival_and_cap) ... ok
+test_ranges_domain_prior_and_provenance (test_revision.RevisionTests.test_ranges_domain_prior_and_provenance) ... ok
+test_synthetic_bypass_explicit (test_revision.RevisionTests.test_synthetic_bypass_explicit) ... ok
+test_truncated_cycle_rejected (test_revision.RevisionTests.test_truncated_cycle_rejected) ... ok
+
+----------------------------------------------------------------------
+Ran 24 tests in 0.683s
+
+OK
+Identifiable plan only; GPU execution disabled
