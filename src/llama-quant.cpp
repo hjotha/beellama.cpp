@@ -327,6 +327,11 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
     quantize &= name != LLM_TN(arch)(LLM_TENSOR_POS_EMBD,    "weight");
     quantize &= name != LLM_TN(arch)(LLM_TENSOR_TOKEN_TYPES, "weight");
 
+    // mHC routing is sensitive to weight quantization (SenseNova Loop)
+    if (arch == LLM_ARCH_SENSENOVA_LOOP) {
+        quantize &= name.find("hc_") == std::string::npos;
+    }
+
     // do not quantize Mamba/Kimi's small conv1d weights
     // NOTE: can't use LLM_TN here because the layer number is not known
     quantize &= name.find("ssm_conv1d") == std::string::npos;

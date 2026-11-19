@@ -324,6 +324,7 @@ llama_kvarn_context_route llama_kvarn_context_route_for(
             case LLM_ARCH_QWEN35:
             case LLM_ARCH_QWEN35MOE:
             case LLM_ARCH_QWEN4EXP:
+            case LLM_ARCH_SENSENOVA_LOOP:
                 return LLAMA_KVARN_CONTEXT_ROUTE_OWNED;
             case LLM_ARCH_GEMMA4_ASSISTANT:
                 return LLAMA_KVARN_CONTEXT_ROUTE_SHARED_TARGET;

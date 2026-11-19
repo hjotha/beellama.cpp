@@ -314,6 +314,7 @@ struct llama_layer {
     struct ggml_tensor * wo_enc    = nullptr;
     struct ggml_tensor * wqkv_gate = nullptr;
     struct ggml_tensor * wqkv_gate_b = nullptr;
+    struct ggml_tensor * wqkv_z    = nullptr; // [wqkv | wqkv_gate] in one weight
     // K2 Horizon MoVA
     struct ggml_tensor * attn_v_gate   = nullptr;
     struct ggml_tensor * attn_v_gate_b = nullptr;
@@ -437,6 +438,7 @@ struct llama_layer {
 
     // qwen3.5
     struct ggml_tensor * ssm_alpha = nullptr;
+    struct ggml_tensor * ssm_beta_alpha_cat = nullptr; // [ssm_beta | ssm_alpha] in one weight, unlike the grouped ssm_beta_alpha
 
     // rwkv
     struct ggml_tensor * time_mix_w1         = nullptr;
@@ -549,9 +551,11 @@ struct llama_layer {
     // DeepSeek-V4
     struct ggml_tensor * attn_kv_norm = nullptr;
     struct ggml_tensor * hc_attn_fn   = nullptr;
+    struct ggml_tensor * hc_attn_fn_b = nullptr;
     struct ggml_tensor * hc_attn_base = nullptr;
     struct ggml_tensor * hc_attn_scale = nullptr;
     struct ggml_tensor * hc_ffn_fn    = nullptr;
+    struct ggml_tensor * hc_ffn_fn_b  = nullptr;
     struct ggml_tensor * hc_ffn_base  = nullptr;
     struct ggml_tensor * hc_ffn_scale = nullptr;
     struct ggml_tensor * attn_comp_wkv   = nullptr;

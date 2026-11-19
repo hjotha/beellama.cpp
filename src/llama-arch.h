@@ -39,6 +39,7 @@ enum llm_arch {
     LLM_ARCH_QWEN2MOE,
     LLM_ARCH_QWEN2VL,
     LLM_ARCH_SENSENOVA_U1,
+    LLM_ARCH_SENSENOVA_LOOP,
     LLM_ARCH_QWEN3,
     LLM_ARCH_QWEN3MOE,
     LLM_ARCH_FLINT,
@@ -339,6 +340,16 @@ enum llm_kv {
     LLM_KV_ATTENTION_SHARED_KV_LAYERS,
     LLM_KV_ATTENTION_RECURRENT_LAYERS,
 
+    LLM_KV_LOOP_START,
+    LLM_KV_LOOP_END,
+    LLM_KV_LOOP_COUNT,
+    LLM_KV_MHC_START,
+    LLM_KV_MHC_END,
+    LLM_KV_MHC_STREAMS,
+    LLM_KV_MHC_ITERATIONS,
+    LLM_KV_MHC_PRE_SCALE,
+    LLM_KV_MHC_FIXED_IDENTITY,
+
     LLM_KV_HYPER_CONNECTION_COUNT,
     LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS,
     LLM_KV_HYPER_CONNECTION_EPSILON,
@@ -532,6 +543,7 @@ enum llm_tensor {
     LLM_TENSOR_ATTN_ROT_EMBD,
     LLM_TENSOR_ATTN_SINKS,
     LLM_TENSOR_ATTN_GATE,
+    LLM_TENSOR_ATTN_QKV_GATE,  // qwen35: [attn_qkv | attn_gate]
     LLM_TENSOR_ATTN_RESID_ALPHA,
     LLM_TENSOR_ATTN_RESID_BETA,
     LLM_TENSOR_FFN_GATE_INP,
@@ -605,6 +617,7 @@ enum llm_tensor {
     LLM_TENSOR_SSM_OUT,
     LLM_TENSOR_SSM_BETA_ALPHA,  // qwen3next
     LLM_TENSOR_SSM_ALPHA,       // qwen3.5
+    LLM_TENSOR_SSM_BETA_ALPHA_CAT, // qwen3.5: [ssm_beta | ssm_alpha], unlike the grouped qwen3next ssm_ba
     // Kimi Linear KDA (using SSM_ prefix for consistency)
     LLM_TENSOR_SSM_CONV1D_Q,      // kimi: Q conv1d weight
     LLM_TENSOR_SSM_CONV1D_K,      // kimi: K conv1d weight

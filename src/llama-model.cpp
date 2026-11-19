@@ -160,6 +160,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_qwen2moe(params);
         case LLM_ARCH_SENSENOVA_U1:
             return new llama_model_sensenova_u1(params);
+        case LLM_ARCH_SENSENOVA_LOOP:
+            return new llama_model_sensenova_loop(params);
         case LLM_ARCH_QWEN3:
             return new llama_model_qwen3(params);
         case LLM_ARCH_FLINT:
@@ -1685,7 +1687,7 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
 
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
     if (params.split_mtp_weights &&
-            (arch != LLM_ARCH_QWEN35 || !params.load_mtp || ml.no_alloc || hparams.router_layer >= 0)) {
+            ((arch != LLM_ARCH_QWEN35 && arch != LLM_ARCH_SENSENOVA_LOOP) || !params.load_mtp || ml.no_alloc || hparams.router_layer >= 0)) {
         throw std::runtime_error("separate MTP weights require an allocated qwen35 target with embedded MTP");
     }
 
@@ -2896,6 +2898,7 @@ void llama_model::print_info() const {
                 arch == LLM_ARCH_GRANITE_HYBRID ||
                 arch == LLM_ARCH_QWEN3NEXT ||
                 arch == LLM_ARCH_QWEN35 ||
+                arch == LLM_ARCH_SENSENOVA_LOOP ||
                 arch == LLM_ARCH_QWEN35MOE ||
                 arch == LLM_ARCH_NEMOTRON_H ||
                 arch == LLM_ARCH_NEMOTRON_H_MOE) {
@@ -3492,7 +3495,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 const bool mtp_on_hybrid_qwen =
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
                     (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE ||
-                     arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_BAILINGMOE3);
+                     arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_BAILINGMOE3 || arch == LLM_ARCH_SENSENOVA_LOOP);
 
                 const bool mtp_on_hybrid_nemotron =
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
@@ -3525,7 +3528,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         filter_recr = [&](uint32_t il) {
                             return hparams.is_recr(il) && hparams.n_ff(il) == 0;
                         };
-                    } else if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_MINIMAX_01) {
+                    } else if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_SENSENOVA_LOOP || arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_MINIMAX_01) {
                         const bool remote_enabled = cparams.remote_attn_enabled && !cparams.local_attn_backend;
                         const int remote_layers = cparams.remote_attn_layers;
                         filter_attn = [this, remote_enabled, remote_layers](uint32_t il) {
@@ -4424,6 +4427,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_QWEN3VL:
         case LLM_ARCH_QWEN3VLMOE:
         case LLM_ARCH_QWEN35:
+        case LLM_ARCH_SENSENOVA_LOOP:
         case LLM_ARCH_QWEN35MOE:
         case LLM_ARCH_CLEF:
         case LLM_ARCH_QWEN4EXP:

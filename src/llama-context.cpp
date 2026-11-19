@@ -5778,6 +5778,12 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     } else if (model.arch == LLM_ARCH_HRM_TEXT) {
         // the 128-slot looped graph needs roughly one stack per token budget
         res = std::max<uint32_t>(n_tokens * 80, 64u * model.n_tensors()) + tail_nodes;
+    } else if (model.arch == LLM_ARCH_SENSENOVA_LOOP) {
+        uint32_t n_mhc = model.hparams.mhc_end - model.hparams.mhc_start;
+        if (model.hparams.mhc_start >= model.hparams.loop_start && model.hparams.mhc_end <= model.hparams.loop_end) {
+            n_mhc *= model.hparams.loop_count;
+        }
+        res = std::max<uint32_t>(1024u, 64u * model.n_tensors() + 128u * model.hparams.n_layer() + 48u * model.hparams.mhc_iterations * n_mhc) + tail_nodes;
     } else if (model.arch == LLM_ARCH_QWEN3NEXT ||
         model.arch == LLM_ARCH_KIMI_LINEAR ||
         model.arch == LLM_ARCH_BAILINGMOE3 ||
