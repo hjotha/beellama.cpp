@@ -44,6 +44,12 @@ residir).
 - Critério de aceite: com modelo MoE e experts em host, o log mostra o plano, o cache
   entra em uso (hit rate no fim) e o servidor responde; com modelo denso, loga
   "nenhum expert em host" e segue sem cache.
+- **Verificado em 2026-11-20** (RTX 4070, OLMoE-1B-7B q2_k, `-cmoe -ngl 99`):
+  `MoE cache auto: 2224.00 MiB for 2224.00 MiB of host experts (100.0% of the experts
+  can be cached)` → `CUDA0 MoE cache size = 2224.00 MiB` → hit rate 68,76% em
+  `ubatch <= 8` (372 hits/169 misses) e 27,22% em lote grande. Modelo denso
+  (`stories15M`, `-ngl 0`): `no host-resident MoE experts, cache disabled`, sem crash.
+  `test-arg-parser` cobre `-1`, valor fixo e `-2` rejeitado.
 
 ## P2 — pinned + planner (próximo)
 
