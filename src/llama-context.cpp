@@ -2471,6 +2471,49 @@ std::vector<ggml_backend_t> layer_backends;
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
+        // --moe-cache-mib -1 (auto): size the expert cache from the device memory that the
+        // weights left free, capped by the host-resident expert bytes. See docs/PLAN-strata-parity.md.
+        if (cparams.moe_cache_size == std::numeric_limits<size_t>::max()) {
+            cparams.moe_cache_size = 0;
+            if (model.no_alloc()) {
+                LLAMA_LOG_INFO("%s: MoE cache auto: no_alloc context, leaving the cache disabled\n", __func__);
+            } else {
+                constexpr size_t MiB = 1024*1024;
+                constexpr size_t reserve = 1536*MiB;
+
+                size_t host_moe_bytes = 0;
+                for (const auto & layer : model.layers) {
+                    for (ggml_tensor * t : { layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps, layer.ffn_gate_up_exps }) {
+                        if (t && t->buffer && ggml_backend_buft_is_host(ggml_backend_buffer_get_type(t->buffer))) {
+                            host_moe_bytes += ggml_nbytes(t);
+                        }
+                    }
+                }
+
+                if (host_moe_bytes == 0) {
+                    LLAMA_LOG_INFO("%s: MoE cache auto: no host-resident MoE experts, cache disabled\n", __func__);
+                } else {
+                    size_t budget = 0;
+                    for (const auto & d : model.devices) {
+                        size_t free_b = 0, total_b = 0;
+                        ggml_backend_dev_memory(d.dev, &free_b, &total_b);
+                        if (free_b > reserve) {
+                            budget += free_b - reserve;
+                        }
+                    }
+                    budget = std::min(budget, host_moe_bytes);
+                    if (budget < 256*MiB) {
+                        LLAMA_LOG_INFO("%s: MoE cache auto: %.2f MiB of host experts, but only %.2f MiB of device memory is free for the cache (reserve %.2f MiB), cache disabled\n",
+                                __func__, host_moe_bytes/(double)MiB, budget/(double)MiB, reserve/(double)MiB);
+                    } else {
+                        cparams.moe_cache_size = budget;
+                        LLAMA_LOG_INFO("%s: MoE cache auto: %.2f MiB for %.2f MiB of host experts (%.1f%% of the experts can be cached)\n",
+                                __func__, budget/(double)MiB, host_moe_bytes/(double)MiB, 100.0*budget/(double)host_moe_bytes);
+                    }
+                }
+            }
+        }
+
         if (cparams.moe_cache_size > 0) {
             moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size);
         }

@@ -108,7 +108,11 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         throw std::runtime_error("failed to load model");
     }
 
-    llama_context * ctx = llama_init_from_model(model, *cparams);
+    // the MoE cache is sized after loading, so it must not be charged to the measurement below
+    llama_context_params cparams_meas = *cparams;
+    cparams_meas.moe_cache_size = 0;
+
+    llama_context * ctx = llama_init_from_model(model, cparams_meas);
     if (ctx == nullptr) {
         llama_model_free(model);
         throw std::runtime_error("failed to create llama_context from model");

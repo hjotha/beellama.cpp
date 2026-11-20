@@ -3762,7 +3762,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
             }
         }
     }
-    cparams.moe_cache_size = params.moe_cache_size;
+    cparams.moe_cache_size = params.moe_cache_auto ? std::numeric_limits<size_t>::max() : params.moe_cache_size;
 
     return cparams;
 }

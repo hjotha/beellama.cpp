@@ -882,6 +882,7 @@ struct common_params {
     // only takes effect when cache_type_k == GGML_TYPE_Q4_0; see docs/kv-mean-center.md
     std::string kv_mean_center_path = "";
     size_t moe_cache_size = 0; // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
+    bool moe_cache_auto = false; // size the MoE cache from the device memory left free after loading, see docs/PLAN-strata-parity.md
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 

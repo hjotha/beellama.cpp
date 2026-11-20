@@ -2450,10 +2450,41 @@ static void test_turboquant_nc_aliases() {
     assert(rejected(split));
 }
 
+static void test_moe_cache_auto_sizing() {
+    auto parse = [](common_params & params, std::vector<std::string> args) {
+        std::vector<char *> argv;
+        for (auto & arg : args) argv.push_back(arg.data());
+        return common_params_parse(int(argv.size()), argv.data(), params, LLAMA_EXAMPLE_SERVER);
+    };
+
+    common_params off;
+    assert(parse(off, {"binary"}));
+    assert(!off.moe_cache_auto && off.moe_cache_size == 0);
+
+    // -1 selects the automatic size: the llama_context sizes it from the free device memory
+    common_params auto_on;
+    assert(parse(auto_on, {"binary", "--moe-cache-mib", "-1"}));
+    assert(auto_on.moe_cache_auto && auto_on.moe_cache_size == 0);
+    auto_on.n_parallel = 1;
+    const auto cparams_auto = common_context_params_to_llama(auto_on);
+    assert(cparams_auto.moe_cache_size == std::numeric_limits<size_t>::max());
+
+    common_params fixed;
+    assert(parse(fixed, {"binary", "--moe-cache-mib", "512"}));
+    assert(!fixed.moe_cache_auto && fixed.moe_cache_size == size_t(512)*1024*1024);
+    fixed.n_parallel = 1;
+    const auto cparams_fixed = common_context_params_to_llama(fixed);
+    assert(cparams_fixed.moe_cache_size == size_t(512)*1024*1024);
+
+    common_params bad;
+    assert(!parse(bad, {"binary", "--moe-cache-mib", "-2"}));
+}
+
 int main(void) {
     try {
         test_e4_wire_argument();
         test_turboquant_nc_aliases();
+        test_moe_cache_auto_sizing();
         test();
         test_position_split_option_and_adaptive_scope();
         test_draft_ubatch_configuration_is_independent();
