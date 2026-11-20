@@ -580,8 +580,10 @@ llama_model_loader::llama_model_loader(
         const llama_model_kv_override * param_overrides_p,
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p,
         bool is_streaming,
-        const llama_model_stream_source_desc * stream_source)
+        const llama_model_stream_source_desc * stream_source,
+        bool keep_host_pinned)
         : is_streaming(is_streaming), metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud) {
+    this->keep_host_pinned = keep_host_pinned;
     this->lazy.streaming = is_streaming;
     auto register_gguf_weights = [&](const llama_file * f, uint16_t sid, const struct gguf_context * gctx, ggml_context * ctx) {
         const size_t expected_size =
@@ -1461,9 +1463,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
         }
 
-        // avoid using a host buffer when using mmap
+        // avoid using a host buffer when using mmap, unless the caller asked to keep the
+        // matched tensors page-locked (e.g. host-resident MoE experts read by the expert cache)
         auto * buft_dev = ggml_backend_buft_get_device(buft);
-        if (use_mmap && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev)) {
+        if (use_mmap && !keep_host_pinned && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev)) {
             auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
             if (!cpu_dev) {
                 throw std::runtime_error("no CPU backend found");

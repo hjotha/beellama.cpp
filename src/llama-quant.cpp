@@ -1004,7 +1004,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     const llama_model_kv_override * kv_overrides = params->kv_overrides;
     std::vector<std::string> splits = {};
     llama_model_loader ml(/*metadata*/ nullptr, /*set_tensor_data*/ nullptr, /*set_tensor_data_ud*/ nullptr,
-        fname_inp, splits, /*file*/ nullptr, /*load_mode*/ sinq_enabled ? LLAMA_LOAD_MODE_MMAP : load_mode, /*check_tensors*/ true, /*no_alloc*/ false, /*load_mtp*/ true, kv_overrides, nullptr);
+        fname_inp, splits, /*file*/ nullptr, /*load_mode*/ sinq_enabled ? LLAMA_LOAD_MODE_MMAP : load_mode, /*check_tensors*/ true, /*no_alloc*/ false, /*load_mtp*/ true, kv_overrides, nullptr, /*is_streaming*/ false, /*stream_source*/ nullptr, /*keep_host_pinned*/ false);
     ml.init_mappings(false); // no prefetching
     if (gguf_find_key(ml.metadata, "beellama.qk_sinq.version") >= 0) {
         throw std::runtime_error("SINQ source copy/requantization requires the original floating model, not a transformed artifact");

@@ -2517,6 +2517,13 @@ std::vector<ggml_backend_t> layer_backends;
 
         if (cparams.moe_cache_size > 0) {
             moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size);
+            if (!model.no_alloc()) {
+                constexpr size_t MiB = 1024*1024;
+                for (const auto & [buft, bytes] : moe_cache->memory_breakdown()) {
+                    LLAMA_LOG_INFO("%s: MoE cache plan: %s = %.2f MiB\n", __func__,
+                            ggml_backend_buft_name(buft), bytes/(double)MiB);
+                }
+            }
         }
 
         sched_reserve();

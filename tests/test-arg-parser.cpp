@@ -2492,6 +2492,22 @@ static void test_moe_cache_auto_sizing() {
 
     common_params reserve_bad;
     assert(!parse(reserve_bad, {"binary", "--vram-reserve-mib", "-1"}));
+
+    // -cmoe with the default pinned preference must reach the model params as a pinned request
+    common_params cmoe;
+    assert(parse(cmoe, {"binary", "-cmoe"}));
+    assert(cmoe.moe_host_pinned);
+    assert(!cmoe.tensor_buft_overrides.empty());
+    cmoe.n_parallel = 1;
+    const auto mparams_cmoe = common_model_params_to_llama(cmoe);
+    assert(mparams_cmoe.keep_host_pinned);
+
+    common_params cmoe_unpinned;
+    assert(parse(cmoe_unpinned, {"binary", "-cmoe", "--no-moe-host-pinned"}));
+    assert(!cmoe_unpinned.moe_host_pinned);
+    cmoe_unpinned.n_parallel = 1;
+    const auto mparams_unpinned = common_model_params_to_llama(cmoe_unpinned);
+    assert(!mparams_unpinned.keep_host_pinned);
 }
 
 int main(void) {

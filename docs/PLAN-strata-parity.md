@@ -51,14 +51,23 @@ residir).
   (`stories15M`, `-ngl 0`): `no host-resident MoE experts, cache disabled`, sem crash.
   `test-arg-parser` cobre `-1`, valor fixo e `-2` rejeitado.
 
-## P2 — pinned + planner (em andamento)
+## P2 — pinned + planner (feito, com limite conhecido)
 
 1. ~~`--vram-reserve-mib N`~~ (default 1536) usado pelo auto-size do P1. **Feito e testado**
    (reserve 20000 MiB desliga o cache: "only 0.00 MiB ... free for the cache").
-2. `--moe-host-pinned on|off` (default `on` quando o device expõe host buffer type):
-   forçar os tensores `ffn_*_exps` host para `ggml_backend_dev_host_buffer_type(dev)`.
-3. `--moe-plan`: imprime plano (bytes host, slots, cobertura %, VRAM livre) e sai.
-4. Teste: `llama-bench` com/sem pinned num MoE que force host.
+2. ~~`--moe-host-pinned` / `--no-moe-host-pinned`~~ (default: ligado). Os overrides de expert
+   (`-cmoe`, `-ncmoe`, `--fit`) que apontam para o buffer CPU passam a apontar para o
+   host buffer do device (`CUDA_Host`, `cudaMallocHost`), e o loader deixa de rebaixá-los
+   para pageable quando o mmap está ligado (`llama_model_params::keep_host_pinned`).
+   **Verificado**: `CUDA_Host model buffer size = 2256.24 MiB` com a flag e `CPU_Mapped`
+   com `--no-moe-host-pinned`; decode 34,3/34,4/34,3 t/s vs 33,9/33,8/33,9 t/s
+   (OLMoE-1B-7B q2_k, `-cmoe --moe-cache-mib 1024`, 4070) → **+1,5%**.
+3. **Limite**: o host buffer CUDA tem `max_size` de 4 GiB por alocação
+   (`ggml-cuda.cu:1681-1685`) e o loader aloca todos os experts num buffer só. Em modelos
+   com >4 GiB de experts em host (Flash-Next no 40G: ~17 GiB) a alocação cai para pageable.
+   Para pinar nessa escala é preciso uma arena em blocos (`cudaHostRegister` sobre ranges),
+   que é o mesmo trabalho de P3/P4.
+4. `--moe-plan`: substituído pelo log `MoE cache plan: <buft> = N MiB` no start.
 
 ## P3 — o item grande (não é port de arquivo)
 

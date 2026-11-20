@@ -3528,6 +3528,41 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     } else {
         GGML_ASSERT(params.tensor_buft_overrides.back().pattern == nullptr && "Tensor buffer overrides not terminated with empty pattern");
         mparams.tensor_buft_overrides = params.tensor_buft_overrides.data();
+
+        // keep the host-resident MoE experts page-locked: swap the pageable CPU buffer type
+        // that -cmoe/-ncmoe/--fit use for the expert tensors for the device's host buffer type
+        if (params.moe_host_pinned) {
+            ggml_backend_buffer_type_t host_buft = nullptr;
+            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    continue;
+                }
+                host_buft = ggml_backend_dev_host_buffer_type(dev);
+                if (host_buft) {
+                    break;
+                }
+            }
+            if (host_buft) {
+                // static: the model keeps the pointer for the whole load
+                static std::vector<llama_model_tensor_buft_override> pinned_overrides;
+                pinned_overrides = params.tensor_buft_overrides;
+                bool any = false;
+                for (auto & entry : pinned_overrides) {
+                    if (entry.pattern && entry.buft && strcmp(ggml_backend_buft_name(entry.buft), "CPU") == 0 &&
+                            std::string(entry.pattern).find("exps") != std::string::npos) {
+                        entry.buft = host_buft;
+                        any = true;
+                    }
+                }
+                if (any) {
+                    mparams.tensor_buft_overrides = pinned_overrides.data();
+                    mparams.keep_host_pinned     = true;
+                    LLAMA_LOG_INFO("%s: MoE host experts will use the page-locked host buffer (%s)\n",
+                            __func__, ggml_backend_buft_name(host_buft));
+                }
+            }
+        }
     }
 
     mparams.progress_callback           = params.load_progress_callback;

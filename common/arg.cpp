@@ -4708,6 +4708,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_VRAM_RESERVE_MIB"));
     add_opt(common_arg(
+        {"--moe-host-pinned"},
+        {"--no-moe-host-pinned"},
+        "keep the MoE experts that are kept in host memory in the device page-locked host buffer\n"
+        "when one is available (default: enabled), instead of the pageable CPU buffer",
+        [](common_params & params, bool value) {
+            params.moe_host_pinned = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_HOST_PINNED"));
+    add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
         "(dense models; for MoE expert weights use --n-cpu-moe)",
