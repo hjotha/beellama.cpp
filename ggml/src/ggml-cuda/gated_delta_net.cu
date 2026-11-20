@@ -470,16 +470,23 @@ static void ggml_cuda_op_gated_delta_net_impl(
     // then the existing scalar kernel writes the suffix and remaining slots.
     static const int prefix_mma_mode = [] {
         const char * value = std::getenv("GGML_CUDA_GDN_PREFIX_MMA");
-        if (value == nullptr) return 0;
+        if (value == nullptr) return 2;
+        if (std::strcmp(value, "0") == 0) return 0;
         if (std::strcmp(value, "1") == 0) return 1;
         if (std::strcmp(value, "2") == 0) return 2;
-        return 0;
+        return 2;
     }();
     const int64_t max_prefix = n_tokens - (K - 1);
     const int64_t prefix = prefix_mma_mode == 2 ? (max_prefix / 16) * 16 : max_prefix;
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    const bool cc_ok = (cc == GGML_CUDA_CC_ADA_LOVELACE ||
+                        cc == GGML_CUDA_CC_AMPERE ||
+                        cc == GGML_CUDA_CC_AMPERE_GA10X ||
+                        cc == GGML_CUDA_CC_HOPPER ||
+                        cc == GGML_CUDA_CC_BLACKWELL);
     if (prefix_mma_mode && !raw && !kda && src_rows == nullptr && n_seqs == 1 &&
         S_v == 128 && H > 0 && K > 1 && n_tokens >= K && prefix >= 64 &&
-        ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_ADA_LOVELACE &&
+        cc_ok &&
         state_slot_stride > 0) {
         const size_t max = std::numeric_limits<size_t>::max();
         const size_t head_size = size_t(128)*128*sizeof(float);

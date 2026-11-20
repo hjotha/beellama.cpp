@@ -57,6 +57,7 @@ struct common_download_opts {
     std::string bearer_token;
     common_header_list headers;
     bool offline = false;
+    bool discover_exl3 = false;
     bool download_mmproj  = false;
     bool download_mtp     = false;
     bool download_eagle3  = false;
@@ -128,6 +129,9 @@ bool common_download_remove_sidecars(const std::string & hf_repo_with_tag, const
 struct common_download_hf_plan {
     hf_cache::hf_file primary;
     hf_cache::hf_files model_files;
+    hf_cache::hf_files exl3_meta_files;
+    hf_cache::hf_files exl3_tensor_files;
+    bool is_exl3 = false;
     hf_cache::hf_file mmproj;
     hf_cache::hf_file mtp;
     hf_cache::hf_file eagle3;
@@ -189,6 +193,22 @@ bool common_download_prepare_stream(
     const common_download_stream_opts & opts,
     std::vector<std::string> & out_paths);
 
+// Prepare an HTTP Range streaming session for an EXL3 safetensors directory keyed by dir_path.
+// Probes each safetensors header [0, 8+N) in parallel and writes .hfstream.tmp header prefixes.
+bool common_download_prepare_stream_exl3(
+    const std::string & dir_path,
+    const std::vector<common_download_task> & tasks,
+    const std::vector<std::string> & rel_paths,
+    const common_download_stream_opts & opts);
+
+// Read a small byte range [offset, offset + size) from file_idx within an active stream session.
+bool common_download_stream_read_range(
+    const std::string & session_key,
+    size_t file_idx,
+    size_t offset,
+    size_t size,
+    void * dst);
+
 void * common_download_get_stream_session_ud(const std::string & first_path);
 
 // Release a prepared-but-unused stream session (lock, fd, temp file). No-op once the loader consumed it.
@@ -198,6 +218,7 @@ struct common_download_stream_file_info {
     std::string temp_path;
     std::string local_path;
     std::string final_path;
+    std::string rel_path;
     std::string etag;
     std::string url;
     size_t      total_size = 0;

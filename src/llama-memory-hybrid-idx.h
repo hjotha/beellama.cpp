@@ -156,6 +156,9 @@ private:
     // the position an edit at p0 stales the sequence from
     llama_pos mem_idx_stale_pos(llama_seq_id seq_id, llama_pos p0) const;
 
+    // Fast-path suffix trim for by_order k-pool layout on rejection rollback.
+    bool kpool_layout_trim_suffix(llama_seq_id seq_id, llama_pos p0);
+
     stale_pos_t mem_idx_stale = stale_pos_clean();
 };
 

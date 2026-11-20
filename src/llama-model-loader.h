@@ -35,15 +35,31 @@ struct llama_model_loader {
 
         ggml_tensor * tensor;
 
-        llama_tensor_weight(const llama_file * file, uint16_t idx, const struct gguf_context * gguf_ctx, ggml_tensor * tensor) : idx(idx), tensor(tensor) {
+        llama_tensor_weight(const llama_file * file, uint16_t idx, const struct gguf_context * gguf_ctx, ggml_tensor * tensor,
+                size_t expected_file_size = 0, bool allow_partial_stream_file = false) : idx(idx), tensor(tensor) {
             const int tensor_idx = gguf_find_tensor(gguf_ctx,  ggml_get_name(tensor));
             if (tensor_idx < 0) {
                 throw std::runtime_error(format("tensor '%s' not found in the model", ggml_get_name(tensor)));
             }
 
-            offs = gguf_get_data_offset(gguf_ctx) + gguf_get_tensor_offset(gguf_ctx, tensor_idx);
-            if (offs + ggml_nbytes(tensor) < offs || offs + ggml_nbytes(tensor) > file->size()) {
-                throw std::runtime_error(format("tensor '%s' data is not within the file bounds, model is corrupted or incomplete", ggml_get_name(tensor)));
+            const size_t data_offset = gguf_get_data_offset(gguf_ctx);
+            const size_t tensor_offset = gguf_get_tensor_offset(gguf_ctx, tensor_idx);
+            offs = data_offset + tensor_offset;
+            if (offs < data_offset || offs + ggml_nbytes(tensor) < offs) {
+                throw std::runtime_error(format("tensor '%s' data offset overflow", ggml_get_name(tensor)));
+            }
+            if (expected_file_size > 0) {
+                if (offs + ggml_nbytes(tensor) > expected_file_size) {
+                    throw std::runtime_error(format("tensor '%s' data is not within the file bounds, model is corrupted or incomplete", ggml_get_name(tensor)));
+                }
+            } else if (file != nullptr) {
+                if (allow_partial_stream_file) {
+                    if (data_offset > file->size()) {
+                        throw std::runtime_error(format("tensor '%s' header is incomplete in streamed temp file", ggml_get_name(tensor)));
+                    }
+                } else if (offs + ggml_nbytes(tensor) > file->size()) {
+                    throw std::runtime_error(format("tensor '%s' data is not within the file bounds, model is corrupted or incomplete", ggml_get_name(tensor)));
+                }
             }
         }
     };
@@ -81,6 +97,7 @@ struct llama_model_loader {
     bool check_tensors;
     bool no_alloc;
     bool load_mtp;
+    bool tensor_set_complete = false;
     int32_t mtp_layer_begin = -1; // set by the architecture for independently owned MTP weights
 
     // handle TENSOR_READ_LAZY
@@ -88,6 +105,7 @@ struct llama_model_loader {
     struct lazy_read {
         // set by the caller before the create_tensor() calls
         enum llama_lazy_mode mode = LLAMA_LAZY_MODE_OFF;
+        bool streaming = false;
 
         // decide whether this tensor is read lazily
         // pass w to also record it, or nullptr to only ask
@@ -118,6 +136,8 @@ struct llama_model_loader {
 
     llama_files files;
     std::vector<size_t> file_data_offsets;
+    std::vector<size_t> stream_min_file_sizes;
+    bool is_streaming = false;
     llama_ftype ftype;
     llama_fver  fver;
 
@@ -187,7 +207,9 @@ struct llama_model_loader {
         bool no_alloc,
         bool load_mtp,
         const llama_model_kv_override * param_overrides_p,
-        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p);
+        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p,
+        bool is_streaming = false,
+        const llama_model_stream_source_desc * stream_source = nullptr);
 
     template<typename T>
     typename std::enable_if<std::is_integral<T>::value, bool>::type
@@ -277,6 +299,7 @@ struct llama_model_loader {
             const std::vector<std::pair<struct ggml_context *, std::vector<ggml_backend_buffer_t>>> & ctx_bufs,
             llama_model_stream_loader_fn stream_fn,
             void * stream_user_data,
+            const llama_model_stream_source_desc * stream_source,
             llama_progress_callback progress_callback,
             void * progress_callback_user_data,
             uint32_t chunk_bytes);

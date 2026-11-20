@@ -213,7 +213,11 @@ static common_json api_get(const std::string & url,
 }
 
 static std::string get_repo_commit(const std::string & repo_id,
-                                   const std::string & token) {
+                                   const std::string & token,
+                                   const std::string & branch_req = {}) {
+    if (!branch_req.empty() && is_valid_commit(branch_req)) {
+        return branch_req;
+    }
     try {
         auto endpoint = common_get_model_endpoint();
         auto json = api_get(endpoint + "api/models/" + repo_id + "/refs", token);
@@ -249,17 +253,40 @@ static std::string get_repo_commit(const std::string & repo_id,
                 continue;
             }
 
-            if (_name == "main") {
+            if (!branch_req.empty() && _name == branch_req) {
                 name = _name;
                 commit = _commit;
                 name_path = candidate;
                 break;
             }
 
+            if (_name == "main") {
+                name = _name;
+                commit = _commit;
+                name_path = candidate;
+                if (branch_req.empty()) {
+                    break;
+                }
+            }
+
             if (name.empty() || commit.empty()) {
                 name = _name;
                 commit = _commit;
                 name_path = candidate;
+            }
+        }
+
+        if (!branch_req.empty() && name != branch_req) {
+            if (json.contains("tags") && json["tags"].is_array()) {
+                for (const auto & tag_item : json["tags"]) {
+                    if (tag_item.is_object() && tag_item.contains("name") && tag_item.contains("targetCommit") &&
+                        tag_item["name"].get<std::string>() == branch_req) {
+                        std::string _c = tag_item["targetCommit"].get<std::string>();
+                        if (is_valid_commit(_c)) {
+                            return _c;
+                        }
+                    }
+                }
             }
         }
 
@@ -280,13 +307,14 @@ static std::string get_repo_commit(const std::string & repo_id,
 }
 
 hf_files get_repo_files(const std::string & repo_id,
-                        const std::string & token) {
+                        const std::string & token,
+                        const std::string & branch) {
     if (!is_valid_repo_id(repo_id)) {
         LOG_WRN("%s: invalid repository: %s\n", __func__, repo_id.c_str());
         return {};
     }
 
-    std::string commit = get_repo_commit(repo_id, token);
+    std::string commit = get_repo_commit(repo_id, token, branch);
     if (commit.empty()) {
         LOG_WRN("%s: failed to resolve commit for %s\n", __func__, repo_id.c_str());
         return {};

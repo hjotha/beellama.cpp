@@ -1852,14 +1852,12 @@ static int save_models(const std::string & arch_filter, const size_t seed, const
             }
             if (arch == LLM_ARCH_QWEN35 && !moe) {
                 // Keep both trunk layer types and append one independently loadable head.
-                llama_model_saver ms(arch, gguf_ctx.get());
-                ms.add_kv(LLM_KV_BLOCK_COUNT, uint32_t(3));
-                ms.add_kv(LLM_KV_NEXTN_PREDICT_LAYERS, uint32_t(1));
-                auto model_and_ctx = get_model_and_ctx(
-                        gguf_ctx.get(), nullptr, seed, stdev, {}, LLAMA_SPLIT_MODE_LAYER, false, nullptr, 0, true);
+                auto mtp_meta = get_gguf_ctx(arch, moe, true);
+                auto mtp_model = get_model(mtp_meta.get(), nullptr, seed, stdev, {},
+                        LLAMA_SPLIT_MODE_LAYER, false, nullptr, 0, true);
                 const std::string mtp_path = dir + "/qwen35-mtp.gguf";
                 LOG_INF("%s: Saving qwen35 MTP fixture to %s...\n", __func__, mtp_path.c_str());
-                llama_model_save_to_file(model_and_ctx.first.get(), mtp_path.c_str());
+                llama_model_save_to_file(mtp_model.get(), mtp_path.c_str());
             }
         }
     }

@@ -2529,6 +2529,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     moe_cache        (params.moe_cache),
     prec_policy      (params.prec_policy),
     hdmd             (params.hdmd),
+    exl3             (params.exl3),
     sinq_scales      (params.sinq_scales),
     samplers         (params.samplers),
     cb_func          (params.cb),
@@ -2602,6 +2603,14 @@ ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
           ggml_tensor * w_s) const {
+    // an EXL3 weight has no scale tensor, and LoRA adapters cannot name it
+    if (exl3) {
+        if (const auto it = exl3->linears.find(w); it != exl3->linears.end()) {
+            GGML_ASSERT(w_s == nullptr);
+            return ggml_exl3_mul_mat(ctx0, w, cur, it->second.suh, it->second.svh, hparams.exl3_codebook);
+        }
+    }
+
     // a Hadamard-folded weight reads the transformed input; a LoRA delta lives in the primal basis and reads `cur`
     ggml_tensor * cur_mm = build_hadamard_input(w, cur);
     if (sinq_scales) {
@@ -2695,6 +2704,17 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * ids,
           ggml_tensor * w_s,
           ggml_tensor * slots) const {
+    // EXL3 experts: no scale tensor, no MoE cache, and LoRA adapters cannot name them
+    if (exl3) {
+        if (const auto it = exl3->linears.find(w); it != exl3->linears.end()) {
+            GGML_ASSERT(w_s == nullptr);
+            if (slots != nullptr) {
+                throw std::runtime_error("EXL3 experts cannot be used with the MoE expert cache");
+            }
+            return ggml_exl3_mul_mat_id(ctx0, w, cur, ids, it->second.suh, it->second.svh, hparams.exl3_codebook);
+        }
+    }
+
     // as in build_lora_mm: the folded weight reads the transformed input, the LoRA delta reads `cur`
     ggml_tensor * cur_mm = build_hadamard_input(w, cur);
     // the experts in the MoE cache are selected by their slots
@@ -3618,6 +3638,15 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
     return ggml_reshape_2d(ctx0, slots, selected_experts->ne[0], selected_experts->ne[1]); // [n_expert_used, n_tokens]
 }
 
+ggml_tensor * llm_graph_context::build_get_rows(ggml_tensor * table, ggml_tensor * ids) const {
+    if (exl3) {
+        if (const auto it = exl3->rows.find(table); it != exl3->rows.end()) {
+            return ggml_exl3_get_rows(ctx0, table, ids, it->second.signs, it->second.n_out);
+        }
+    }
+    return ggml_get_rows(ctx0, table, ids);
+}
+
 // input embeddings with optional lora
 ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float tok_scale) const {
     const int64_t n_embd_inp = hparams.n_embd_inp();
@@ -3663,13 +3692,13 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
     // we use ggml_build_forward_order to make the GET_ROWS ops stick at the beginning of the compute graph
     // this way the embeddings remain in the host buffer, and the GET_ROWS run before any other computations
     {
-        embd0 = ggml_get_rows(ctx0, tok_embd, inp->tokens);
+        embd0 = build_get_rows(tok_embd, inp->tokens);
         ggml_build_forward_order(gf, embd0);
 
         embd1 = inp->embd;
 
         if (has_mixed) {
-            embd2 = ggml_get_rows(ctx0, tok_embd, inp->mixed_tokens);
+            embd2 = build_get_rows(tok_embd, inp->mixed_tokens);
             ggml_build_forward_order(gf, embd2);
         }
     }
@@ -4815,7 +4844,8 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * v_mla, // TODO: remove
             float     kq_scale,
             int       il,
-        ggml_tensor * kq_mask_override) const {
+        ggml_tensor * kq_mask_override,
+            int64_t   n_kv_max) const {
     GGML_ASSERT(v_mla == nullptr);
 
     if (auto * paged = dynamic_cast<llm_graph_input_attn_kv_paged *>(inp)) {
@@ -5076,8 +5106,11 @@ ggml_tensor * llm_graph_context::build_attn(
                 route->body_type_k, route->body_type_v, kq_mask, kq_b,
                 k, v, body_mask, body_bias);
     }
+    const int64_t sparse_kv_bound = cparams.flash_attn && !use_kvarn &&
+            tail_route == LLAMA_KV_TAIL_ROUTE_NONE && !k_tail && !v_tail &&
+            k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 ? n_kv_max : 0;
     ggml_tensor * final_tail_op = nullptr;
-    ggml_tensor * cur = build_attn_mha(q, k, v, body_bias, body_mask, sinks, v_mla, 0, kq_scale, il,
+    ggml_tensor * cur = build_attn_mha(q, k, v, body_bias, body_mask, sinks, v_mla, sparse_kv_bound, kq_scale, il,
 k_tail, v_tail, kq_mask_tail, kq_b_tail,
             use_indexed_tail ? tail_read_idxs : nullptr,
             (use_indexed_tail || use_kvarn) ? inp->get_tail_query_order() : nullptr,

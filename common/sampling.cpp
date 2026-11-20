@@ -1012,6 +1012,9 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
             if (!accept(draft[i])) {
                 break;
             }
+            if (llama_vocab_is_eog(llama_model_get_vocab(llama_get_model(ctx)), draft[i]) && i + 1 < draft.size()) {
+                break;
+            }
             continue;
         }
 
@@ -1097,6 +1100,9 @@ struct llama_context * ctx,
         if (q_draft > 0.0f && uniform(gsmpl->speculative_rng) * q_draft <= p_draft) {
             common_sampler_accept(gsmpl, draft[i], true);
             result.push_back(draft[i]);
+            if (llama_vocab_is_eog(llama_model_get_vocab(llama_get_model(ctx)), draft[i]) && i + 1 < draft.size()) {
+                break;
+            }
             continue;
         }
 

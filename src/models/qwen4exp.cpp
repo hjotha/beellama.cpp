@@ -3,9 +3,16 @@
 #include "llama-kv-cache-kvarn.h"
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
+#ifdef LLAMA_USE_EXL3
+#include "exl3.h"
+#endif
 
 #include <algorithm>
 #include <cinttypes>
+#include <thread>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 // bad metadata must be catchable: GGML_ASSERT aborts the whole process
 static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, uint32_t value) {
@@ -223,8 +230,20 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         }
 
         // the converter pads the table; a model synthesised from metadata has no tensor to ask
+        // an EXL3 file holds the rows quantized as "<name>.exl3r_trellis" next to the F16 bias of every hash head
         const std::string ple_name = tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").str();
-        if (const auto * ple_w = ml.get_weight(ple_name.c_str())) {
+        const std::string ple_exl3 = tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "exl3r_trellis").str();
+        const auto * ple_quant = hparams.exl3_codebook >= 0 ? ml.get_weight(ple_exl3.c_str()) : nullptr;
+        const auto * ple_w = ple_quant ? ple_quant : ml.get_weight(ple_name.c_str());
+        if (ple_quant) {
+#ifdef LLAMA_USE_EXL3
+            if (hparams.ple_head_dim != GGML_EXL3_ROW_DIM) {
+                throw std::runtime_error(format("EXL3 n-gram table '%s' has width %u, expected %d", ple_exl3.c_str(), hparams.ple_head_dim, GGML_EXL3_ROW_DIM));
+            }
+#endif
+            ple_exl3_bias = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "exl3r_bias"), { hparams.ple_head_dim, hparams.ple_n_heads }, 0);
+        }
+        if (ple_w) {
             if (ple_w->tensor->ne[1] < ple_rows) {
                 throw std::runtime_error(format("%s has %" PRId64 " rows, too few for the PLE head ranges (%" PRId64 ")",
                                                 ple_name.c_str(), ple_w->tensor->ne[1], ple_rows));
@@ -234,6 +253,9 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 
         per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
                                            { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY | trunk_flags);
+        if (ple_quant && ple_w) {
+            ple_exl3_k = (int32_t) ((ple_w->tensor->ne[0] - 1)*16/hparams.ple_head_dim);
+        }
     }
 
     auto load_block = [&](int il, int flags) {
@@ -330,7 +352,15 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         load_block(il, mtp_flags);
 
         auto & nextn = layers[il].nextn;
-        nextn.eh_proj      = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ,      "weight", il), { 2*n_embd, n_embd }, mtp_flags);
+        // an EXL3 file keeps fc_embedding and fc_hidden as two linears, e_proj and h_proj, because each has its own
+        // scales; a dense file holds them merged into eh_proj
+        if (ml.get_weight(tn(LLM_TENSOR_NEXTN_E_PROJ, "weight", il).str().c_str()) ||
+            ml.get_weight(tn(LLM_TENSOR_NEXTN_E_PROJ, "exl3_trellis", il).str().c_str())) {
+            nextn.e_proj = create_tensor(tn(LLM_TENSOR_NEXTN_E_PROJ, "weight", il), { n_embd, n_embd }, mtp_flags);
+            nextn.h_proj = create_tensor(tn(LLM_TENSOR_NEXTN_H_PROJ, "weight", il), { n_embd, n_embd }, mtp_flags);
+        } else {
+            nextn.eh_proj = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ, "weight", il), { 2*n_embd, n_embd }, mtp_flags);
+        }
         nextn.enorm        = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,        "weight", il), { n_embd }, mtp_flags);
         // RMS per hc stream of the trunk residual, so the gammas load as [n_embd, hc] like the mixer norms
         nextn.hnorm        = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,        "weight", il), { n_embd, hc }, mtp_flags | TENSOR_ALLOW_RESHAPE);
@@ -615,7 +645,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_tensor * hc_head_norm = layer.nextn.hc_head_norm ? layer.nextn.hc_head_norm : model.hc_head_norm;
     ggml_tensor * hc_head_down = layer.nextn.hc_head_down ? layer.nextn.hc_head_down : model.hc_head_down;
     ggml_tensor * hc_head_up   = layer.nextn.hc_head_up   ? layer.nextn.hc_head_up   : model.hc_head_up;
-    GGML_ASSERT(layer.nextn.eh_proj && layer.nextn.enorm && layer.nextn.hnorm &&
+    GGML_ASSERT((layer.nextn.eh_proj || (layer.nextn.e_proj && layer.nextn.h_proj)) && layer.nextn.enorm && layer.nextn.hnorm &&
             hc_head_norm && hc_head_down && hc_head_up &&
             "MTP block missing, load the model with MTP enabled");
 
@@ -637,7 +667,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_tensor * tok_embd;
     if (ubatch.token) {
         const auto & owner = model.tok_embd ? model : qwen4exp_shared_model(cparams, model, "token_embd");
-        tok_embd = ggml_get_rows(ctx0, owner.tok_embd, inp->tokens);
+        tok_embd = build_get_rows(owner.tok_embd, inp->tokens);
     } else {
         tok_embd = inp->embd;
     }
@@ -668,11 +698,20 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_tensor * h_norm = build_norm(ggml_reshape_3d(ctx0, h, n_embd, hc, n_tokens), layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
     cb(h_norm, "mtp_hnorm", il);
 
-    ggml_tensor * e_norm = build_norm(tok_embd, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
-    e_norm = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, e_norm, n_embd, 1, n_tokens), n_embd, hc, n_tokens, 1);
-    cb(e_norm, "mtp_enorm", il);
-
-    ggml_tensor * res_hc = build_lora_mm(layer.nextn.eh_proj, ggml_concat(ctx0, e_norm, h_norm, 0)); // [n_embd, hc, n_tokens]
+    ggml_tensor * e_norm_1 = build_norm(tok_embd, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
+    ggml_tensor * res_hc;
+    if (layer.nextn.eh_proj) {
+        ggml_tensor * e_norm = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, e_norm_1, n_embd, 1, n_tokens), n_embd, hc, n_tokens, 1);
+        cb(e_norm, "mtp_enorm", il);
+        ggml_tensor * eh_in = ggml_reshape_2d(ctx0, ggml_concat(ctx0, e_norm, h_norm, 0), 2 * n_embd, hc * n_tokens);
+        res_hc = ggml_reshape_3d(ctx0, build_lora_mm(layer.nextn.eh_proj, eh_in), n_embd, hc, n_tokens); // [n_embd, hc, n_tokens]
+    } else {
+        cb(e_norm_1, "mtp_enorm", il);
+        ggml_tensor * e = build_lora_mm(layer.nextn.e_proj, e_norm_1);
+        ggml_tensor * h_in = ggml_reshape_2d(ctx0, h_norm, n_embd, hc * n_tokens);
+        ggml_tensor * h_out = ggml_reshape_3d(ctx0, build_lora_mm(layer.nextn.h_proj, h_in), n_embd, hc, n_tokens);
+        res_hc = ggml_add(ctx0, ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, e, n_embd, 1, n_tokens), n_embd, hc, n_tokens, 1), h_out);
+    }
     cb(res_hc, "mtp_eh_proj", il);
 
     hc_mix attn_mix = build_hc_mix(res_hc, layer.hc_attn_norm, layer.hc_attn_down, layer.hc_attn_up, layer.hc_attn_inject, layer.hc_attn_down_inject, il);
@@ -996,7 +1035,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         ggml_tensor *             v_cur,
         ggml_tensor *             sel,
         float                     kq_scale,
-        int                       il) {
+        int                       il,
+        int64_t                   n_kv_max) {
     // The indexer emits [n_kv, n_tokens]; attention partitions those tokens
     // across KV streams. Preserve upstream's stream layout before composing tails.
     const auto * mask = inp->get_kq_mask();
@@ -1006,7 +1046,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     GGML_ASSERT(ggml_are_same_shape(sel, inp->get_kq_mask()));
     cb(sel, "kq_mask_qsa", il);
     return build_attn(inp, nullptr, nullptr, nullptr, q_cur, k_cur, v_cur,
-            nullptr, nullptr, nullptr, kq_scale, il, sel);
+            nullptr, nullptr, nullptr, kq_scale, il, sel, n_kv_max);
 }
 
 ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
@@ -1076,7 +1116,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
     if (sel) {
-        cur = build_attn_qsa(inp, Qcur, Kcur, Vcur, sel, kq_scale, il);
+        cur = build_attn_qsa(inp, Qcur, Kcur, Vcur, sel, kq_scale, il, inp_kpool ? inp_kpool->n_sel : 0);
     } else {
         cur = build_attn(inp,
                     nullptr, nullptr, nullptr,
@@ -1299,10 +1339,12 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override {
         mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx)->get_attn();
-        return rows->ne[0] == (int64_t) model.hparams.ple_n_heads * params.ubatch.n_tokens;
+        const int64_t expected = (int64_t) model.hparams.ple_n_heads * params.ubatch.n_tokens;
+        return embd ? embd->ne[1] == expected : rows->ne[0] == expected;
     }
 
     ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]
+    ggml_tensor * embd = nullptr;   // F32 [ple_head_dim, ple_n_heads * n_tokens] (EXL3 decoded on host)
 
     const llama_model & model;
 
@@ -1383,6 +1425,71 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
         }
     }
 
+    const auto & qmodel = static_cast<const llama_model_qwen4exp &>(model);
+    if (qmodel.ple_exl3_bias) {
+#ifdef LLAMA_USE_EXL3
+        const int64_t dim = hparams.ple_head_dim;
+        std::call_once(qmodel.ple_exl3_bias_once, [&]() {
+            qmodel.ple_exl3_bias_host.resize(ggml_nelements(qmodel.ple_exl3_bias));
+            ggml_backend_tensor_get(
+                qmodel.ple_exl3_bias,
+                qmodel.ple_exl3_bias_host.data(),
+                0,
+                ggml_nbytes(qmodel.ple_exl3_bias));
+        });
+        const auto & ple_bias = qmodel.ple_exl3_bias_host;
+        const ggml_tensor * ple = model.per_layer_tok_embd;
+        GGML_ASSERT(ple && ple->data);
+        std::vector<float> out((size_t) idx.size() * dim);
+        std::vector<int64_t> offsets(hparams.ple_head_offsets.begin(), hparams.ple_head_offsets.begin() + n_heads);
+#ifdef _OPENMP
+        const size_t n_items = idx.size();
+        #pragma omp parallel for schedule(static) if (n_items >= 64)
+        for (size_t j = 0; j < n_items; ++j) {
+            const int32_t row = idx[j];
+            const int64_t h = ggml_exl3_ngram_head(offsets.data(), (int) n_heads, row);
+            const auto * src = (const int16_t *) ((const char *) ple->data + (size_t) row * ple->nb[1]);
+            ggml_exl3_decode_ngram_row(src, qmodel.ple_exl3_k, ple_bias.data() + h * dim, out.data() + j * dim);
+        }
+#else
+        auto decode_range = [&](size_t j_begin, size_t j_end) {
+            for (size_t j = j_begin; j < j_end; ++j) {
+                const int32_t row = idx[j];
+                const int64_t h = ggml_exl3_ngram_head(offsets.data(), (int) n_heads, row);
+                const auto * src = (const int16_t *) ((const char *) ple->data + (size_t) row * ple->nb[1]);
+                ggml_exl3_decode_ngram_row(src, qmodel.ple_exl3_k, ple_bias.data() + h * dim, out.data() + j * dim);
+            }
+        };
+        if (idx.size() >= 64) {
+            const size_t n_threads = std::min<size_t>(8, std::max<size_t>(1, std::thread::hardware_concurrency()));
+            if (n_threads > 1) {
+                std::vector<std::thread> workers;
+                workers.reserve(n_threads);
+                const size_t chunk = (idx.size() + n_threads - 1) / n_threads;
+                for (size_t t = 0; t < n_threads; ++t) {
+                    const size_t j0 = t * chunk;
+                    const size_t j1 = std::min(idx.size(), j0 + chunk);
+                    if (j0 < j1) {
+                        workers.emplace_back(decode_range, j0, j1);
+                    }
+                }
+                for (auto & w : workers) {
+                    w.join();
+                }
+            } else {
+                decode_range(0, idx.size());
+            }
+        } else {
+            decode_range(0, idx.size());
+        }
+#endif
+        ggml_backend_tensor_set(embd, out.data(), 0, out.size() * sizeof(float));
+        return;
+#else
+        GGML_ABORT("EXL3 n-gram rows need a build with GGML_EXL3=ON");
+#endif
+    }
+
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
 }
 
@@ -1436,7 +1543,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
                 conv_states_all->nb[1],
                 (slot * mem_size + kv_head) * row_size);
 
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, tail, dst));
     }
 
     return conv_input;
@@ -1449,13 +1556,22 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
     // the attention cells see every ubatch regardless of the layer types
     auto ple_inp = std::make_unique<llm_graph_input_qwen4exp_ple>(model, mctx_hyb->get_attn());
 
-    ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
-    ggml_set_input(ple_inp->rows);
-    ggml_tensor * rows = ple_inp->rows;
-    res->add_input(std::move(ple_inp));
+    const auto & qmodel = static_cast<const llama_model_qwen4exp &>(model);
+    ggml_tensor * emb = nullptr;
+    if (qmodel.ple_exl3_bias) {
+        ple_inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.ple_head_dim, n_heads * n_tokens);
+        ggml_set_input(ple_inp->embd);
+        emb = ple_inp->embd;
+        res->add_input(std::move(ple_inp));
+    } else {
+        ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
+        ggml_set_input(ple_inp->rows);
+        ggml_tensor * rows = ple_inp->rows;
+        res->add_input(std::move(ple_inp));
 
-    // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
-    ggml_tensor * emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
+        // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
+        emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
+    }
     emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);
     cb(emb, "ple_embd", -1);
 

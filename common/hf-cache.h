@@ -22,7 +22,8 @@ using hf_files = std::vector<hf_file>;
 // Get files from HF API
 hf_files get_repo_files(
     const std::string & repo_id,
-    const std::string & token
+    const std::string & token = {},
+    const std::string & branch = {}
 );
 
 hf_files get_cached_files(const std::string & repo_id = {});

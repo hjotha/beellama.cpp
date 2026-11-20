@@ -393,6 +393,47 @@ extern "C" {
         const size_t * file_data_offsets,
         void * user_data);
 
+    // Optional byte-range transform/validation callback for streamed targets (e.g. EXL3 type/shape conversions).
+    // When dst != NULL, transforms src[0..src_bytes) into dst[0..dst_bytes).
+    // When dst == NULL, validates src[0..src_bytes) only. Returns false on invalid data.
+    typedef bool (*llama_model_stream_transform_fn)(
+        const void * src,
+        size_t src_bytes,
+        void * dst,
+        size_t dst_bytes,
+        void * user_data);
+
+    struct llama_model_stream_target_desc {
+        uint16_t file_idx;
+        size_t   file_offset;
+        size_t   src_bytes;
+        size_t   dst_offset;
+        llama_model_stream_transform_fn transform;
+        void *   transform_user_data;
+    };
+
+    struct llama_model_stream_target_sink {
+        bool (*add_target)(void * ctx, struct ggml_tensor * dst, const struct llama_model_stream_target_desc * desc);
+    };
+
+    // Optional external stream source layout and tensor-to-file mapping (for llama_model_init_from_user
+    // or explicit shard sizes for header-only GGUF temp files).
+    struct llama_model_stream_source_desc {
+        uint16_t n_files;
+        const size_t * file_sizes;
+        const size_t * file_data_offsets;
+        bool (*register_tensor)(
+            struct ggml_tensor * tensor,
+            const struct llama_model_stream_target_sink * sink,
+            void * sink_ctx,
+            void * user_data);
+        bool (*register_extra)(
+            const struct llama_model_stream_target_sink * sink,
+            void * sink_ctx,
+            void * user_data);
+        void * user_data;
+    };
+
     struct llama_model_params {
         // NULL-terminated list of devices to use for offloading (if NULL, all available devices are used)
         ggml_backend_dev_t * devices;
@@ -442,6 +483,7 @@ extern "C" {
         llama_model_stream_loader_fn stream_loader;
         void * stream_loader_user_data;
         uint32_t stream_chunk_bytes; // preferred staging buffer capacity in bytes (0 = default 8 MiB)
+        const struct llama_model_stream_source_desc * stream_source;
     };
 
     struct llama_sampler_seq_config {
@@ -783,6 +825,8 @@ extern "C" {
     // Create a new model from GGUF metadata as well as a function to set the tensor data
     //   - tensors are created as GGML_TYPE_F32 by default,
     //     override by adding a tensor with the same name but a different name to the context
+    //   - set the boolean metadata key llama.tensor_set_complete to true to supply the complete tensor set, as in a model file:
+    //     shapes are checked, a missing optional tensor stays missing and every tensor must be used
     LLAMA_API struct llama_model * llama_model_init_from_user(
                     struct gguf_context * metadata,
           llama_model_set_tensor_data_t   set_tensor_data,    // function to initialize tensor data with

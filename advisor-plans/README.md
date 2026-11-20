@@ -15,3 +15,9 @@ Ordem: reparar splitter e testes/merge, fechar F1, F2b, F3 4B, F4 disco, F5 27B,
 | [002 — Regressão CUDA FP8 e cobertura da review](002-rkva276-regression-performance-steer.md) | P1 | TODO — encaminhar AGY para Sol | Build 276 e baseline CPU; instrumentar antes de otimizar |
 
 Escopo independente do plano 001. Ordem interna: profile e A/B controlado, regressão, alocações/cópias, FP8 Xbox, demais gates e wavefront condicionado a evidência. Hipóteses/descartes e critérios estão no plano.
+
+## Decode do Flash-Next na A100
+
+| Plano | Prioridade | Estado | Dependências |
+|---|---|---|---|
+| [003 — Flash-Next EXL3 com MTP](003-flash-next-decode-a100.md) | P1 | Auditoria concluída, patches propostos | Trace pareado de decode e fixtures de paridade |

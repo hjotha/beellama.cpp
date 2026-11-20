@@ -244,11 +244,15 @@ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
         return false;
     }
     if (mem_idx) {
-        const llama_pos stale = mem_idx_stale_pos(seq_id, p0);
         if (!mem_idx->seq_rm(seq_id, p0, p1)) {
             return false;
         }
-        mem_idx_stale_set(seq_id, stale);
+        if (p1 < 0 && kpool_layout_trim_suffix(seq_id, p0)) {
+            // Trimmed suffix in-place successfully; avoid marking stale
+        } else {
+            const llama_pos stale = mem_idx_stale_pos(seq_id, p0);
+            mem_idx_stale_set(seq_id, stale);
+        }
     }
     return get_mem_attn()->seq_rm(seq_id, p0, p1);
 }
@@ -404,6 +408,18 @@ uint32_t kpool_pad(uint32_t n_pool) {
 // Rank of (pos, cell) in a sequence's cells sorted by position then cell, or -1 when absent.
 // In order mode the rank alone places a token: cells sharing a position (M-RoPE images) have distinct ranks.
 int64_t kpool_rank(const std::vector<std::pair<llama_pos, uint32_t>> & cells, llama_pos pos, uint32_t cell) {
+    if (!cells.empty()) {
+        const auto & b = cells.back();
+        if (b.first == pos && b.second == cell) {
+            return (int64_t) cells.size() - 1;
+        }
+        if (cells.size() > 1) {
+            const auto & b2 = cells[cells.size() - 2];
+            if (b2.first == pos && b2.second == cell) {
+                return (int64_t) cells.size() - 2;
+            }
+        }
+    }
     auto it = std::lower_bound(cells.begin(), cells.end(), std::make_pair(pos, cell));
     return it != cells.end() && it->second == cell && it->first == pos ? it - cells.begin() : -1;
 }
@@ -416,6 +432,41 @@ const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_lay
     GGML_ASSERT(kpool_lay != nullptr);
 
     return *kpool_lay;
+}
+
+bool llama_memory_hybrid_idx::kpool_layout_trim_suffix(llama_seq_id seq_id, llama_pos p0) {
+    if (!kpool_lay || seq_id < 0 || seq_id >= (llama_seq_id) LLAMA_MAX_SEQ) {
+        return false;
+    }
+    if (!hparams_idx.indexer_kpool_by_order) {
+        return false;
+    }
+    auto & sq = kpool_lay->seqs[seq_id];
+    if (sq.cells.empty()) {
+        return false;
+    }
+    const uint32_t n_stream_kv = mem_idx->get_n_stream();
+    const bool unified = n_stream_kv == 1;
+    const auto & cells = mem_idx->get_cells(unified ? 0 : seq_id);
+    const auto & live = cells.seq_pos_get(seq_id);
+
+    const auto cut = std::lower_bound(sq.cells.begin(), sq.cells.end(), std::make_pair(p0, 0u));
+    const size_t keep = size_t(cut - sq.cells.begin());
+    const uint32_t kpool = get_kpool();
+    if (kpool == 0) {
+        return false;
+    }
+    const size_t pools = keep / kpool;
+    if (keep == 0 || keep != live.size() || pools > sq.pools.size() ||
+            sq.cells.front() != *live.begin() || sq.cells[keep - 1] != *live.rbegin()) {
+        return false;
+    }
+
+    kpool_lay->n_pool_real -= uint32_t(sq.pools.size() - pools);
+    sq.cells.resize(keep);
+    sq.pools.resize(pools);
+    sq.j_next = pools * kpool;
+    return true;
 }
 
 // Pools are fixed by the positions relative to the sequence's first one, so the layout survives a plain
@@ -890,20 +941,26 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     }
 
     uint32_t i_new = 0;
+    int64_t max_rep = -1;
+    uint32_t pool_count = 0;
     for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ; ++s) {
         const auto & sq = lay.seqs[s];
-        seq_pool_start[s] = (uint32_t) pool_end.size();
+        seq_pool_start[s] = pool_count;
 
         const bool inert = n_stream_kv > 1 && !seq_in_ub[s];
 
         for (size_t pi = 0; pi < sq.pools.size(); ++pi) {
             const uint32_t j  = sq.pools[pi];
-            const uint32_t ip = (uint32_t) pool_end.size();
+            const uint32_t ip = pool_count++;
             GGML_ASSERT(ip + 1 < n_pool);
 
             // The pooled key lives in the last member's row.
             const uint32_t rep = sq.cells[j + kpool - 1].second;
-            pcell[ip] = (int32_t) gcell(sq, rep);
+            const int32_t gc = (int32_t) gcell(sq, rep);
+            pcell[ip] = gc;
+            if ((int64_t) gc > max_rep) {
+                max_rep = gc;
+            }
 
             for (uint32_t k = 0; k < kpool; ++k) {
                 pidx[(size_t) ip*kpool + k] = inert ? sentinel : (int32_t) sq.cells[j + k].second;
@@ -927,7 +984,9 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
                 ++i_new;
             }
 
-            pool_end.push_back(sq.cells[j + kpool - 1].first);
+            if (!by_order) {
+                pool_end.push_back(sq.cells[j + kpool - 1].first);
+            }
         }
     }
     GGML_ASSERT(i_new == n_new);
@@ -935,23 +994,32 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     // Padded entries re-pool cells whose pooled slot is never read: only the reps of complete pools are read.
     // Each entry takes its own cell, entries sharing one would write it from several threads in the scatter.
     if (n_new_g > n_new) {
-        std::vector<int64_t> reps(pcell, pcell + pool_end.size());
-        std::sort(reps.begin(), reps.end());
-
-        int64_t pad_cell = 0;
-        for (uint32_t i = n_new; i < n_new_g; ++i, ++pad_cell) {
-            while (std::binary_search(reps.begin(), reps.end(), pad_cell)) {
-                ++pad_cell;
+        const int64_t max_total_cells = (int64_t) kv_size * n_stream_kv;
+        if (max_rep + (int64_t)(n_new_g - n_new) < max_total_cells) {
+            int64_t pad_cell = max_rep + 1;
+            for (uint32_t i = n_new; i < n_new_g; ++i, ++pad_cell) {
+                for (uint32_t k = 0; k < kpool; ++k) {
+                    nidx[(size_t) i*kpool + k] = (int32_t) pad_cell;
+                }
+                nrep[i] = pad_cell;
             }
-            GGML_ASSERT(pad_cell < (int64_t) kv_size*n_stream_kv);
-            for (uint32_t k = 0; k < kpool; ++k) {
-                nidx[(size_t) i*kpool + k] = (int32_t) pad_cell;
+        } else {
+            std::unordered_set<int64_t> reps_set(pcell, pcell + pool_count);
+            int64_t pad_cell = max_total_cells - 1;
+            for (uint32_t i = n_new; i < n_new_g; ++i, --pad_cell) {
+                while (pad_cell >= 0 && reps_set.count(pad_cell)) {
+                    --pad_cell;
+                }
+                GGML_ASSERT(pad_cell >= 0);
+                for (uint32_t k = 0; k < kpool; ++k) {
+                    nidx[(size_t) i*kpool + k] = (int32_t) pad_cell;
+                }
+                nrep[i] = pad_cell;
             }
-            nrep[i] = pad_cell;
         }
     }
 
-    const uint32_t n_pool_real = (uint32_t) pool_end.size();
+    const uint32_t n_pool_real = pool_count;
     for (uint32_t ip = n_pool_real; ip < n_pool; ++ip) {
         pcell[ip] = (int32_t) dummy_cell; // pool_cells always addresses the K storage
         for (uint32_t k = 0; k < kpool; ++k) {
@@ -970,13 +1038,17 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
             const llama_pos    p = ubatch->pos[i];
 
             T * row = data + (size_t) i*n_pool;
-            std::fill(row, row + n_pool, drop);
 
             const uint32_t p0 = seq_pool_start[s];
             const uint32_t p1 = p0 + (uint32_t) lay.seqs[s].pools.size();
             const uint32_t nv = by_order ? std::min(p1 - p0, (uint32_t) ((rank[i] + 1)/kpool)) :
                 (uint32_t) (std::upper_bound(pool_end.begin() + p0, pool_end.begin() + p1, p) - (pool_end.begin() + p0));
+
+            if (p0 > 0) {
+                std::fill(row, row + p0, drop);
+            }
             std::fill(row + p0, row + p0 + nv, keep);
+            std::fill(row + p0 + nv, row + n_pool, drop);
 
             // Finite visible pools occupy the first min(nv, n_top) ranked slots.
             if (gm != nullptr) {

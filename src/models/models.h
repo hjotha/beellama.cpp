@@ -7,6 +7,7 @@
 // note: almost all graphs require at least sqrtf, so include cmath globally
 #include <cmath>
 #include <map>
+#include <mutex>
 
 class llama_memory_hybrid_idx_context;
 
@@ -2883,6 +2884,11 @@ struct llama_model_clef : public llama_model_qwen35 {
 struct llama_model_qwen4exp : public llama_model_base {
     llama_model_qwen4exp(const struct llama_model_params & params) : llama_model_base(params) {}
 
+    struct ggml_tensor * ple_exl3_bias = nullptr;
+    int32_t              ple_exl3_k    = 0;
+    mutable std::once_flag             ple_exl3_bias_once;
+    mutable std::vector<ggml_fp16_t>   ple_exl3_bias_host;
+
     class llm_graph_input_kpool;
 
     void load_arch_hparams(llama_model_loader & ml) override;
@@ -2934,7 +2940,8 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * v_cur,
                     ggml_tensor * sel,
                           float   kq_scale,
-                            int   il);
+                            int   il,
+                        int64_t   n_kv_max = 0);
 
         // the QSA layers share one set of k-pool inputs, see llama_memory_hybrid_idx
         llm_graph_input_kpool * build_inp_kpool(const llama_memory_hybrid_idx_context * mctx_hyb);

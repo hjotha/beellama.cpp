@@ -314,6 +314,7 @@ struct common_params_model {
     std::string url         = ""; // model url to download
     std::string hf_repo     = ""; // HF repo
     std::string hf_file     = ""; // HF file
+    std::string hf_branch   = ""; // HF branch or revision
     std::string docker_repo = ""; // Docker repo
     std::vector<std::string> splits; // optional split paths (populated by HF stream prepare)
 

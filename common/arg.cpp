@@ -612,7 +612,9 @@ common_models_handler common_models_handler_init(const common_params & params, l
                         && params.mmproj.path.empty() && params.mmproj.url.empty();
 
     if (!params.model.hf_repo.empty()) {
-        plan = common_download_get_hf_plan(params.model, opts);
+        auto main_opts = opts;
+        main_opts.discover_exl3 = params.hf_stream_vram;
+        plan = common_download_get_hf_plan(params.model, main_opts);
     }
 
     if (!params.speculative.draft.mparams.hf_repo.empty()) {
@@ -926,7 +928,7 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
     // If HF->VRAM direct streaming is requested for main model GGUF(s), try preparing
     // header-only temp files first; otherwise fall back to regular disk download tasks.
     std::string prepared_stream_first_path;
-    if (!params.offline && !stream_candidate_tasks.empty()) {
+    if (plan.is_exl3 || (!params.offline && !stream_candidate_tasks.empty())) {
         common_download_stream_opts sopts;
         sopts.n_threads   = std::max(1, params.hf_download_threads);
         sopts.chunk_bytes = static_cast<size_t>(std::max(1, params.hf_stream_chunk_mb)) * 1024u * 1024u;
@@ -938,36 +940,74 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
             sopts.disk_mode = COMMON_HF_STREAM_DISK_SYNC;
         }
 
-        std::vector<std::string> stream_paths;
-        if (common_download_prepare_stream(stream_candidate_tasks, sopts, stream_paths) && !stream_paths.empty()) {
-            prepared_stream_first_path = stream_paths.front();
-            params.model.path = stream_paths.front();
-            if (stream_paths.size() > 1) {
-                params.model.splits = stream_paths;
-            }
-            params.load_mode = LLAMA_LOAD_MODE_NONE;
-        } else {
-            // Fall back to regular download for all candidate tasks
-            if (!params.model.url.empty()) {
-                for (size_t i = 0; i < stream_candidate_tasks.size(); ++i) {
-                    auto & t = stream_candidate_tasks[i];
-                    if (i == 0) {
-                        const std::string first_path = t.local_path;
-                        t.on_done = [&params, first_path]() { params.model.path = first_path; };
-                    }
-                    tasks.push_back(std::move(t));
+        if (plan.is_exl3) {
+            std::vector<common_download_task> metadata;
+            std::filesystem::path dir;
+            for (const auto & file : plan.exl3_meta_files) {
+                metadata.emplace_back(file, opts);
+                if (file.path == "config.json") {
+                    dir = std::filesystem::path(file.final_path).parent_path();
                 }
-            } else if (!plan.model_files.empty()) {
-                for (size_t i = 0; i < plan.model_files.size(); ++i) {
-                    const auto & model_file = plan.model_files[i];
-                    const bool is_primary = (model_file.path == plan.primary.path);
-                    tasks.emplace_back(model_file, opts, [&, is_primary]() {
-                        if (is_primary) {
-                            params.model.path = finalize(model_file);
-                        } else {
-                            finalize(model_file);
+            }
+            if (!params.offline) {
+                common_download_run_tasks(metadata);
+            }
+            for (const auto & file : plan.exl3_meta_files) {
+                finalize(file);
+            }
+            std::ifstream config_file(dir / "config.json");
+            std::string config_text((std::istreambuf_iterator<char>(config_file)), std::istreambuf_iterator<char>());
+            const auto config = common_json::parse(config_text);
+            const auto qc = config.value("quantization_config", common_json());
+            if (!qc.is_object() || qc.value("quant_method", "") != "exl3") {
+                throw std::runtime_error("Hugging Face repository has no GGUF or EXL3 model");
+            }
+
+            std::vector<common_download_task> shards;
+            std::vector<std::string> names;
+            for (const auto & file : plan.exl3_tensor_files) {
+                shards.emplace_back(file, opts, [file]() { hf_cache::finalize_file(file); });
+                names.push_back(file.path);
+            }
+            params.model.path = dir.string();
+            if (!params.offline && common_download_prepare_stream_exl3(params.model.path, shards, names, sopts)) {
+                prepared_stream_first_path = params.model.path;
+                params.load_mode = LLAMA_LOAD_MODE_NONE;
+            } else {
+                tasks.insert(tasks.end(), shards.begin(), shards.end());
+            }
+        } else {
+            std::vector<std::string> stream_paths;
+            if (common_download_prepare_stream(stream_candidate_tasks, sopts, stream_paths) && !stream_paths.empty()) {
+                prepared_stream_first_path = stream_paths.front();
+                params.model.path = stream_paths.front();
+                if (stream_paths.size() > 1) {
+                    params.model.splits = stream_paths;
+                }
+                params.load_mode = LLAMA_LOAD_MODE_NONE;
+            } else {
+                // Fall back to regular download for all candidate tasks
+                if (!params.model.url.empty()) {
+                    for (size_t i = 0; i < stream_candidate_tasks.size(); ++i) {
+                        auto & t = stream_candidate_tasks[i];
+                        if (i == 0) {
+                            const std::string first_path = t.local_path;
+                            t.on_done = [&params, first_path]() { params.model.path = first_path; };
                         }
-                    });
+                        tasks.push_back(std::move(t));
+                    }
+                } else if (!plan.model_files.empty()) {
+                    for (size_t i = 0; i < plan.model_files.size(); ++i) {
+                        const auto & model_file = plan.model_files[i];
+                        const bool is_primary = (model_file.path == plan.primary.path);
+                        tasks.emplace_back(model_file, opts, [&, is_primary]() {
+                            if (is_primary) {
+                                params.model.path = finalize(model_file);
+                            } else {
+                                finalize(model_file);
+                            }
+                        });
+                    }
                 }
             }
         }
@@ -4952,6 +4992,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_DOWNLOAD, LLAMA_EXAMPLE_TOKENIZE}).set_env("LLAMA_ARG_HF_FILE"));
     add_opt(common_arg(
+        {"-hfb", "--hf-branch"}, "BRANCH_OR_COMMIT",
+        "Hugging Face branch name or commit hash (default: main)",
+        [](common_params & params, const std::string & value) {
+            params.model.hf_branch = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_DOWNLOAD, LLAMA_EXAMPLE_TOKENIZE}).set_env("LLAMA_ARG_HF_BRANCH"));
+    add_opt(common_arg(
         {"-hft", "--hf-token"}, "TOKEN",
         "Hugging Face access token (default: value from HF_TOKEN environment variable)",
         [](common_params & params, const std::string & value) {
@@ -4970,7 +5017,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_DOWNLOAD}).set_env("LLAMA_ARG_HF_THREADS"));
     add_opt(common_arg(
         {"--hf-stream-vram"},
-        "stream uncached GGUF weights from Hugging Face/HTTP directly to VRAM via pinned buffers while persisting to disk simultaneously (default: false)",
+        "stream uncached GGUF (Hugging Face/HTTP) or EXL3 (Hugging Face) weights directly to VRAM via pinned buffers (default: false)",
         [](common_params & params) {
             params.hf_stream_vram = true;
         }

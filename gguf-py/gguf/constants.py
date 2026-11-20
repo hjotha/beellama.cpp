@@ -567,6 +567,15 @@ class Keys:
         INVERSE_WEIGHT_NAMES = "prism.hadamard.inverse_weight_names"
         GDN_V_GROUPED        = "prism.hadamard.gdn_v_grouped"
 
+    class Exl3:
+        VERSION             = "exl3.version"
+        CODEBOOK            = "exl3.codebook"
+        HADAMARD_SIZE       = "exl3.hadamard_size"
+        ROWS_VERSION        = "exl3.rows.version"
+        PERMUTATION         = "exl3.permutation"
+        PERMUTED_TENSORS    = "exl3.permuted_tensors"
+        SOURCE_QUANT_CONFIG = "exl3.source.quantization_config"
+
 
 #
 # recommended mapping of model tensor names for storage in gguf
@@ -958,8 +967,6 @@ class MODEL_TENSOR(IntEnum):
     HC_FFN_INJECT        = auto() # qwen4exp
     HC_ATTN_DOWN_INJECT  = auto() # qwen4exp, [hc_attn_down | hc_attn_inject]
     HC_FFN_DOWN_INJECT   = auto() # qwen4exp, [hc_ffn_down | hc_ffn_inject]
-    ATTN_QKV_GATE        = auto() # qwen4exp, [attn_qkv | attn_gate]
-    SSM_BETA_ALPHA_CAT   = auto() # qwen4exp, [ssm_beta | ssm_alpha], unlike the grouped qwen3next ssm_ba
     PLE_KEY              = auto() # qwen4exp
     PLE_VALUE            = auto() # qwen4exp
     PLE_NORM_KEY         = auto() # qwen4exp
@@ -1376,6 +1383,8 @@ class MODEL_TENSOR(IntEnum):
     NEXTN_HC_HEAD_NORM     = auto()
     NEXTN_HC_HEAD_DOWN     = auto()
     NEXTN_HC_HEAD_UP       = auto()
+    NEXTN_E_PROJ           = auto() # eh_proj in two parts (EXL3 qwen4exp)
+    NEXTN_H_PROJ           = auto()
     # eagle3
     FC                     = auto()  # feature fusion layer
     D2T                    = auto()  # draft to target vocabulary mapping
@@ -1833,8 +1842,6 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.HC_FFN_INJECT:             "blk.{bid}.hc_ffn_inject",        # qwen4exp
     MODEL_TENSOR.HC_ATTN_DOWN_INJECT:       "blk.{bid}.hc_attn_down_inject",  # qwen4exp
     MODEL_TENSOR.HC_FFN_DOWN_INJECT:        "blk.{bid}.hc_ffn_down_inject",   # qwen4exp
-    MODEL_TENSOR.ATTN_QKV_GATE:             "blk.{bid}.attn_qkv_gate",        # qwen4exp
-    MODEL_TENSOR.SSM_BETA_ALPHA_CAT:        "blk.{bid}.ssm_beta_alpha",       # qwen4exp
     MODEL_TENSOR.PLE_KEY:                   "blk.{bid}.ple_key",              # qwen4exp
     MODEL_TENSOR.PLE_VALUE:                 "blk.{bid}.ple_value",            # qwen4exp
     MODEL_TENSOR.PLE_NORM_KEY:              "blk.{bid}.ple_norm_key",         # qwen4exp
@@ -2278,6 +2285,8 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.NEXTN_HC_HEAD_NORM:        "blk.{bid}.nextn.hc_head_norm",
     MODEL_TENSOR.NEXTN_HC_HEAD_DOWN:        "blk.{bid}.nextn.hc_head_down",
     MODEL_TENSOR.NEXTN_HC_HEAD_UP:          "blk.{bid}.nextn.hc_head_up",
+    MODEL_TENSOR.NEXTN_E_PROJ:              "blk.{bid}.nextn.e_proj",
+    MODEL_TENSOR.NEXTN_H_PROJ:              "blk.{bid}.nextn.h_proj",
     MODEL_TENSOR.FC:                        "fc",
     # dspark drafter
     MODEL_TENSOR.DSPARK_FC:                 "dspark.fc",
@@ -3559,6 +3568,9 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.NEXTN_HC_HEAD_NORM,
         MODEL_TENSOR.NEXTN_HC_HEAD_DOWN,
         MODEL_TENSOR.NEXTN_HC_HEAD_UP,
+        # EXL3: fc_embedding and fc_hidden stay two linears
+        MODEL_TENSOR.NEXTN_E_PROJ,
+        MODEL_TENSOR.NEXTN_H_PROJ,
     ],
     MODEL_ARCH.PLAMO: [
         MODEL_TENSOR.TOKEN_EMBD,
@@ -5696,6 +5708,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
     MODEL_ARCH.LFM2MOE: [
         MODEL_TENSOR.TOKEN_EMBD,
         MODEL_TENSOR.TOKEN_EMBD_NORM,
+        MODEL_TENSOR.OUTPUT, # an untied head (EXL3 checkpoints store one)
         MODEL_TENSOR.SHORTCONV_CONV,
         MODEL_TENSOR.SHORTCONV_INPROJ,
         MODEL_TENSOR.SHORTCONV_OUTPROJ,

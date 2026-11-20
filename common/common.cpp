@@ -6,6 +6,9 @@
 #include "build-info.h"
 #include "common.h"
 #include "common-rollback.h"
+#ifdef LLAMA_USE_EXL3
+#include "exl3-dir.h"
+#endif
 #include "json.h"
 
 #include "../src/llama-ext.h"
@@ -2424,15 +2427,9 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         cparams.kv_tail_request = tail_request.get();
     }
 
-    if (!(params.n_ctx == 0 && !params.kv_paged)) {
-        try {
-            common_fit_apply(params, mparams, cparams);
-        } catch (const common_params_fit_unsafe_extra_exception & e) {
-            COM_ERR("%s\n", e.what());
-            return;
-        }
-    }
-
+    std::vector<common_download_stream_file_info> stream_files;
+    std::vector<size_t> stream_sizes;
+    llama_model_stream_source_desc stream_source{};
     if (void * stream_ud = common_download_get_stream_session_ud(params.model.path)) {
         static std::once_flag atexit_flag;
         std::call_once(atexit_flag, []() {
@@ -2442,6 +2439,26 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         mparams.stream_loader_user_data = stream_ud;
         mparams.stream_chunk_bytes      = static_cast<uint32_t>(std::max(1, params.hf_stream_chunk_mb)) * 1024u * 1024u;
         mparams.load_mode               = LLAMA_LOAD_MODE_NONE;
+    }
+
+    if (mparams.stream_loader &&
+        common_download_get_stream_file_infos(params.model.path, stream_files) &&
+        stream_files.front().rel_path.empty()) {
+        for (const auto & file : stream_files) {
+            stream_sizes.push_back(file.total_size);
+        }
+        stream_source.n_files = static_cast<uint16_t>(stream_sizes.size());
+        stream_source.file_sizes = stream_sizes.data();
+        mparams.stream_source = &stream_source;
+    }
+
+    if (!(params.n_ctx == 0 && !params.kv_paged)) {
+        try {
+            common_fit_apply(params, mparams, cparams);
+        } catch (const common_params_fit_unsafe_extra_exception & e) {
+            COM_ERR("%s\n", e.what());
+            return;
+        }
     }
 
     const bool was_streamed = (mparams.stream_loader != nullptr);
@@ -2454,7 +2471,11 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         }
         model = llama_model_load_from_splits(c_splits.data(), c_splits.size(), mparams);
     } else {
+#ifdef LLAMA_USE_EXL3
+        model = common_exl3_load_model(params.model.path, mparams);
+#else
         model = llama_model_load_from_file(params.model.path.c_str(), mparams);
+#endif
     }
     if (model == NULL) {
         return;

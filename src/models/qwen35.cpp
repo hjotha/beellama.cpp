@@ -1114,8 +1114,9 @@ ggml_tensor * llama_model_qwen35::graph_base::build_layer_attn_linear(
     // backends would fall back to the CPU for the whole op, which costs more than the four launches
     static const bool raw_gates_disable = getenv("GGML_GDN_RAW_GATES_DISABLE") != nullptr;
     // the fused [beta | alpha] projection leaves alpha as a strided view; the raw-gate
-    // path reshapes it and requires contiguous data, so keep the activated path there
-    const bool raw_gates_shape_ok = !model.layers[il].ssm_beta_alpha_cat;
+    // path reshapes it and requires contiguous data, so keep the activated path there.
+    // For prompt prefill (n_seq_tokens >= 64), keep the activated path to enable Tensor Core MMA.
+    const bool raw_gates_shape_ok = !model.layers[il].ssm_beta_alpha_cat && n_seq_tokens < 64;
     if (!raw_gates_disable && raw_gates_shape_ok && gdn_raw_gates_dev_ok &&
         model.layers[il].ssm_dt && model.layers[il].ssm_dt->type == GGML_TYPE_F32 &&
         model.layers[il].ssm_a  && model.layers[il].ssm_a->type  == GGML_TYPE_F32) {
@@ -1301,7 +1302,7 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     if (ubatch.token) {
         ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
 
-        tok_embd = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
+        tok_embd = build_get_rows(tok_embd_w, inp->tokens);
         tok_embd = build_hadamard_inverse_embd(tok_embd_w, tok_embd);
     } else {
         tok_embd = inp->embd;

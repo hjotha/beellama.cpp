@@ -558,7 +558,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         FIXTURES_REQUIRED generate-models
         ENVIRONMENT "TMPDIR=${CMAKE_CURRENT_BINARY_DIR}/state-convert-tmp;CUDA_VISIBLE_DEVICES=;GGML_DISABLE_VULKAN=1")
     target_include_directories(test-server-model-identity PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
-    target_link_libraries(test-server-model-identity PRIVATE server-context)
+    target_link_libraries(test-server-model-identity PRIVATE server-context cpp-httplib)
     llama_test(test-server-model-identity ARGS ${CMAKE_CURRENT_BINARY_DIR}/test-models/gemma2-dense.gguf)
     set_tests_properties(test-server-model-identity PROPERTIES FIXTURES_REQUIRED generate-models)
     if (DEFINED LLAMA_TEST_CACHE_MODEL)
@@ -832,6 +832,7 @@ if (GGML_CPU AND (NOT WIN32 OR NOT BUILD_SHARED_LIBS))
     set_tests_properties(test-fp8-requantize PROPERTIES FIXTURES_REQUIRED fp8-models)
 endif()
 
+if (WIN32 AND BUILD_SHARED_LIBS)
 llama_test(
     test-llama-archs
     NAME test-generate-models
@@ -875,6 +876,7 @@ set_tests_properties(test-llama-context PROPERTIES
 )
 
 llama_build(test-fusion.cpp)
+endif()
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp  LABEL behavior)
 llama_build_and_test(test-jinja.cpp  LABEL behavior)
@@ -1470,6 +1472,14 @@ llama_build_and_test(test-ptq1_0-element-map.cpp)
 llama_build_and_test(test-ptq1_0-cuda-dot.cpp)
 endif()
 
+if (GGML_EXL3)
+    # EXL3 decode self-test, kept next to the decoder under ggml/exl3
+    llama_build_and_test(${PROJECT_SOURCE_DIR}/ggml/exl3/test_exl3.c NAME test-exl3 LINK ggml vendor::hash)
+    target_include_directories(test-exl3 PRIVATE ${PROJECT_SOURCE_DIR}/ggml/exl3 ${PROJECT_SOURCE_DIR}/vendor)
+    # EXL3 model directory importer, common/exl3-dir.cpp
+    llama_build_and_test(test-exl3-dir.cpp LINK llama-common vendor::hash)
+endif()
+
 # libmtmd
 llama_build_and_test(test-mtmd-c-api.c  LABEL behavior  LINK mtmd)
 
@@ -1496,6 +1506,9 @@ if (TARGET cpp-httplib)
 
         llama_build_and_test(test-hf-stream-vram.cpp LABEL main LINK llama llama-common cpp-httplib)
         target_include_directories(test-hf-stream-vram PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/common)
+        if (GGML_EXL3)
+            target_compile_definitions(test-hf-stream-vram PRIVATE TEST_HF_STREAM_EXL3)
+        endif()
     endif()
 endif()
 

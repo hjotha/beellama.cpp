@@ -9,10 +9,10 @@ extern "C" {
 // TOP_K_MASK shifts the fork's custom operation IDs; reject older peers.
 #define RPC_PROTO_MAJOR_VERSION    10
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    4
+#define RPC_PROTO_PATCH_VERSION    7
 
 #ifdef  __cplusplus
-static_assert(GGML_OP_COUNT == 110, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
+static_assert(GGML_OP_COUNT == 113, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
 #endif
 
 #define GGML_RPC_MAX_SERVERS       16

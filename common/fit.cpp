@@ -3,6 +3,9 @@
 
 #include "common.h"
 #include "download.h"
+#ifdef LLAMA_USE_EXL3
+#include "exl3-dir.h"
+#endif
 #include "json.h"
 #include "llama-cpp.h"
 #include "log.h"
@@ -55,6 +58,36 @@ private:
     ggml_log_level min_level;
 };
 
+static llama_model * common_fit_load_model(const char * path, llama_model_params params) {
+    const auto splits = path ? common_download_get_stream_splits(path) : std::vector<std::string>{};
+    const auto stream_ud = path ? common_download_get_stream_session_ud(path) : nullptr;
+    std::vector<common_download_stream_file_info> infos;
+    std::vector<size_t> sizes;
+    llama_model_stream_source_desc source{};
+    if (stream_ud && common_download_get_stream_file_infos(path, infos) && infos.front().rel_path.empty()) {
+        for (const auto & info : infos) {
+            sizes.push_back(info.total_size);
+        }
+        source.n_files = static_cast<uint16_t>(sizes.size());
+        source.file_sizes = sizes.data();
+        params.stream_source = &source;
+        params.stream_loader = common_download_stream_loader;
+        params.stream_loader_user_data = stream_ud;
+    }
+    if (splits.size() > 1) {
+        std::vector<const char *> c_splits;
+        for (const auto & split : splits) {
+            c_splits.push_back(split.c_str());
+        }
+        return llama_model_load_from_splits(c_splits.data(), c_splits.size(), params);
+    }
+#ifdef LLAMA_USE_EXL3
+    return common_exl3_load_model(path, params);
+#else
+    return llama_model_load_from_file(path, params);
+#endif
+}
+
 static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         const char * path_model,
         const llama_model_params * mparams,
@@ -70,18 +103,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     mparams_copy.no_alloc  = true;
     mparams_copy.load_mode = LLAMA_LOAD_MODE_NONE;
 
-    const auto stream_splits = path_model ? common_download_get_stream_splits(path_model) : std::vector<std::string>{};
-    llama_model * model = nullptr;
-    if (stream_splits.size() > 1) {
-        std::vector<const char *> c_splits;
-        c_splits.reserve(stream_splits.size());
-        for (const auto & s : stream_splits) {
-            c_splits.push_back(s.c_str());
-        }
-        model = llama_model_load_from_splits(c_splits.data(), c_splits.size(), mparams_copy);
-    } else {
-        model = llama_model_load_from_file(path_model, mparams_copy);
-    }
+    llama_model * model = common_fit_load_model(path_model, mparams_copy);
     if (model == nullptr) {
         throw std::runtime_error("failed to load model");
     }
@@ -187,7 +209,7 @@ std::vector<common_memory_breakdown_row> common_fit_measure(
     mparams_copy.no_alloc  = true;
     mparams_copy.load_mode = LLAMA_LOAD_MODE_NONE;
 
-    llama_model_ptr model(llama_model_load_from_file(path_model, mparams_copy));
+    llama_model_ptr model(common_fit_load_model(path_model, mparams_copy));
     if (!model) {
         throw std::runtime_error("failed to load model");
     }

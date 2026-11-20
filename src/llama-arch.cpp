@@ -524,6 +524,11 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_PRISM_HADAMARD_INVERSE_WEIGHT_NAMES, "prism.hadamard.inverse_weight_names" },
     { LLM_KV_PRISM_HADAMARD_GDN_V_GROUPED,        "prism.hadamard.gdn_v_grouped"        },
 
+    { LLM_KV_EXL3_VERSION,                        "exl3.version"                        },
+    { LLM_KV_EXL3_CODEBOOK,                       "exl3.codebook"                       },
+    { LLM_KV_EXL3_HADAMARD_SIZE,                  "exl3.hadamard_size"                  },
+    { LLM_KV_EXL3_ROWS_VERSION,                   "exl3.rows.version"                   },
+
     // deprecated
     { LLM_KV_TOKENIZER_PREFIX_ID,                    "tokenizer.ggml.prefix_token_id"            },
     { LLM_KV_TOKENIZER_SUFFIX_ID,                    "tokenizer.ggml.suffix_token_id"            },
@@ -724,6 +729,8 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_NEXTN_HC_HEAD_NORM,                     "blk.%d.nextn.hc_head_norm" },
     { LLM_TENSOR_NEXTN_HC_HEAD_DOWN,                     "blk.%d.nextn.hc_head_down" },
     { LLM_TENSOR_NEXTN_HC_HEAD_UP,                       "blk.%d.nextn.hc_head_up" },
+    { LLM_TENSOR_NEXTN_E_PROJ,                           "blk.%d.nextn.e_proj" },
+    { LLM_TENSOR_NEXTN_H_PROJ,                           "blk.%d.nextn.h_proj" },
     { LLM_TENSOR_ATTN_SUB_NORM,                          "blk.%d.attn_sub_norm" },
     { LLM_TENSOR_FFN_SUB_NORM,                           "blk.%d.ffn_sub_norm" },
     { LLM_TENSOR_DEC_OUTPUT_NORM,                        "dec.output_norm" },
@@ -1193,6 +1200,8 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     // last nextn_predict_layers blocks carry them. Classify as LAYER_REPEATING so
     // the model loader doesn't fault on the block index.
     { LLM_TENSOR_NEXTN_EH_PROJ,            { LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT }    },
+    { LLM_TENSOR_NEXTN_E_PROJ,             { LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT }    },
+    { LLM_TENSOR_NEXTN_H_PROJ,             { LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT }    },
     { LLM_TENSOR_NEXTN_EMBED_TOKENS,       { LLM_TENSOR_LAYER_REPEATING, GGML_OP_GET_ROWS }   },
     { LLM_TENSOR_NEXTN_ENORM,              { LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL }        },
     { LLM_TENSOR_NEXTN_HNORM,              { LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL }        },

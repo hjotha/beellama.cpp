@@ -85,6 +85,9 @@
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
 #include "ggml-cuda/top-k-mask.cuh"
+#ifdef GGML_USE_EXL3
+#include "ggml-cuda/exl3.cuh"
+#endif
 #include "ggml.h"
 
 #include <algorithm>
@@ -3455,6 +3458,17 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_TOP_K_MASK:
             ggml_cuda_op_top_k_mask(ctx, dst);
             break;
+#ifdef GGML_USE_EXL3
+        case GGML_OP_EXL3_MUL_MAT:
+            ggml_cuda_op_exl3_mul_mat(ctx, dst);
+            break;
+        case GGML_OP_EXL3_MUL_MAT_ID:
+            ggml_cuda_op_exl3_mul_mat_id(ctx, dst);
+            break;
+        case GGML_OP_EXL3_GET_ROWS:
+            ggml_cuda_op_exl3_get_rows(ctx, dst);
+            break;
+#endif
         default:
             return false;
     }
@@ -3687,6 +3701,15 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph, uint64_t * t
                 }
             }
         }
+#ifdef GGML_USE_EXL3
+        if (node->op == GGML_OP_EXL3_MUL_MAT_ID && ggml_cuda_exl3_mul_mat_id_needs_sync(node)) {
+            use_cuda_graph = false;
+            if (trace_reason) *trace_reason = GGML_CUDA_TRACE_MUL_MAT_ID;
+            if (ggml_cuda_graph_debug_enabled()) {
+                GGML_LOG_DEBUG("%s: disabling CUDA graphs due to EXL3_MUL_MAT_ID host sync\n", __func__);
+            }
+        }
+#endif
 
         // The fused position-split span runs a host-driven executor (pinned
         // staging copies + a Vulkan graph submission), so it synchronizes the
@@ -8404,6 +8427,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return ggml_cuda_kvarn_split_fused_supported(op);
         case GGML_OP_TOP_K_MASK:
             return op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32;
+        case GGML_OP_EXL3_MUL_MAT:
+        case GGML_OP_EXL3_MUL_MAT_ID:
+        case GGML_OP_EXL3_GET_ROWS:
+#ifdef GGML_USE_EXL3
+            return ggml_cuda_exl3_supports_op(op);
+#else
+            return false;
+#endif
 
         default:
             return false;
@@ -8419,10 +8450,13 @@ static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_
 static int64_t get_op_batch_size(const ggml_tensor * op) {
     switch (op->op) {
         case GGML_OP_GET_ROWS:
+        case GGML_OP_EXL3_GET_ROWS:
             return 0;
         case GGML_OP_MUL_MAT:
+        case GGML_OP_EXL3_MUL_MAT:
             return op->ne[1];
         case GGML_OP_MUL_MAT_ID:
+        case GGML_OP_EXL3_MUL_MAT_ID:
         case GGML_OP_ROPE:
         case GGML_OP_ROPE_BACK:
             return op->ne[2];

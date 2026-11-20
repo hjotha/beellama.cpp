@@ -1182,9 +1182,10 @@ common_download_hf_plan common_download_get_hf_plan(const common_params_model & 
     hf_cache::hf_files all;
 
     auto [repo, tag] = common_download_split_repo_tag(model.hf_repo);
+    const std::string branch = model.hf_branch.empty() ? tag : model.hf_branch;
 
     if (!opts.offline) {
-        all = hf_cache::get_repo_files(repo, opts.bearer_token);
+        all = hf_cache::get_repo_files(repo, opts.bearer_token, branch);
     }
     if (all.empty()) {
         all = hf_cache::get_cached_files(repo);
@@ -1217,6 +1218,34 @@ common_download_hf_plan common_download_get_hf_plan(const common_params_model & 
         }
     } else {
         primary = find_best_model(all, tag);
+#ifdef LLAMA_USE_EXL3
+        if (opts.discover_exl3 && primary.path.empty()) {
+            bool has_config = false;
+            bool has_tokenizer = false;
+            for (const auto & f : all) {
+                has_config |= f.path == "config.json";
+                has_tokenizer |= f.path == "tokenizer.json";
+                if (f.path == "config.json" || f.path == "quantization_config.json" ||
+                    f.path == "tokenizer.json" || f.path == "tokenizer_config.json" ||
+                    f.path == "model.safetensors.index.json" || f.path == "generation_config.json" ||
+                    f.path == "chat_template.jinja" || f.path == "chat_template.json" ||
+                    f.path == "modules.json") {
+                    plan.exl3_meta_files.push_back(f);
+                } else if (f.path.find_first_of("/\\") == std::string::npos &&
+                           std::filesystem::path(f.path).extension() == ".safetensors" &&
+                           f.path.find("cal_trace") == std::string::npos &&
+                           f.path.find("vision_") == std::string::npos) {
+                    plan.exl3_tensor_files.push_back(f);
+                }
+            }
+            if (has_config && has_tokenizer && !plan.exl3_tensor_files.empty()) {
+                plan.is_exl3 = true;
+                std::sort(plan.exl3_tensor_files.begin(), plan.exl3_tensor_files.end(),
+                          [](const auto & a, const auto & b) { return a.path < b.path; });
+                return plan;
+            }
+        }
+#endif
         // a requested draft can resolve on its own, without a full model of the same tag
         const bool want_draft = std::any_of(sidecars.begin(), sidecars.end(), [&](const common_download_sidecar & s) {
             return s.draft && opts.*s.opt;
@@ -1630,6 +1659,7 @@ struct stream_file_state {
     bool                        owns_temp = false; // only true while we hold the lock
     int                         fd = -1;
     size_t                      header_end = 0;
+    std::string                 rel_path;
 };
 
 struct stream_session {
@@ -1941,16 +1971,22 @@ void common_download_wait_background() {
     }
 }
 
-bool common_download_prepare_stream(
+static bool prepare_stream(
         const std::vector<common_download_task> & tasks,
         const common_download_stream_opts & opts,
-        std::vector<std::string> & out_paths) {
+        std::vector<std::string> & out_paths,
+        const std::string & dir_path,
+        const std::vector<std::string> & rel_paths) {
     common_download_wait_background();
     out_paths.clear();
     if (tasks.empty() || tasks.size() > UINT16_MAX) {
         return false;
     }
 
+    const bool exl3 = !dir_path.empty();
+    if (exl3 && rel_paths.size() != tasks.size()) {
+        return false;
+    }
     auto sess = std::make_shared<stream_session>();
     sess->opts = opts;
     sess->opts.n_threads   = std::clamp(sess->opts.n_threads, 1, 32);
@@ -1983,6 +2019,9 @@ bool common_download_prepare_stream(
         sess->files.push_back(std::make_unique<stream_file_state>());
         auto & fs = *sess->files.back();
         fs.task       = task;
+        if (exl3) {
+            fs.rel_path = rel_paths[sess->files.size() - 1];
+        }
         fs.temp_path  = task.local_path + STREAM_TMP_SUFFIX;
         fs.final_path = opts.disk_mode == COMMON_HF_STREAM_DISK_NONE ? std::string()
                       : (task.alt_path.empty() ? task.local_path : task.alt_path);
@@ -2008,12 +2047,18 @@ bool common_download_prepare_stream(
             std::filesystem::remove(std::filesystem::u8path(fs.temp_path), ec);
         }
 
+        out_paths.push_back(fs.temp_path);
+    }
+
+    auto probe = [&](size_t index) {
+        auto & fs = *sess->files[index];
+        const auto & task = fs.task;
         if (!common_resolve_remote_file(task.url, task.opts, fs.resolved) ||
             !fs.resolved.supports_ranges ||
-            fs.resolved.total_size < size_t(1024) * 1024) {
+            fs.resolved.total_size < (exl3 ? 10 : size_t(1024) * 1024)) {
             LOG_WRN("%s: '%s' is not range-streamable (status=%d, ranges=%d, size=%zu)\n", __func__,
                     task.local_path.c_str(), fs.resolved.status, (int) fs.resolved.supports_ranges, fs.resolved.total_size);
-            return abort_prepare();
+            return false;
         }
 
         {
@@ -2022,14 +2067,35 @@ bool common_download_prepare_stream(
         }
 
         fs.fd = open_rw_fd(fs.temp_path);
-        if (fs.fd < 0 || !ftruncate_fd(fs.fd, fs.resolved.total_size)) {
+        if (fs.fd < 0 || (opts.disk_mode != COMMON_HF_STREAM_DISK_NONE && !ftruncate_fd(fs.fd, fs.resolved.total_size))) {
             LOG_ERR("%s: unable to create '%s' (errno=%d)\n", __func__, fs.temp_path.c_str(), errno);
-            return abort_prepare();
+            return false;
         }
 
         // Fetch the GGUF header incrementally (geometric growth) until it parses from the prefix alone.
         stream_conn conn;
-        const int file_idx = static_cast<int>(sess->files.size() - 1);
+        const int file_idx = static_cast<int>(index);
+        if (exl3) {
+            uint8_t len[8];
+            if (!stream_fetch(conn, fs, file_idx, 0, sizeof(len), len, nullptr)) {
+                return false;
+            }
+            uint64_t n = 0;
+            for (int i = 7; i >= 0; --i) {
+                n = (n << 8) | len[i];
+            }
+            if (n < 2 || n > fs.resolved.total_size - sizeof(len) || n > (uint64_t{256} << 20)) {
+                return false;
+            }
+            std::vector<uint8_t> header(n);
+            if (!stream_fetch(conn, fs, file_idx, sizeof(len), header.size(), header.data(), nullptr) ||
+                !pwrite_all_fd(fs.fd, len, sizeof(len), 0) ||
+                !pwrite_all_fd(fs.fd, header.data(), header.size(), sizeof(len))) {
+                return false;
+            }
+            fs.header_end = sizeof(len) + header.size();
+            return true;
+        }
         const size_t max_header_probe = std::min<size_t>(fs.resolved.total_size, size_t(128) * 1024 * 1024);
         std::vector<uint8_t> prefix;
         size_t fetched     = 0;
@@ -2045,7 +2111,7 @@ bool common_download_prepare_stream(
                 !pwrite_all_fd(fs.fd, prefix.data() + fetched, req_len, fetched)) {
                 LOG_ERR("%s: failed to fetch GGUF header bytes [%zu, %zu) of '%s'\n",
                         __func__, fetched, req_end, task.local_path.c_str());
-                return abort_prepare();
+                return false;
             }
             fetched = req_end;
             if (probe_gguf_data_offset(prefix, data_offset)) {
@@ -2055,25 +2121,85 @@ bool common_download_prepare_stream(
             step = std::min<size_t>(step * 2, size_t(32) * 1024 * 1024);
         }
 
-        if (!parsed_header || data_offset > fs.resolved.total_size) {
+        if (!parsed_header || data_offset > fetched) {
             LOG_WRN("%s: unable to parse GGUF header of '%s' within %zu bytes\n",
                     __func__, task.local_path.c_str(), fetched);
-            return abort_prepare();
+            return false;
         }
         fs.header_end = fetched;
-        out_paths.push_back(fs.temp_path);
+        return true;
+    };
+    try {
+        const size_t parallel = exl3 ? sess->opts.n_threads : 1;
+        for (size_t i = 0; i < tasks.size(); i += parallel) {
+            if (parallel == 1) {
+                if (!probe(i)) {
+                    return abort_prepare();
+                }
+                continue;
+            }
+            std::vector<std::future<bool>> pending;
+            for (size_t j = i; j < std::min(tasks.size(), i + parallel); ++j) {
+                pending.push_back(std::async(std::launch::async, probe, j));
+            }
+            bool ok = true;
+            for (auto & f : pending) {
+                ok = f.get() && ok;
+            }
+            if (!ok) {
+                return abort_prepare();
+            }
+        }
+    } catch (const std::exception & e) {
+        LOG_ERR("%s: %s\n", __func__, e.what());
+        return abort_prepare();
     }
 
     {
         std::lock_guard<std::mutex> lock(g_stream_mtx);
-        g_stream_sessions[out_paths.front()] = sess;
+        g_stream_sessions[exl3 ? dir_path : out_paths.front()] = sess;
         for (const auto & fs : sess->files) {
             g_stream_final_paths[fs->temp_path] = fs->final_path;
         }
     }
-    LOG_INF("%s: prepared %zu GGUF file(s) for direct HF->VRAM streaming (%d threads, %zu MiB chunks)\n",
+    LOG_INF("%s: prepared %zu model file(s) for direct HF->VRAM streaming (%d threads, %zu MiB chunks)\n",
             __func__, sess->files.size(), sess->opts.n_threads, sess->opts.chunk_bytes / (1024 * 1024));
     return true;
+}
+
+bool common_download_prepare_stream(
+        const std::vector<common_download_task> & tasks,
+        const common_download_stream_opts & opts,
+        std::vector<std::string> & out_paths) {
+    return prepare_stream(tasks, opts, out_paths, {}, {});
+}
+
+bool common_download_prepare_stream_exl3(
+        const std::string & dir_path,
+        const std::vector<common_download_task> & tasks,
+        const std::vector<std::string> & rel_paths,
+        const common_download_stream_opts & opts) {
+    std::vector<std::string> paths;
+    return !dir_path.empty() && prepare_stream(tasks, opts, paths, dir_path, rel_paths);
+}
+
+bool common_download_stream_read_range(
+        const std::string & session_key, size_t file_idx, size_t offset, size_t size, void * dst) {
+    std::shared_ptr<stream_session> sess;
+    {
+        std::lock_guard<std::mutex> lock(g_stream_mtx);
+        const auto it = g_stream_sessions.find(session_key);
+        if (it == g_stream_sessions.end() || it->second->consumed || file_idx >= it->second->files.size()) {
+            return false;
+        }
+        sess = it->second;
+    }
+    auto & fs = *sess->files[file_idx];
+    if (offset > fs.resolved.total_size || size > fs.resolved.total_size - offset) {
+        return false;
+    }
+    stream_conn conn;
+    return size == 0 || stream_fetch(conn, fs, file_idx, offset, size, static_cast<uint8_t *>(dst), nullptr);
 }
 
 void * common_download_get_stream_session_ud(const std::string & first_path) {
@@ -2104,7 +2230,8 @@ void common_download_stream_abort(const std::string & first_path) {
 std::vector<std::string> common_download_get_stream_splits(const std::string & first_path) {
     std::lock_guard<std::mutex> lock(g_stream_mtx);
     auto it = g_stream_sessions.find(first_path);
-    if (it == g_stream_sessions.end() || it->second->consumed || it->second->files.size() <= 1) {
+    if (it == g_stream_sessions.end() || it->second->consumed || it->second->files.size() <= 1 ||
+        !it->second->files.front()->rel_path.empty()) {
         return {};
     }
     std::vector<std::string> out;
@@ -2130,6 +2257,7 @@ bool common_download_get_stream_file_infos(
         info.temp_path  = fs->temp_path;
         info.local_path = fs->task.local_path;
         info.final_path = fs->final_path;
+        info.rel_path   = fs->rel_path;
         info.etag       = fs->resolved.etag;
         info.url        = fs->task.url;
         info.total_size = fs->resolved.total_size;

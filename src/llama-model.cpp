@@ -1506,6 +1506,7 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     }
 
     load_hparams_hadamard(ml);
+    load_hparams_exl3(ml);
 
     // get general kv
     ml.get_key(LLM_KV_GENERAL_NAME, name, false);
@@ -1866,7 +1867,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     // resolve AUTO on systems without mmap support (e.g. iGPUs): fall back to OFF; see #28160
-    if (ml.lazy.mode == LLAMA_LAZY_MODE_AUTO) {
+    if (ml.lazy.mode == LLAMA_LAZY_MODE_AUTO && params.stream_loader == nullptr) {
         for (const auto & dev : devices) {
             ggml_backend_dev_props props;
             ggml_backend_dev_get_props(dev.dev, &props);
@@ -2242,7 +2243,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         llama_mlocks mtp_locks;
 
         // a lazy context is mapped whatever the load mode, but the memory-fit pass maps nothing
-        const bool is_lazy_mapped = ctx_key.lazy && !ml.no_alloc;
+        const bool is_lazy_mapped = ctx_key.lazy && !ml.no_alloc && params.stream_loader == nullptr;
 
         if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
             GGML_ASSERT(!ml.no_alloc);
@@ -2337,13 +2338,6 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // Source companions stay F16 on disk. Cache their exact F32 promotion once,
     // not through hundreds of CPY kernels on every decode step. Group buffers
     // by placement and share equal vectors; all-one diagonals are exact no-ops.
-    struct sinq_cache_group {
-        ggml_context_ptr ctx;
-        std::map<std::pair<std::string,std::vector<ggml_fp16_t>>,ggml_tensor *> tensors;
-        std::vector<std::pair<ggml_tensor *,std::vector<float>>> values;
-    };
-    std::map<ggml_backend_buffer_type_t,sinq_cache_group> sinq_cache;
-    size_t sinq_identity_count = 0;
     auto sinq_placement = [&](ggml_backend_buffer_type_t buft) -> std::string {
         auto * device = ggml_backend_buft_get_device(buft);
         if (!device) {
@@ -2354,76 +2348,102 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         if (!device) { throw std::runtime_error("QK SINQ cannot resolve a tensor buffer placement"); }
         return ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU ? "CPU" : ggml_backend_dev_name(device);
     };
-    for (auto it = sinq_scales.begin(); it != sinq_scales.end();) {
-        ggml_tensor * scale = it->second;
-        if (sinq_placement(tensor_bufts.at(it->first)) != sinq_placement(tensor_bufts.at(scale))) {
-            throw std::runtime_error(format("QK SINQ scale placement must match base weight '%s'; use matching tensor placement overrides",it->first->name));
+    for (const auto & [base, scale] : sinq_scales) {
+        if (sinq_placement(tensor_bufts.at(base)) != sinq_placement(tensor_bufts.at(scale))) {
+            throw std::runtime_error(format("QK SINQ scale placement must match base weight '%s'; use matching tensor placement overrides", base->name));
         }
-        const auto & serialized = ml.weights_map.at(scale->name);
-        std::vector<ggml_fp16_t> values(ggml_nelements(scale));
-        // File-backed association/shard bounds were validated above. This read
-        // also works for no-allocation fit probes before backend data loading.
-        const auto & file = ml.files.at(serialized.idx);
-        file->seek(serialized.offs,SEEK_SET);
-        file->read_raw(values.data(),values.size()*sizeof(ggml_fp16_t));
-        std::vector<float> promoted(values.size());
-        bool identity = true;
-        for (size_t j = 0; j < values.size(); ++j) {
-            const float value = ggml_fp16_to_fp32(values[j]);
-            if (!std::isfinite(value) || value <= 0.f) {
-                throw std::runtime_error(format("SINQ companion '%s' has non-finite or non-positive scale at index %zu",scale->name,j));
-            }
-            promoted[j] = value;
-            identity = identity && value == 1.f;
-        }
-        if (identity) {
-            ++sinq_identity_count;
-            it = sinq_scales.erase(it);
-            continue;
-        }
-        const auto buft = tensor_bufts.at(scale);
-        auto & group = sinq_cache[buft];
-        if (!group.ctx) {
-            group.ctx.reset(ggml_init({ggml_tensor_overhead()*(n_sinq_weights+1),nullptr,true}));
-            if (!group.ctx) { throw std::runtime_error("cannot allocate QK SINQ runtime scale context"); }
-        }
-        // Equal diagonals can have different channel ownership in tensor mode.
-        // Keep a per-base cache there; other placements still share equal values.
-        const std::string owner = split_mode == LLAMA_SPLIT_MODE_TENSOR ? it->first->name : "";
-        auto key = std::make_pair(owner,std::move(values));
-        auto found = group.tensors.find(key);
-        if (found == group.tensors.end()) {
-            auto * cached = ggml_new_tensor_1d(group.ctx.get(),GGML_TYPE_F32,scale->ne[0]);
-            ggml_format_name(cached,"%s.runtime_f32",scale->name);
-            group.values.emplace_back(cached,std::move(promoted));
-            found = group.tensors.emplace(std::move(key),cached).first;
-        }
-        it->second = found->second;
-        ++it;
     }
-    for (auto & entry : sinq_cache) {
-        auto & group = entry.second;
-        ggml_backend_buffer_ptr buffer;
-        if (ml.no_alloc) {
-            buffer.reset(ggml_backend_buft_alloc_buffer(entry.first,0));
-            for (auto & value : group.values) { value.first->buffer = buffer.get(); }
-        } else {
-            buffer.reset(ggml_backend_alloc_ctx_tensors_from_buft(group.ctx.get(),entry.first));
+
+    auto promote_sinq_scales = [&](bool from_files) {
+        if (sinq_scales.empty()) {
+            return;
         }
-        if (!buffer) { throw std::runtime_error("cannot allocate QK SINQ runtime scale buffer"); }
-        ggml_backend_buffer_set_usage(buffer.get(),GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-        if (!ml.no_alloc) {
-            for (const auto & value : group.values) {
-                ggml_backend_tensor_set(value.first,value.second.data(),0,value.second.size()*sizeof(float));
+        struct sinq_cache_group {
+            ggml_context_ptr ctx;
+            std::map<std::pair<std::string,std::vector<ggml_fp16_t>>,ggml_tensor *> tensors;
+            std::vector<std::pair<ggml_tensor *,std::vector<float>>> values;
+        };
+        std::map<ggml_backend_buffer_type_t,sinq_cache_group> sinq_cache;
+        size_t sinq_identity_count = 0;
+        for (auto it = sinq_scales.begin(); it != sinq_scales.end();) {
+            ggml_tensor * scale = it->second;
+            std::vector<ggml_fp16_t> values(ggml_nelements(scale));
+            if (from_files) {
+                const auto & serialized = ml.weights_map.at(scale->name);
+                // File-backed association/shard bounds were validated above. This read
+                // also works for no-allocation fit probes before backend data loading.
+                const auto & file = ml.files.at(serialized.idx);
+                file->seek(serialized.offs,SEEK_SET);
+                file->read_raw(values.data(),values.size()*sizeof(ggml_fp16_t));
+            } else {
+                ggml_backend_tensor_get(scale, values.data(), 0, values.size()*sizeof(ggml_fp16_t));
             }
+            std::vector<float> promoted(values.size());
+            bool identity = true;
+            for (size_t j = 0; j < values.size(); ++j) {
+                const float value = ggml_fp16_to_fp32(values[j]);
+                if (!std::isfinite(value) || value <= 0.f) {
+                    throw std::runtime_error(format("SINQ companion '%s' has non-finite or non-positive scale at index %zu",scale->name,j));
+                }
+                promoted[j] = value;
+                identity = identity && value == 1.f;
+            }
+            if (identity) {
+                ++sinq_identity_count;
+                it = sinq_scales.erase(it);
+                continue;
+            }
+            const auto buft = tensor_bufts.at(scale);
+            auto & group = sinq_cache[buft];
+            if (!group.ctx) {
+                group.ctx.reset(ggml_init({ggml_tensor_overhead()*(n_sinq_weights+1),nullptr,true}));
+                if (!group.ctx) { throw std::runtime_error("cannot allocate QK SINQ runtime scale context"); }
+            }
+            // Equal diagonals can have different channel ownership in tensor mode.
+            // Keep a per-base cache there; other placements still share equal values.
+            const std::string owner = split_mode == LLAMA_SPLIT_MODE_TENSOR ? it->first->name : "";
+            auto key = std::make_pair(owner,std::move(values));
+            auto found = group.tensors.find(key);
+            if (found == group.tensors.end()) {
+                auto * cached = ggml_new_tensor_1d(group.ctx.get(),GGML_TYPE_F32,scale->ne[0]);
+                ggml_format_name(cached,"%s.runtime_f32",scale->name);
+                group.values.emplace_back(cached,std::move(promoted));
+                found = group.tensors.emplace(std::move(key),cached).first;
+            }
+            it->second = found->second;
+            ++it;
         }
-        std::vector<ggml_backend_buffer_ptr> buffers;
-        buffers.emplace_back(std::move(buffer));
-        pimpl->ctxs_bufs.emplace_back(std::move(group.ctx),std::move(buffers));
-    }
-    if (n_sinq_weights) {
-        LLAMA_LOG_INFO("%s: QK SINQ cached F32 vectors for %zu weights, elided %zu exact identity diagonals\n",
-            __func__,sinq_scales.size(),sinq_identity_count);
+        for (auto & entry : sinq_cache) {
+            auto & group = entry.second;
+            ggml_backend_buffer_ptr buffer;
+            if (ml.no_alloc) {
+                buffer.reset(ggml_backend_buft_alloc_buffer(entry.first,0));
+                for (auto & value : group.values) { value.first->buffer = buffer.get(); }
+            } else {
+                buffer.reset(ggml_backend_alloc_ctx_tensors_from_buft(group.ctx.get(),entry.first));
+            }
+            if (!buffer) { throw std::runtime_error("cannot allocate QK SINQ runtime scale buffer"); }
+            ggml_backend_buffer_set_usage(buffer.get(),GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            if (!ml.no_alloc) {
+                for (const auto & value : group.values) {
+                    ggml_backend_tensor_set(value.first,value.second.data(),0,value.second.size()*sizeof(float));
+                }
+            }
+            std::vector<ggml_backend_buffer_ptr> buffers;
+            buffers.emplace_back(std::move(buffer));
+            pimpl->ctxs_bufs.emplace_back(std::move(group.ctx),std::move(buffers));
+        }
+        if (n_sinq_weights) {
+            LLAMA_LOG_INFO("%s: QK SINQ cached F32 vectors for %zu weights, elided %zu exact identity diagonals\n",
+                __func__,sinq_scales.size(),sinq_identity_count);
+        }
+    };
+
+    // In streaming mode, .hfstream.tmp files do not contain tensor payloads yet; defer
+    // F16->F32 SINQ promotion until load_all_data_streaming() populates the F16 scale tensors.
+    // For no_alloc fit probes under streaming, build_graph() consumes the F16 scale tensors directly.
+    if (params.stream_loader == nullptr) {
+        promote_sinq_scales(/*from_files=*/true);
     }
 
     // print memory requirements per buffer type
@@ -2433,6 +2453,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 __func__, ggml_backend_buffer_name(buf.get()), ggml_backend_buffer_get_size(buf.get()) / 1024.0 / 1024.0);
         }
     }
+
+    // register EXL3 linear/row tables before no_alloc early return so --fit graph probing can emit EXL3 ops
+    load_tensors_exl3();
 
     if (ml.no_alloc) {
         return true;
@@ -2448,11 +2471,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // load tensor data
     ++pimpl->model_load_count;
-    if (params.stream_loader != nullptr && !ml.no_alloc && !ml.files.empty()) {
+    if (params.stream_loader != nullptr && !ml.no_alloc && (!ml.files.empty() || params.stream_source != nullptr)) {
         if (!ml.load_all_data_streaming(ctx_bufs, params.stream_loader, params.stream_loader_user_data,
-                params.progress_callback, params.progress_callback_user_data, params.stream_chunk_bytes)) {
+                params.stream_source, params.progress_callback, params.progress_callback_user_data, params.stream_chunk_bytes)) {
             return false;
         }
+        promote_sinq_scales(/*from_files=*/false);
     } else {
         for (auto & [ctx, bufs] : ctx_bufs) {
             if (!ml.load_all_data(ctx, bufs, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
@@ -2509,6 +2533,103 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     load_tensors_hadamard();
 
     return true;
+}
+
+// read and check the exl3.* metadata; create_tensor then takes "<name>.exl3_trellis/_suh/_svh" for "<name>.weight"
+void llama_model_base::load_hparams_exl3(llama_model_loader & ml) {
+    uint32_t version = 0;
+    if (!ml.get_key(LLM_KV_EXL3_VERSION, version, false)) {
+        return;
+    }
+    if (version != 1) {
+        throw std::runtime_error(format("unsupported exl3.version: %u", version));
+    }
+
+    std::string codebook;
+    uint32_t    hadamard_size = 0;
+    ml.get_key(LLM_KV_EXL3_CODEBOOK, codebook);
+    ml.get_key(LLM_KV_EXL3_HADAMARD_SIZE, hadamard_size);
+    if (hadamard_size != 128) {
+        throw std::runtime_error(format("unsupported exl3.hadamard_size: %u", hadamard_size));
+    }
+    uint32_t rows_version = 0;
+    if (ml.get_key(LLM_KV_EXL3_ROWS_VERSION, rows_version, false) && rows_version != 1) {
+        throw std::runtime_error(format("unsupported exl3.rows.version: %u", rows_version));
+    }
+    static const char * codebooks[] = { "3inst", "mcg", "mul1" };
+    for (int i = 0; i < 3; i++) {
+        if (codebook == codebooks[i]) {
+            hparams.exl3_codebook = i;
+        }
+    }
+    if (hparams.exl3_codebook < 0) {
+        throw std::runtime_error(format("unknown exl3.codebook: %s", codebook.c_str()));
+    }
+
+    // a smallest linear (k = n = 128, K = 4): some device must support the op
+    {
+        ggml_init_params params = { ggml_tensor_overhead()*8, NULL, true };
+        ggml_context_ptr ctx_ptr { ggml_init(params) };
+        ggml_context * ctx = ctx_ptr.get();
+        ggml_tensor * op = ggml_exl3_mul_mat(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_I16, 64, 8, 8),
+                ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, 1), ggml_new_tensor_1d(ctx, GGML_TYPE_F16, 128),
+                ggml_new_tensor_1d(ctx, GGML_TYPE_F16, 128), hparams.exl3_codebook);
+        bool supported = false;
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            supported = supported || ggml_backend_dev_supports_op(ggml_backend_dev_get(i), op);
+        }
+        if (!supported) {
+            throw std::runtime_error("the model has EXL3 linears, but no backend of this build runs them (build with -DGGML_EXL3=ON)");
+        }
+    }
+
+    if (!hdmd.weight_blocks.empty() || !hdmd.inverse_blocks.empty()) {
+        throw std::runtime_error("EXL3 linears and prism.hadamard folded weights cannot be combined");
+    }
+}
+
+void llama_model_base::load_tensors_exl3() {
+    if (hparams.exl3_codebook < 0) {
+        return;
+    }
+
+    std::unordered_map<std::string, ggml_tensor *> by_name;
+    for (const auto & [name, t] : tensors_by_name) {
+        by_name.emplace(name, t);
+    }
+
+    const std::string suffix = ".exl3_trellis";
+    for (const auto & [name, t] : tensors_by_name) {
+        if (name.size() <= suffix.size() || name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0) {
+            continue;
+        }
+        const std::string base = name.substr(0, name.size() - suffix.size());
+        const auto su = by_name.find(base + ".exl3_suh");
+        const auto sv = by_name.find(base + ".exl3_svh");
+        if (su == by_name.end() || sv == by_name.end()) {
+            throw std::runtime_error(format("exl3: '%s' has no scales", name.c_str()));
+        }
+        exl3.linears.emplace(t, llama_exl3_linear { su->second, sv->second });
+    }
+
+    // row tables decode to the embedding width (only the token embedding is one)
+    // an n-gram row table (with a head bias, qwen4exp PLE) is decoded on the host, never by a graph op
+    const std::string suffix_rows = ".exl3r_trellis";
+    for (const auto & [name, t] : tensors_by_name) {
+        if (name.size() <= suffix_rows.size() || name.compare(name.size() - suffix_rows.size(), suffix_rows.size(), suffix_rows) != 0) {
+            continue;
+        }
+        if (by_name.count(name.substr(0, name.size() - suffix_rows.size()) + ".exl3r_bias")) {
+            continue;
+        }
+        const auto sg = by_name.find(name.substr(0, name.size() - suffix_rows.size()) + ".exl3r_signs");
+        if (sg == by_name.end() || t != tok_embd) {
+            throw std::runtime_error(format("exl3: '%s' has no signs or is not the token embedding", name.c_str()));
+        }
+        exl3.rows.emplace(t, llama_exl3_rows { sg->second, (int64_t) hparams.n_embd });
+    }
+
+    LLAMA_LOG_INFO("%s: %zu EXL3 linears, codebook %d, %zu row tables\n", __func__, exl3.linears.size(), hparams.exl3_codebook, exl3.rows.size());
 }
 
 // read and check the prism.hadamard metadata, and record the folded weights (load_tensors_hadamard makes the tensors)
@@ -4442,6 +4563,7 @@ llama_model_params llama_model_default_params() {
         /*.stream_loader               =*/ nullptr,
         /*.stream_loader_user_data     =*/ nullptr,
         /*.stream_chunk_bytes          =*/ 0,
+        /*.stream_source               =*/ nullptr,
     };
 
     return result;
@@ -5080,7 +5202,13 @@ llama_model_base::nextn_flags_t llama_model_base::nextn_flags(llama_model_loader
         if (ml.get_weight(tn(trunk_probe, "weight", 0).str().c_str()) == nullptr) {
             trunk = TENSOR_NOT_REQUIRED;
         }
-        if (ml.get_weight(tn(LLM_TENSOR_NEXTN_EH_PROJ, "weight", hparams.n_layer()).str().c_str()) == nullptr) {
+        // an EXL3 eh_proj is stored as its trellis (or split e_proj/h_proj trellises)
+        const std::string eh_proj = tn(LLM_TENSOR_NEXTN_EH_PROJ, "weight", hparams.n_layer()).str();
+        const std::string e_proj  = tn(LLM_TENSOR_NEXTN_E_PROJ,  "weight", hparams.n_layer()).str();
+        if (ml.get_weight(eh_proj.c_str()) == nullptr &&
+                ml.get_weight((eh_proj.substr(0, eh_proj.size() - strlen("weight")) + "exl3_trellis").c_str()) == nullptr &&
+                ml.get_weight(e_proj.c_str()) == nullptr &&
+                ml.get_weight((e_proj.substr(0, e_proj.size() - strlen("weight")) + "exl3_trellis").c_str()) == nullptr) {
             mtp = TENSOR_NOT_REQUIRED;
         }
     }

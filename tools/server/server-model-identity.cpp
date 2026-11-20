@@ -5,6 +5,7 @@
 #include "gguf.h"
 #include "hash/hash.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -12,6 +13,14 @@
 #include <map>
 #include <memory>
 #include <stdexcept>
+
+#ifdef _WIN32
+#define ST_FSEEK64 _fseeki64
+using st_off_t = __int64;
+#else
+#define ST_FSEEK64 fseeko
+using st_off_t = off_t;
+#endif
 
 #ifndef _WIN32
 #include <sys/stat.h>
@@ -172,6 +181,68 @@ static std::string compute_etag_header_identity(FILE * file, size_t data_offset,
     return hash_sha256_hex(buf.data(), buf.size());
 }
 
+static std::string compute_safetensors_head_tail_identity(FILE * file, uint64_t total_size) {
+    static_assert(sizeof(st_off_t) >= 8, "64-bit file offset required");
+    if (total_size < 8) {
+        throw std::runtime_error("truncated safetensors model identity source");
+    }
+    if (ST_FSEEK64(file, 0, SEEK_SET) != 0) {
+        throw std::runtime_error("cannot rewind safetensors model identity source");
+    }
+    uint8_t hdr_bytes[8];
+    if (std::fread(hdr_bytes, 1, sizeof(hdr_bytes), file) != sizeof(hdr_bytes)) {
+        throw std::runtime_error("cannot read safetensors header length for identity hash");
+    }
+    uint64_t header_len = 0;
+    for (int i = 0; i < 8; ++i) {
+        header_len |= uint64_t(hdr_bytes[i]) << (8 * i);
+    }
+    if (header_len > total_size - 8) {
+        throw std::runtime_error("corrupt safetensors header length for identity hash");
+    }
+    const uint64_t payload_off = 8 + header_len;
+    const size_t hdr_take = static_cast<size_t>(std::min<uint64_t>(header_len, uint64_t(128) * 1024 * 1024));
+    const size_t head_take = static_cast<size_t>(std::min<uint64_t>(total_size - payload_off, 65536ULL));
+    const size_t tail_take = static_cast<size_t>(std::min<uint64_t>(total_size, 65536ULL));
+
+    std::string buf;
+    buf.reserve(hdr_take + head_take + tail_take + 64);
+    append_string(buf, "st-head-tail-v1");
+    append_u64(buf, total_size);
+    append_u64(buf, header_len);
+    append_u64(buf, hdr_take);
+    {
+        const size_t pos = buf.size();
+        buf.resize(pos + hdr_take);
+        if (hdr_take > 0 && std::fread(&buf[pos], 1, hdr_take, file) != hdr_take) {
+            throw std::runtime_error("cannot read safetensors header for identity hash");
+        }
+    }
+    append_u64(buf, head_take);
+    if (head_take > 0) {
+        if (hdr_take < header_len && ST_FSEEK64(file, st_off_t(payload_off), SEEK_SET) != 0) {
+            throw std::runtime_error("cannot seek safetensors payload head for identity hash");
+        }
+        const size_t pos = buf.size();
+        buf.resize(pos + head_take);
+        if (std::fread(&buf[pos], 1, head_take, file) != head_take) {
+            throw std::runtime_error("cannot read safetensors payload head for identity hash");
+        }
+    }
+    append_u64(buf, tail_take);
+    if (tail_take > 0) {
+        if (ST_FSEEK64(file, st_off_t(total_size - tail_take), SEEK_SET) != 0) {
+            throw std::runtime_error("cannot seek safetensors tail for identity hash");
+        }
+        const size_t pos = buf.size();
+        buf.resize(pos + tail_take);
+        if (std::fread(&buf[pos], 1, tail_take, file) != tail_take) {
+            throw std::runtime_error("cannot read safetensors tail for identity hash");
+        }
+    }
+    return hash_sha256_hex(buf.data(), buf.size());
+}
+
 server_model_identity server_model_identity::prepare(const std::string & loader_path,
         const std::vector<llama_model_kv_override> & overrides) {
     server_model_identity result;
@@ -179,26 +250,63 @@ server_model_identity server_model_identity::prepare(const std::string & loader_
     std::string material = "llama-prompt-cache-model-v1";
     append_string(material, canonical_overrides(typed));
 
+    const auto exl3_metadata = [](const std::string & name) {
+        return name == "config.json" || name == "tokenizer.json" || name == "tokenizer_config.json" ||
+               name == "model.safetensors.index.json" || name == "quantization_config.json" ||
+               name == "chat_template.jinja" || name == "chat_template.json" || name == "generation_config.json";
+    };
+
     std::vector<common_download_stream_file_info> stream_infos;
     if (common_download_get_stream_file_infos(loader_path, stream_infos) && !stream_infos.empty()) {
         result.streamed = true;
+        const bool exl3 = !stream_infos.front().rel_path.empty();
+        if (exl3) {
+            append_string(material, "exl3-etag-identity-v1");
+            std::sort(stream_infos.begin(), stream_infos.end(), [](const auto & a, const auto & b) {
+                return a.rel_path < b.rel_path;
+            });
+            std::vector<std::filesystem::path> metadata;
+            for (const auto & entry : std::filesystem::directory_iterator(loader_path)) {
+                if (entry.is_regular_file() && exl3_metadata(entry.path().filename().string())) {
+                    metadata.push_back(entry.path());
+                }
+            }
+            std::sort(metadata.begin(), metadata.end());
+            append_u64(material, metadata.size());
+            for (const auto & path : metadata) {
+                std::unique_ptr<FILE, int (*)(FILE *)> file(ggml_fopen(path.string().c_str(), "rb"), &std::fclose);
+                if (!file) {
+                    throw std::runtime_error("cannot open streamed EXL3 metadata: " + path.string());
+                }
+                append_string(material, path.filename().string());
+                append_string(material, hash_sha256_hex(file.get()));
+            }
+        }
         append_u64(material, stream_infos.size());
-        for (size_t index = 0; index < stream_infos.size(); ++index) {
-            const auto & sinfo = stream_infos[index];
-            std::unique_ptr<FILE, int (*)(FILE *)> file(ggml_fopen(sinfo.temp_path.c_str(), "rb"), &std::fclose);
-            if (!file) {
-                throw std::runtime_error("cannot open streamed model identity source: " + sinfo.temp_path);
+        for (const auto & sinfo : stream_infos) {
+            if (exl3) {
+                if (sinfo.etag.empty()) {
+                    throw std::runtime_error("missing ETag for streamed EXL3 shard: " + sinfo.rel_path);
+                }
+                append_string(material, sinfo.rel_path);
+                append_u64(material, sinfo.total_size);
+                append_string(material, sinfo.etag);
+            } else {
+                std::unique_ptr<FILE, int (*)(FILE *)> file(ggml_fopen(sinfo.temp_path.c_str(), "rb"), &std::fclose);
+                if (!file) {
+                    throw std::runtime_error("cannot open streamed model identity source: " + sinfo.temp_path);
+                }
+                std::unique_ptr<gguf_context, decltype(&gguf_free)> meta(
+                    gguf_init_from_file_ptr(file.get(), {true, nullptr}), &gguf_free);
+                if (!meta) {
+                    throw std::runtime_error("cannot read streamed model identity GGUF: " + sinfo.temp_path);
+                }
+                const size_t data_offset = gguf_get_data_offset(meta.get());
+                const std::string tag = !sinfo.etag.empty() ? sinfo.etag : sinfo.url;
+                const std::string file_hash = compute_etag_header_identity(file.get(), data_offset, sinfo.total_size, tag);
+                append_u64(material, sinfo.total_size);
+                append_string(material, file_hash);
             }
-            std::unique_ptr<gguf_context, decltype(&gguf_free)> meta(
-                gguf_init_from_file_ptr(file.get(), {true, nullptr}), &gguf_free);
-            if (!meta) {
-                throw std::runtime_error("cannot read streamed model identity GGUF: " + sinfo.temp_path);
-            }
-            const size_t data_offset = gguf_get_data_offset(meta.get());
-            const std::string tag = !sinfo.etag.empty() ? sinfo.etag : sinfo.url;
-            const std::string file_hash = compute_etag_header_identity(file.get(), data_offset, sinfo.total_size, tag);
-            append_u64(material, sinfo.total_size);
-            append_string(material, file_hash);
             source src{};
             src.loader_path    = sinfo.temp_path;
             src.canonical_path = sinfo.final_path.empty() ? sinfo.local_path : sinfo.final_path;
@@ -206,6 +314,77 @@ server_model_identity server_model_identity::prepare(const std::string & loader_
             result.sources.push_back(std::move(src));
         }
         result.digest = hash_sha256_hex(material.data(), material.size());
+        return result;
+    }
+    const std::filesystem::path abs_dir = std::filesystem::absolute(loader_path);
+    std::error_code dir_ec;
+    if (std::filesystem::is_directory(abs_dir, dir_ec) && !dir_ec) {
+        std::vector<std::filesystem::path> dir_paths;
+        bool has_config = false;
+        bool has_safetensors = false;
+        std::error_code it_ec;
+        for (const auto & entry : std::filesystem::directory_iterator(abs_dir, it_ec)) {
+            if (it_ec) {
+                throw std::runtime_error("cannot enumerate model identity directory: " + abs_dir.string());
+            }
+            std::error_code reg_ec;
+            if (!entry.is_regular_file(reg_ec) || reg_ec) {
+                continue;
+            }
+            const std::string fn = entry.path().filename().string();
+            const bool is_json = exl3_metadata(fn);
+            const bool is_st = entry.path().extension() == ".safetensors" &&
+                               fn.rfind("cal_trace", 0) != 0 && fn.rfind("vision_", 0) != 0;
+            if (!is_json && !is_st) {
+                continue;
+            }
+            if (fn == "config.json") {
+                has_config = true;
+            }
+            if (is_st) {
+                has_safetensors = true;
+            }
+            dir_paths.push_back(entry.path());
+        }
+        if (it_ec || !has_config || !has_safetensors) {
+            throw std::runtime_error("cannot inspect model identity directory: " + abs_dir.string());
+        }
+        std::sort(dir_paths.begin(), dir_paths.end(), [](const std::filesystem::path & a, const std::filesystem::path & b) {
+            return a.filename().string() < b.filename().string();
+        });
+        append_string(material, "exl3-dir-identity-v1");
+        append_u64(material, dir_paths.size());
+        for (const auto & entry_path : dir_paths) {
+            const std::string p = entry_path.string();
+            const source before = capture(p);
+            std::unique_ptr<FILE, int (*)(FILE *)> file(ggml_fopen(p.c_str(), "rb"), &std::fclose);
+            if (!file) {
+                throw std::runtime_error("cannot open model identity source: " + p);
+            }
+#ifndef _WIN32
+            if (descriptor_stamp(file.get()) != before.file) {
+                throw std::runtime_error("model identity source changed while opening: " + p);
+            }
+#endif
+            const bool is_st = entry_path.extension() == ".safetensors";
+            const std::string file_hash = is_st
+                ? compute_safetensors_head_tail_identity(file.get(), before.file[2])
+                : hash_sha256_hex(file.get());
+#ifndef _WIN32
+            if (descriptor_stamp(file.get()) != before.file) {
+                throw std::runtime_error("model identity source changed while hashing: " + p);
+            }
+#endif
+            if (!equal(before, capture(p))) {
+                throw std::runtime_error("model identity source path changed while hashing: " + p);
+            }
+            append_string(material, entry_path.filename().string());
+            append_u64(material, before.file[2]);
+            append_string(material, file_hash);
+            result.sources.push_back(before);
+        }
+        result.digest = hash_sha256_hex(material.data(), material.size());
+        result.verify_sources();
         return result;
     }
     // Keep the loader-visible name. Canonicalizing first changes inferred shard siblings.

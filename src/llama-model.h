@@ -231,6 +231,9 @@ struct llama_layer_nextn {
     struct ggml_tensor * eh_proj               = nullptr;
     struct ggml_tensor * eh_proj_s             = nullptr;
     struct ggml_tensor * eh_proj_in_s          = nullptr;
+    // qwen4exp EXL3: eh_proj as its two parts, e_proj(e) + h_proj(h)
+    struct ggml_tensor * e_proj                = nullptr;
+    struct ggml_tensor * h_proj                = nullptr;
     struct ggml_tensor * embed_tokens          = nullptr;
     struct ggml_tensor * enorm                 = nullptr;
     struct ggml_tensor * hnorm                 = nullptr;
@@ -734,6 +737,23 @@ struct llama_hadamard {
     llama_hadamard_rotations inv; // latent lookup table -> inverse transform
 };
 
+// EXL3 linears (see ggml/exl3/README.md): the trellis tensor stands for the weight, its scales are found here
+struct llama_exl3_linear {
+    struct ggml_tensor * suh;
+    struct ggml_tensor * svh;
+};
+
+// EXL3 row-ring table (quantized token embedding): the trellis tensor stands for the table
+struct llama_exl3_rows {
+    struct ggml_tensor * signs;
+    int64_t              n_out;
+};
+
+struct llama_exl3 {
+    std::unordered_map<const ggml_tensor *, llama_exl3_linear> linears; // trellis -> scales
+    std::unordered_map<const ggml_tensor *, llama_exl3_rows>   rows;    // row table -> signs
+};
+
 struct llama_model {
     llm_type type = LLM_TYPE_UNKNOWN;
     llm_arch arch = LLM_ARCH_UNKNOWN;
@@ -747,6 +767,7 @@ struct llama_model {
     llama_prec_policy prec_policy;
 
     llama_hadamard hdmd;
+    llama_exl3     exl3;
 
     // SINQ scale2 belongs to the base weight, not to any LoRA delta.
     std::unordered_map<const ggml_tensor *, ggml_tensor *> sinq_scales;
@@ -1056,6 +1077,10 @@ struct llama_model_base : public llama_model {
 
     // helper: make the prism.hadamard rotation and sign tensors for the folded weights
     void load_tensors_hadamard();
+
+    // helper: read the exl3.* metadata, and pair each EXL3 trellis with its scales after create_tensor made them
+    void load_hparams_exl3(llama_model_loader & ml);
+    void load_tensors_exl3();
 
     // helper: read the SWA pattern as one flag per layer, or as a period expanded by set_swa_pattern
     void load_swa_pattern(llama_model_loader & ml, uint32_t n_pattern, bool dense_first = false);

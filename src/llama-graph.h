@@ -27,6 +27,7 @@ struct llama_cparams;
 struct llama_layer;
 struct llama_prec_policy;
 struct llama_hadamard;
+struct llama_exl3;
 
 class llama_moe_cache;
 
@@ -1075,6 +1076,7 @@ struct llm_graph_params {
     const llama_prec_policy * prec_policy = nullptr;
 
     const llama_hadamard * hdmd = nullptr;
+    const llama_exl3     * exl3 = nullptr;
     const std::unordered_map<const ggml_tensor *, ggml_tensor *> * sinq_scales = nullptr;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
@@ -1373,6 +1375,7 @@ struct llm_graph_context {
     const llama_prec_policy * prec_policy;
 
     const llama_hadamard * hdmd;
+    const llama_exl3     * exl3;
     const std::unordered_map<const ggml_tensor *, ggml_tensor *> * sinq_scales;
     // Per-build cache only: never retain activation graph pointers across builds.
     mutable std::unordered_map<const ggml_tensor *, std::unordered_map<const ggml_tensor *, ggml_tensor *>> sinq_inputs;
@@ -1418,6 +1421,9 @@ struct llm_graph_context {
     ggml_tensor * build_hadamard_inverse_embd(
             ggml_tensor * w,
             ggml_tensor * cur) const;
+
+    // rows `ids` of an embedding table; an EXL3 row-ring table is decoded by EXL3_GET_ROWS
+    ggml_tensor * build_get_rows(ggml_tensor * table, ggml_tensor * ids) const;
 
     // do mat_mul, while optionally apply lora and per-tensor scale
     ggml_tensor * build_lora_mm(
@@ -1660,7 +1666,8 @@ ggml_tensor * build_attn_mha_paged(
             ggml_tensor * v_mla, // [n_embd_head_v_mla, n_embd_head_v, n_head_v] // TODO: remove
                   float   kq_scale,
                     int   il,
-            ggml_tensor * kq_mask_override = nullptr) const;
+            ggml_tensor * kq_mask_override = nullptr,
+                int64_t   n_kv_max = 0) const;
 
     // F3 position-split dual-range attention. True when P-mode is active,
     // global history exceeds P and current queries are overflow-range.

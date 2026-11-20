@@ -13100,6 +13100,7 @@ private:
                         // first; the next pass can save the evaluated prefix
                         // before adding the final token.
                         if (auto_cache_enabled() && ctx_dft && slot.can_speculate() &&
+                                llama_model_mtp_weights_get_info(model_tgt).managed &&
                                 slot.prompt.n_tokens() + 1 == slot.task->n_tokens() &&
                                 batch.size() > n_tokens_prev) {
                             break;
@@ -13132,6 +13133,7 @@ private:
                         // MTP also wants logits at every prompt position so the
                         // streaming hook can mirror t_h_nextn into ctx_dft.
                         if (auto_cache_enabled() && ctx_dft && slot.can_speculate() &&
+                                llama_model_mtp_weights_get_info(model_tgt).managed &&
                                 slot.prompt.n_tokens() + 1 == slot.task->n_tokens()) {
                             auto_save_prompt_prefix_checkpoint(slot);
                         }
@@ -13152,7 +13154,9 @@ private:
                         // break at the last user message, or at user messages at least min step past the last checkpoint
                         // (standard/recurring caches); KVarN breaks at the group seam just before a user
                         // message instead, so the checkpoint boundary is a restorable full-descriptor position
-                        if (do_checkpoint && reuse_alignment == 1 && spans.is_user_start(slot.prompt.n_tokens())) {
+                        if (do_checkpoint && reuse_alignment == 1 &&
+                                slot.prompt.n_tokens() >= (int32_t) n_ubatch &&
+                                spans.is_user_start(slot.prompt.n_tokens())) {
                             const auto pos = slot.prompt.n_tokens();
                             const auto & checkpoints = slot.prompt.checkpoints;
 
