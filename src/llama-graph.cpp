@@ -452,6 +452,10 @@ void llm_graph_input_pos_bucket_kv::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_out_ids::set_input(const llama_ubatch * ubatch) {
+    if (n_outputs == 0 || !out_ids || !out_ids->buffer) {
+        return;
+    }
+
     GGML_ASSERT(out_ids);
 
     const int64_t n_tokens = ubatch->n_tokens;
@@ -3840,6 +3844,10 @@ ggml_tensor * llm_graph_context::build_inp_attn_scale() const {
 }
 
 ggml_tensor * llm_graph_context::build_inp_out_ids() const {
+    if (n_outputs == 0) {
+        return nullptr;
+    }
+
     // note: when all tokens are output, we could skip this optimization to spare the ggml_get_rows() calls,
     //       but this would make the graph topology depend on the number of output tokens, which can interfere with
     //       features that require constant topology such as pipeline parallelism
