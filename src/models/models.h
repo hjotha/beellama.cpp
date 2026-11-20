@@ -2930,8 +2930,7 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
                             int * sections,
-                            int   il,
-                           bool   kv_only = false);
+                            int   il);
 
         // dense self-attention over the cells the QSA mask keeps
         ggml_tensor * build_attn_qsa(
@@ -2954,8 +2953,7 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
                             int * sections,
-                            int   il,
-                           bool   kv_only = false);
+                            int   il);
 
         ggml_tensor * build_layer_attn_linear(
              llm_graph_input_rs * inp,
