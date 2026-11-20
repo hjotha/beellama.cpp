@@ -88,6 +88,7 @@ bool kv_unified;
     bool training;           // set by llama_opt_init()
 
     size_t moe_cache_size;
+    size_t moe_cache_reserve;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 

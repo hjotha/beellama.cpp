@@ -883,6 +883,7 @@ struct common_params {
     std::string kv_mean_center_path = "";
     size_t moe_cache_size = 0; // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
     bool moe_cache_auto = false; // size the MoE cache from the device memory left free after loading, see docs/PLAN-strata-parity.md
+    int  vram_reserve_mib = 1536; // device memory kept free when the MoE cache is sized automatically
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 

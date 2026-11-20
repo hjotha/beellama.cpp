@@ -2478,6 +2478,20 @@ static void test_moe_cache_auto_sizing() {
 
     common_params bad;
     assert(!parse(bad, {"binary", "--moe-cache-mib", "-2"}));
+
+    common_params reserve;
+    assert(parse(reserve, {"binary", "--vram-reserve-mib", "4096"}));
+    assert(reserve.vram_reserve_mib == 4096);
+    reserve.n_parallel = 1;
+    const auto cparams_reserve = common_context_params_to_llama(reserve);
+    assert(cparams_reserve.moe_cache_reserve == size_t(4096)*1024*1024);
+
+    common_params reserve_default;
+    assert(parse(reserve_default, {"binary"}));
+    assert(reserve_default.vram_reserve_mib == 1536);
+
+    common_params reserve_bad;
+    assert(!parse(reserve_bad, {"binary", "--vram-reserve-mib", "-1"}));
 }
 
 int main(void) {

@@ -608,6 +608,7 @@ extern "C" {
         const char * remote_attn_upload_format; // copied during context construction
         const char * remote_attn_wire_format; // copied during context construction; null uses legacy environment
         size_t moe_cache_size; // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
+        size_t moe_cache_reserve; // bytes of each device kept free when moe_cache_size is sized automatically [EXPERIMENTAL]
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted

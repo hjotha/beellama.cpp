@@ -1187,6 +1187,7 @@ llama_context::llama_context(
     cparams.snapkv_retention = params.snapkv_retention;
     cparams.snapkv_budget_blocks = params.snapkv_budget_blocks;
     cparams.moe_cache_size = params.moe_cache_size;
+    cparams.moe_cache_reserve = params.moe_cache_reserve;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -2479,7 +2480,7 @@ std::vector<ggml_backend_t> layer_backends;
                 LLAMA_LOG_INFO("%s: MoE cache auto: no_alloc context, leaving the cache disabled\n", __func__);
             } else {
                 constexpr size_t MiB = 1024*1024;
-                constexpr size_t reserve = 1536*MiB;
+                const size_t reserve = cparams.moe_cache_reserve;
 
                 size_t host_moe_bytes = 0;
                 for (const auto & layer : model.layers) {
@@ -8928,6 +8929,7 @@ llama_context_params llama_context_default_params() {
         /*.remote_attn_upload_format   =*/ nullptr,
         /*.remote_attn_wire_format     =*/ nullptr,
         /*.moe_cache_size              =*/ 0,
+        /*.moe_cache_reserve           =*/ 1536u*1024u*1024u,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,

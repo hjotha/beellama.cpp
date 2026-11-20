@@ -51,11 +51,12 @@ residir).
   (`stories15M`, `-ngl 0`): `no host-resident MoE experts, cache disabled`, sem crash.
   `test-arg-parser` cobre `-1`, valor fixo e `-2` rejeitado.
 
-## P2 — pinned + planner (próximo)
+## P2 — pinned + planner (em andamento)
 
-1. `--moe-host-pinned on|off` (default `on` quando o device expõe host buffer type):
+1. ~~`--vram-reserve-mib N`~~ (default 1536) usado pelo auto-size do P1. **Feito e testado**
+   (reserve 20000 MiB desliga o cache: "only 0.00 MiB ... free for the cache").
+2. `--moe-host-pinned on|off` (default `on` quando o device expõe host buffer type):
    forçar os tensores `ffn_*_exps` host para `ggml_backend_dev_host_buffer_type(dev)`.
-2. `--vram-reserve-mib N` (default 1536) usado pelo P1.
 3. `--moe-plan`: imprime plano (bytes host, slots, cobertura %, VRAM livre) e sai.
 4. Teste: `llama-bench` com/sem pinned num MoE que force host.
 
