@@ -1318,7 +1318,6 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     res->add_input(std::move(inp));
 
     ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
 
     auto * inp_attn = build_attn_inp_kv();
 
@@ -1387,6 +1386,18 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, gate));
     cur = build_lora_mm(layer.wo, cur, layer.wo_s);
     cb(cur, "mtp_attn_out", il);
+
+    // On kv_only MTP catch-up batches (n_outputs == 0), skip residual, dense FFN,
+    // head norm, and LM head once KV cache updates from attention are scheduled.
+    const bool kv_only = (n_outputs == 0) &&
+                         cparams.embeddings_nextn_masked &&
+                         !cparams.embeddings;
+    if (kv_only) {
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
+
+    ggml_tensor * inp_out_ids = build_inp_out_ids();
 
     cur = ggml_add(ctx0, cur, inpSA);
     cb(cur, "mtp_attn_residual", il);
