@@ -122,8 +122,19 @@ performance; esta seção registra só o que já foi validado e não antecipa n�
 **Teste**: 28/28 testes da matriz QSA em `test-backend-ops` passaram no CUDA local
 (RTX 4070, build sm_80), incluindo KV 4096/16384/32768, `nq` 1/5/512, `nq=2/3/4`,
 `nq=13`, sem máscara e tail 1–3. O caso GQA ratio 2 (rota densa, `ncols2=2`) foi
-validado separadamente, 1/1. A A100-40G está medindo a performance agora; sem números
-novos nesta nota.
+validado separadamente, 1/1.
+
+**Medição na A100-40G** (3 runs, `b2048/ub1024`, cache 6144, KV q8_0):
+
+| config | short tg | pp4k | decode 4k | pp28k | decode 28k |
+|---|---:|---:|---:|---:|---:|
+| base-q8 (release) | 55,73 | 1.484,5 | 46,04 | 1.513,9 | 39,62 |
+| QSA q8 (branch) | 55,59 | 1.485,8 | 46,40 | 1.516,4 | **43,53** |
+
+- Prefill em 28k: **+0,2%** (dentro do ruído); decode após 28k: **+9,9%**.
+- O alvo de **+25% no prefill longo não foi atingido**. O cache de experts é bypassado
+  em lotes > 32 tokens, então o prefill de 28k envia ~39,7 GB de experts do host; esse
+  H2D domina o custo e mascara o ganho da atenção esparsa.
 
 ### Correção do baseline (`MEASURED.md`, 21/11)
 
@@ -149,17 +160,35 @@ pronto é `unsloth/Qwen3.8-Flash-Next-GGUF` →
 `-md <sidecar> --spec-type draft-mtp` (o auto-discovery não varre `MTP/`, então `-md` é
 obrigatório).
 
-- O sidecar tem `compress_ratios[48]=0`; foi criado um patch de 1 byte `0→4` para o A/B.
+- O sidecar tem `compress_ratios[48]=0`; o patch de 1 byte `0→4` **falha ao carregar**
+  (metadata inválida para o loader), então o arquivo original é o caminho.
 - O cache de experts compartilhado entre contextos foi **removido** da integração por
   risco de corrida entre streams (não validado). Com `-md`, o draft não compartilha o
   cache do alvo.
-- Sem números de MTP (aceitação/throughput) nesta nota.
 
-### Fase 0 — instrumentação (em preparação)
+**Medição na A100-40G** (1 run, cache auto `-1` + reserve 4096, n-max 2):
 
-`GGML_SCHED_SPLIT_TIMING`, `LLAMA_GRAPH_PREP_PROFILE`, `nsys` e o A/B `lazy on/off` estão
-sendo preparados. As fases 3 e 4 continuam **gated por evidência**; não há código novo
-delas nesta branch.
+| config | VRAM | pp4k | decode 4k | pp28k | decode 28k | aceitação |
+|---|---:|---:|---:|---:|---:|---:|
+| sem spec | 37.550 | 1.484,5 | 46,04 | 1.513,9 | 39,62 | — |
+| MTP sidecar | 39.052 | 1.227,2 | **61,47** | 1.293,0 | **58,86** | **80,7%** |
+
+- Decode: **+33%** após 4k e **+49%** após 28k; curto 53,96 (sem ganho).
+- Prefill: **-17% / -15%** — o alvo calcula o hidden NextN de todos os tokens do prompt
+  para o draft fazer o catch-up uma vez; esse é o custo.
+- Cache fixo 2048/4096 = 40.404 MiB e OOM no primeiro request; n-max 4 falha no load;
+  auto + reserve 4096 funciona em 39.052 MiB.
+- A recipe fica `experimental` até o caminho da recipe (zip clean) ser verificado; os
+  números acima usam o build `parity2`.
+
+### Fase 0 — instrumentação
+
+Os scripts (`profile_prefill.sh`, `ablate_lazy.py`, `summarize_nsys.py`) estão em
+`collabosm/tools/profiling/`, validados em dry-run e com SQLite sintético. O achado que
+muda a ordem: o cache de experts é bypassado em lotes > 32 tokens, então o prefill de
+28k envia ~39,7 GB de experts do host. As fases 3 e 4 continuam **gated por evidência**;
+o primeiro experimento é permitir o cache no prefill quando o working set do grupo cabe
+(protótipo em andamento), seguido do overlap H2D se o profiling confirmar.
 
 ### Build A100 (nota curta)
 
