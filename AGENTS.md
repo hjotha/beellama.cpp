@@ -186,7 +186,7 @@ floor before candidate KLD is interpreted.
 
 ## Git Conventions
 
-- Do not use git worktrees for `beellama` or `llama.cpp`; edit directly in the repository checkout on a branch based on `main` (e.g. `git checkout -b <branch> main`).
+- Use a dedicated Git worktree for `beellama` / `llama.cpp` changes when the task involves implementation work (e.g. `git worktree add /home/hjotha/worktrees/<repo>-<task> -b <branch> main`); keep the main checkout read-only. Short docs-only edits requested by the user may be made in the main checkout.
 - Keep fork-specific changes small and aligned with current upstream
   abstractions.
 - Do not treat old benchmark notes as current evidence without rerunning them.

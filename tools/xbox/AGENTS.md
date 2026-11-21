@@ -2,7 +2,7 @@
 
 Read the repository root AGENTS.md and tools/xbox/README.md first. This is the
 Xbox frontend of BeeLlama, not an independent core repository. Edit only on the
-root task branch; the root beellama no-worktree exception applies.
+root task branch; the root worktree policy applies.
 
 Use the root core via the existing CMake llama target or uwp/BeeLlama.props.
 Never create a nested llama.cpp checkout, add a core submodule, or patch core
