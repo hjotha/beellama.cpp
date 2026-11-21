@@ -627,6 +627,12 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
     llama_test(
         test-llama-archs
+        NAME test-mtp-qwen4exp
+        LABEL main
+        ARGS --test-mtp-qwen4exp
+    )
+    llama_test(
+        test-llama-archs
         NAME test-kvarn-state-restore
         LABEL main
         ARGS --test-kvarn-state-restore

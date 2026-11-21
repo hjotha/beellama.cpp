@@ -13757,8 +13757,40 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // Qwen QSA: 256/256, gqa 12, budget 2048.
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 8192, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
-    // quantized cache, deep enough to take the sparse path
-    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 32768, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 2048));
+    // Q8_0 QSA matrix: decode and prompt batches across KV depths, with and
+    // without the sparse bound. n_kv=4096/16384/32768, nq=1/5/512 (tile tails
+    // 1, 5 and 0), n_kv_max=0/2048. The bound must be exact when the CUDA
+    // sparse Q8_0 kernel runs, and a no-op on dense backends.
+    for (int64_t kv : {4096, 16384, 32768}) {
+        for (int64_t nq : {1, 5, 512}) {
+            for (int64_t n_kv_max : {0, 2048}) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, nq, true, false, 0, 0,
+                    GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, n_kv_max));
+            }
+        }
+    }
+    // ncols1=2 and ncols1=4 have no sparse Q8_0 instance: those batches must
+    // keep the dense F16-conversion buffers and stay correct.
+    for (int64_t nq : {2, 3, 4}) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 32768, nq, true, false, 0, 0,
+            GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 2048));
+    }
+    // No mask at all: sparse is not applicable even with n_kv_max set, so this
+    // must stay on the dense kernel.
+    for (int64_t nq : {1, 5, 512}) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 4096, nq, false, false, 0, 0,
+            GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 2048));
+    }
+    // KV tail 1-3: the sparse bound is only valid without a tail, so the
+    // merged-tail graph must keep the dense result. Tail bodies are F16/BF16
+    // only in ggml_kv_tail_attention_merge.
+    for (int64_t n_tail : {1, 2, 3}) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 4096, 5, true, false, 0, 0,
+            GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3},
+            n_tail, false, GGML_TYPE_F16, GGML_TYPE_F16, false, false, false, false, false, 0, false, 0.0f, -1, 0,
+            true, false, 2048));
+    }
+
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 32768, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, 2048));
     // single head with quantized K (MMQ on Vulkan)
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 1, 1}, 8192, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 512));

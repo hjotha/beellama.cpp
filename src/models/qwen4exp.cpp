@@ -717,12 +717,13 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_tensor * cur    = attn_mix.cur;
     cur    = build_layer_attn(inp_hyb->get_attn(), mctx_hyb, inp_kpool, cur, inp_pos, sections, il);
 
-    // On kv_only MTP catch-up batches (n_outputs == 0), skip post-attention
-    // MoE FFN, head mixer, and LM head once KV and QSA caches are updated.
-    const bool kv_only = (n_outputs == 0) &&
-                         cparams.embeddings_nextn_masked &&
-                         !cparams.embeddings;
+    // A catch-up batch asks for no outputs: nothing consumes the FFN, the head
+    // mixer or the LM head, so stop after the attention (and QSA) cache writes.
+    // The masked flag is not required: n_outputs == 0 means no row is read.
+    const bool kv_only = (n_outputs == 0) && !cparams.embeddings &&
+                         (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked);
     if (kv_only) {
+        LLAMA_LOG_DEBUG("%s: writing KV and QSA pools only (n_outputs == 0)\n", "graph_mtp");
         ggml_build_forward_expand(gf, cur);
         return;
     }

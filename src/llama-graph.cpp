@@ -5114,9 +5114,16 @@ ggml_tensor * llm_graph_context::build_attn(
                 route->body_type_k, route->body_type_v, kq_mask, kq_b,
                 k, v, body_mask, body_bias);
     }
+    // Sparse FlashAttention is applicable when the KV body is local, has no
+    // tail, and is stored in a type the sparse MMA kernel can consume. The
+    // F16 path is the original one; Q8_0 is dequantized per gathered row so
+    // that a quantized QSA cache does not fall back to scanning the full KV.
+    const bool sparse_kv_type =
+            (k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16) ||
+            (k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q8_0);
     const int64_t sparse_kv_bound = cparams.flash_attn && !use_kvarn &&
             tail_route == LLAMA_KV_TAIL_ROUTE_NONE && !k_tail && !v_tail &&
-            k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 ? n_kv_max : 0;
+            sparse_kv_type ? n_kv_max : 0;
     ggml_tensor * final_tail_op = nullptr;
     ggml_tensor * cur = build_attn_mha(q, k, v, body_bias, body_mask, sinks, v_mla, sparse_kv_bound, kq_scale, il,
 k_tail, v_tail, kq_mask_tail, kq_b_tail,

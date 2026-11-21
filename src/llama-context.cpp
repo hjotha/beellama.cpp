@@ -478,7 +478,8 @@ static bool selected_attention_layer(
 // keeps its intrinsic 128-token tail). Shared by the mixed auto-placement
 // planner (P == 0) and the LLAMA_MTP_POSITION_SPLIT=1 fit check (P != 0).
 static uint64_t estimate_mtp_reserve_bytes(
-        const llama_model & model, const llama_context_params & params, const llama_cparams & cparams) {
+        const llama_model & model, const llama_context_params & params, const llama_cparams & cparams,
+        std::map<ggml_backend_dev_t, uint64_t> * per_device = nullptr) {
     llama_kv_mixed_mtp_input mtp_input = {};
     mtp_input.n_ctx = cparams.n_ctx_seq;
     mtp_input.n_seq_max = cparams.n_seq_max;
@@ -514,6 +515,13 @@ static uint64_t estimate_mtp_reserve_bytes(
                 "mixed KV auto-placement cannot reserve the planned draft-MTP cache: %s",
                 mtp_budget.error[0] ? mtp_budget.error :
                         llama_kv_mixed_status_name(mtp_status)));
+    }
+    if (per_device != nullptr) {
+        per_device->clear();
+        const size_t n_layers = std::min(mtp_input.layers.size(), mtp_budget.layer_bytes.size());
+        for (size_t i = 0; i < n_layers; ++i) {
+            (*per_device)[model.dev_layer(mtp_input.layers[i].layer)] += mtp_budget.layer_bytes[i];
+        }
     }
     return mtp_budget.total_bytes;
 }
@@ -2517,12 +2525,48 @@ std::vector<ggml_backend_t> layer_backends;
                 if (host_moe_bytes == 0) {
                     LLAMA_LOG_INFO("%s: MoE cache auto: no host-resident MoE experts, cache disabled\n", __func__);
                 } else {
+                    // A draft-MTP context is created after this one and needs its own
+                    // KV cache plus compute buffers on the same devices. Reserve both
+                    // before sizing the expert cache, or the draft creation can fail
+                    // (or the auto-size can hand the draft the memory the experts
+                    // should use). The MTP graph is one decoder layer, so the target's
+                    // compute buffer on each device is a safe upper bound for the
+                    // draft's. See docs/PLAN-strata-parity.md (P2).
+                    std::map<ggml_backend_dev_t, uint64_t> draft_kv;
+                    uint64_t draft_kv_total = 0;
+                    if (params.mtp_reserve_enabled) {
+                        try {
+                            draft_kv_total = estimate_mtp_reserve_bytes(model, params, cparams, &draft_kv);
+                            LLAMA_LOG_INFO("%s: MoE cache auto: reserving %.2f MiB of draft-MTP KV (ctx %u, %s/%s)\n",
+                                    __func__, draft_kv_total/(double)MiB, cparams.n_ctx,
+                                    params.mtp_reserve_kvarn == LLAMA_KVARN_TYPE_DISABLED ? ggml_type_name(params.mtp_reserve_type_k) : llama_kvarn_type_name(params.mtp_reserve_kvarn),
+                                    params.mtp_reserve_kvarn == LLAMA_KVARN_TYPE_DISABLED ? ggml_type_name(params.mtp_reserve_type_v) : llama_kvarn_type_name(params.mtp_reserve_kvarn));
+                        } catch (const std::exception & e) {
+                            LLAMA_LOG_WARN("%s: MoE cache auto: cannot estimate the draft-MTP reserve: %s\n", __func__, e.what());
+                        }
+                    }
+
                     size_t budget = 0;
                     for (const auto & d : model.devices) {
                         size_t free_b = 0, total_b = 0;
                         ggml_backend_dev_memory(d.dev, &free_b, &total_b);
-                        if (free_b > reserve) {
-                            budget += free_b - reserve;
+
+                        size_t need = reserve;
+                        if (params.mtp_reserve_enabled) {
+                            const auto it_kv = draft_kv.find(d.dev);
+                            if (it_kv != draft_kv.end()) {
+                                need += (size_t) it_kv->second;
+                            }
+                            // the draft's compute/graph buffers: bound by this context's
+                            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                                if (ggml_backend_get_device(backend_ptrs[i]) == d.dev) {
+                                    need += backend_buf_exp_size[i];
+                                }
+                            }
+                        }
+
+                        if (free_b > need) {
+                            budget += free_b - need;
                         }
                     }
                     budget = std::min(budget, host_moe_bytes);
@@ -9258,7 +9302,14 @@ const char * context_label = params.ctx_type == LLAMA_CONTEXT_TYPE_MTP
     // router_layer >= 0 means n_layer_nextn is repurposed for a router layer, not real MTP
     if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
         (model->hparams.n_layer_nextn == 0 || model->hparams.router_layer >= 0)) {
-        LLAMA_LOG_WARN("%s: context type MTP requested but model doesn't contain MTP layers\n", __func__);
+        if (model->hparams.router_layer >= 0) {
+            LLAMA_LOG_ERROR("%s: context type MTP requested, but this model uses its NextN layers as a router layer\n", __func__);
+        } else {
+            LLAMA_LOG_ERROR("%s: context type MTP requested, but '%s' (%s) declares no NextN/MTP block. "
+                    "The GGUF was converted without the MTP tensors: use --spec-type none for this file, "
+                    "or a model file that keeps the NextN block.\n",
+                    __func__, model->name.c_str(), model->arch_name().c_str());
+        }
         return nullptr;
     }
 

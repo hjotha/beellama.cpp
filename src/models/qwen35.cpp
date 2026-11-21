@@ -1387,11 +1387,10 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     cur = build_lora_mm(layer.wo, cur, layer.wo_s);
     cb(cur, "mtp_attn_out", il);
 
-    // On kv_only MTP catch-up batches (n_outputs == 0), skip residual, dense FFN,
-    // head norm, and LM head once KV cache updates from attention are scheduled.
-    const bool kv_only = (n_outputs == 0) &&
-                         cparams.embeddings_nextn_masked &&
-                         !cparams.embeddings;
+    // A catch-up batch asks for no outputs: skip residual, dense FFN, head norm
+    // and LM head once the KV cache updates from attention are scheduled.
+    const bool kv_only = (n_outputs == 0) && !cparams.embeddings &&
+                         (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked);
     if (kv_only) {
         ggml_build_forward_expand(gf, cur);
         return;

@@ -162,14 +162,101 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
 
     const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
 
+    // Q8_0 can be dequantized per gathered row by the MMA kernel. Only the
+    // D=256, ncols2=8 instances exist, and only on Ampere+ where the wide
+    // ncols1=8 sparse kernel is compiled. Other Q8_0 geometries keep the
+    // historical dense-F16-conversion sparse path.
+    const bool q8_direct = K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0 &&
+        K->ne[0] == 256 && V->ne[0] == 256 && ncols2 == 8;
+    if (q8_direct) {
+        if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_AMPERE ||
+                K->ne[1] % FATTN_KQ_STRIDE != 0 || Q->ne[2] % K->ne[2] != 0 ||
+                Q->ne[2]/K->ne[2] <= 4 ||
+                !ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(256, 256, ncols1, 8)) {
+            return false;
+        }
+    }
+
     // the dense kernel handles up to 64/ncols2 queries per K/V pass, the single-query gather has to beat that
     const int64_t n_gather = (ncols1 == 1 ? std::min<int64_t>(Q->ne[1], 64/ncols2) : ncols1) * (int64_t) n_kv_max;
+
+    // Q8_0 halves the bytes per gathered row, so a 1x gather bound is already
+    // favorable; F16 keeps the original conservative 2x bound.
+    const int64_t min_kv = q8_direct ? std::max<int64_t>(4096, n_gather + 1) :
+        std::max<int64_t>(4096, GGML_CUDA_CC_IS_NVIDIA(cc) ? 2*n_gather : 2LL*n_kv_max);
 
     return ((GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc)) || amd_mfma_available(cc)) &&
         mask != nullptr && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
         mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&
-        K->ne[1] >= std::max<int64_t>(4096, GGML_CUDA_CC_IS_NVIDIA(cc) ? 2*n_gather : 2LL*n_kv_max);
+        K->ne[1] >= min_kv;
 #endif // !defined(GGML_USE_MUSA)
+}
+
+// Mirror ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2/_ncols1 and the
+// get_best_fattn_kernel GQA eligibility checks, so buffer planning disables the
+// dense F16 conversion exactly when the Q8_0 sparse kernel is going to run.
+// A false positive here leaves the dense kernel without its conversion
+// buffer, so every fallback must be reproduced, not approximated.
+static bool ggml_cuda_flash_attn_ext_uses_sparse_q8(const int device, const ggml_tensor * dst) {
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+
+    if (K->type != GGML_TYPE_Q8_0 || V->type != GGML_TYPE_Q8_0 || K->ne[0] != 256 || V->ne[0] != 256) {
+        return false;
+    }
+
+    const int cc = ggml_cuda_info().devices[device].cc;
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_AMPERE) {
+        return false;
+    }
+
+    float max_bias = 0.0f;
+    float logit_softcap = 0.0f;
+    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+    if (!mask || max_bias != 0.0f || logit_softcap != 0.0f ||
+            Q->ne[2] % K->ne[2] != 0 || Q->ne[2]/K->ne[2] <= 4) {
+        return false;
+    }
+
+    // switch_ncols2 reaches ncols2=8 only through the GQA-optimized path,
+    // which also rejects non-16-byte row strides of any non-quantized operand.
+    bool use_gqa_opt = K->ne[1] % FATTN_KQ_STRIDE == 0;
+    for (const ggml_tensor * t : {Q, K, V, mask}) {
+        if (t == nullptr || ggml_is_quantized(t->type)) {
+            continue;
+        }
+        for (size_t i = 1; i < GGML_MAX_DIMS; ++i) {
+            if (t->nb[i] % 16 != 0) {
+                use_gqa_opt = false;
+                break;
+            }
+        }
+    }
+    if (!use_gqa_opt) {
+        return false;
+    }
+
+    // switch_ncols1 for ncols2 = 8. Only the ncols1=1 and ncols1=8 instances
+    // have an instantiated sparse kernel; ncols1=2 and ncols1=4 are dense.
+    const bool narrow = ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(256, 256, 1, 8) &&
+        ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, 1, 8);
+    const bool wide = ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(256, 256, 8, 8) &&
+        ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, 8, 8);
+
+    if (turing_mma_available(cc) && Q->ne[1] <= 8/8) {
+        return narrow;
+    }
+    if (Q->ne[1] <= 16/8) {
+        return false;
+    }
+    if (Q->ne[1] <= 32/8 ||
+            (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING)) {
+        return false;
+    }
+    return wide;
 }
 
 template <int DKQ, int DV, int ncols2>
@@ -1086,7 +1173,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                         !(gqa_ratio > 4 && (Q->ne[0] >= 256 || K->ne[1] >= 8192))) {
                     return BEST_FATTN_KERNEL_VEC;
                 }
-            } else {
+            } else if (!ggml_cuda_flash_attn_ext_uses_sparse_q8(device, dst)) {
                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {
                     if (Q->ne[1] <= 2) {
                         return BEST_FATTN_KERNEL_VEC;
@@ -1097,7 +1184,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                     }
                 }
             }
-            if (!gqa_opt_applies && Q->ne[1] == 1) {
+            if (!gqa_opt_applies && Q->ne[1] == 1 &&
+                    !ggml_cuda_flash_attn_ext_uses_sparse_q8(device, dst)) {
                 return BEST_FATTN_KERNEL_VEC;
             }
         }
@@ -1226,9 +1314,16 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     switch (kernel) {
         case BEST_FATTN_KERNEL_TILE:
-        case BEST_FATTN_KERNEL_MMA_F16:
             need_f16_K = true;
             need_f16_V = true;
+            break;
+        case BEST_FATTN_KERNEL_MMA_F16:
+            // The sparse Q8_0 kernel consumes the packed cache directly; every
+            // other MMA case still needs the dense F16 conversion buffers.
+            if (!ggml_cuda_flash_attn_ext_uses_sparse_q8(device, dst)) {
+                need_f16_K = true;
+                need_f16_V = true;
+            }
             break;
         case BEST_FATTN_KERNEL_VEC: {
             const bool f16_fallback = ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type) == nullptr;

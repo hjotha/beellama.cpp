@@ -6357,7 +6357,8 @@ private:
         const bool spec_mtp = std::find(params_base.speculative.types.begin(),
                                         params_base.speculative.types.end(),
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
-        const bool has_spec = has_draft || spec_mtp;
+        bool has_spec = has_draft || spec_mtp;
+        const bool has_spec_stage = has_spec;
 
         if (callback_state) {
             std::vector<std::string> stages = {"text_model"};
@@ -6470,6 +6471,20 @@ private:
 
         vocab = llama_model_get_vocab(model_tgt);
 
+        // A model file converted without the NextN/MTP tensors cannot drive
+        // draft-mtp: the MTP context creation fails by design. Keep the server
+        // loadable and say exactly why instead of refusing to load.
+        if (has_spec && !has_draft && spec_mtp && llama_model_n_layer_nextn(model_tgt) == 0) {
+            SRV_WRN("--spec-type draft-mtp requested, but '%s' declares no NextN/MTP block; "
+                    "serving without speculative decoding (the GGUF was converted without the MTP tensors)\n",
+                    params.model.path.c_str());
+            auto & spec_types = params_base.speculative.types;
+            spec_types.erase(std::remove(spec_types.begin(), spec_types.end(),
+                        COMMON_SPECULATIVE_TYPE_DRAFT_MTP), spec_types.end());
+            // other requested spec types (e.g. ngram) may still be usable
+            has_spec = has_draft || !spec_types.empty();
+        }
+
         try {
             decision.init(model_tgt);
         } catch (const std::exception & e) {
@@ -6553,6 +6568,11 @@ private:
                 }
             }
 
+            load_progress_callback(1.0f, &load_progress_spec);
+        } else if (has_spec_stage) {
+            // the spec stage was announced before the model told us it has no MTP
+            // block: report it complete so the load progress does not stall
+            load_progress_callback(0.0f, &load_progress_spec);
             load_progress_callback(1.0f, &load_progress_spec);
         }
 
@@ -7243,7 +7263,10 @@ private:
         ctx_dft = nullptr;
         model_dft = nullptr;
 
-        const bool use_mtp = adaptive_draft_n_for_profile(profile) > 0;
+        // a file without a NextN block cannot create an MTP context; treat the
+        // profile as non-speculative instead of failing the adaptive transition
+        const bool use_mtp = adaptive_draft_n_for_profile(profile) > 0 &&
+                llama_model_n_layer_nextn(model_tgt) > 0;
         if (!use_mtp) {
             ctx_tgt_seq_rm_type = common_context_can_seq_rm(ctx_tgt);
             ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;

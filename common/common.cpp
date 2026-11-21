@@ -1482,6 +1482,8 @@ static size_t common_probe_context_overhead(
 
     const bool spec_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(),
                                     COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    // a file converted without the NextN tensors has no MTP context to probe
+    const bool probe_mtp = spec_mtp && llama_model_n_layer_nextn(model) > 0;
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
 
@@ -1495,7 +1497,7 @@ static size_t common_probe_context_overhead(
         }
 
         size_t measured = common_context_memory_on_device(ctx_tgt, dev);
-        if (spec_mtp) {
+        if (probe_mtp) {
             auto probe_params_dft = common_base_params_to_speculative(probe_params);
             auto cparams_dft = common_context_params_to_llama(probe_params_dft);
             cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
@@ -1521,7 +1523,7 @@ static size_t common_probe_context_overhead(
         LOG_INF("%s: probe ctx=%u, batch=%u, ubatch=%u, measured=%.1f MiB, kv=%.1f MiB, overhead=%.1f MiB, mtp=%s\n",
                 __func__, probe_ctx, params.n_batch, params.n_ubatch,
                 measured / 1024.0 / 1024.0, probe_kv_bytes / 1024.0 / 1024.0,
-                overhead / 1024.0 / 1024.0, spec_mtp ? "yes" : "no");
+                overhead / 1024.0 / 1024.0, probe_mtp ? "yes" : "no");
         return overhead;
     } catch (const std::exception & e) {
         LOG_WRN("%s: context probe failed at ctx=%u: %s\n", __func__, probe_ctx, e.what());
@@ -2350,6 +2352,12 @@ common_gguf_info common_get_gguf_info(const std::string & fname) {
         info.n_ctx_train = gguf_get_val_u32(gguf_ctx.get(), ctx_id);
     }
 
+    // a file converted without the NextN/MTP tensors cannot create an MTP context
+    const int64_t nextn_id = gguf_find_key(gguf_ctx.get(), (arch + ".nextn_predict_layers").c_str());
+    if (nextn_id >= 0 && gguf_get_kv_type(gguf_ctx.get(), nextn_id) == GGUF_TYPE_UINT32) {
+        info.n_layer_nextn = gguf_get_val_u32(gguf_ctx.get(), nextn_id);
+    }
+
     // same key as llama_model_chat_template(model, nullptr)
     info.has_chat_tmpl = gguf_find_key(gguf_ctx.get(), "tokenizer.chat_template") >= 0;
 
@@ -2369,11 +2377,18 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
     const bool spec_mtp  = std::find(params.speculative.types.begin(), params.speculative.types.end(),
         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
 
+    // A file without a NextN block has no extra MTP context to fit. Only skip
+    // when the metadata was readable: streamed files are fitted as before.
+    const common_gguf_info gguf_info = spec_mtp && !has_draft
+        ? common_get_gguf_info(params.model.path) : common_gguf_info{};
+    const bool spec_mtp_extra = spec_mtp && !has_draft &&
+        (gguf_info.n_ctx_train == 0 || gguf_info.n_layer_nextn > 0);
+
     common_params params_dft = common_base_params_to_speculative(params);
 
     auto mparams_dft = common_model_params_to_llama(params_dft);
     auto cparams_dft = common_context_params_to_llama(params_dft);
-    if (spec_mtp) {
+    if (spec_mtp_extra) {
         cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
     }
     cparams_dft.n_rs_seq = 0;
@@ -2391,7 +2406,7 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
         params.tensor_buft_overrides.data(),
         params.fit_params_target.data(),
         params.fit_params_min_ctx,
-        has_draft || spec_mtp ? &extra : nullptr,
+        has_draft || spec_mtp_extra ? &extra : nullptr,
         params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
     if (fit_status == COMMON_PARAMS_FIT_STATUS_UNSAFE_EXTRA) {
         throw common_params_fit_unsafe_extra_exception(

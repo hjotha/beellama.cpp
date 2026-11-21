@@ -1338,6 +1338,7 @@ common_decision_type common_get_decision_type(const struct llama_model * model);
 struct common_gguf_info {
     common_decision_type decision_type = COMMON_DECISION_TYPE_UNKNOWN; // UNKNOWN if the file is missing, unreadable, or invalid
     uint32_t             n_ctx_train   = 0;                            // 0 if unknown
+    uint32_t             n_layer_nextn = 0;                            // NextN/MTP blocks declared by the file, 0 if none
     bool                 has_chat_tmpl = false;                        // has the default tokenizer.chat_template
 };
 

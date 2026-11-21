@@ -171,6 +171,7 @@ static void usage(char ** argv) {
     LOG("      --test-mtp-ubatch-sync   Run the Bee MTP ubatch sync regression\n");
     LOG("      --test-mtp-request-reset Run the Bee MTP request reset regression\n");
     LOG("      --test-mtp-kvarn-routing Run the Bee MTP KVarN routing regression\n");
+    LOG("      --test-mtp-qwen4exp     Run the qwen4exp native MTP decode/rollback regression\n");
     LOG("      --test-kvarn-state-restore Run the Bee KVarN self-contained state restore regression\n");
     LOG("      --test-qsa-exact-tail Run the QSA body/exact mask regression\n");
 #endif
@@ -1019,6 +1020,183 @@ const auto prefill = [&](const std::vector<uint8_t> & carry) {
         throw std::runtime_error("previous-request MTP carry contaminated the new prompt's draft cache");
     }
 
+    return 0;
+}
+
+// qwen4exp native MTP: an LLAMA_CONTEXT_TYPE_MTP context decodes the NextN
+// block that ships in the target model. Covers the production Q8_0 draft cache,
+// the KV-only catch-up (n_outputs == 0 with masked nextn hidden output) and the
+// rollback of a rejected draft suffix at the production ubatch sizes.
+static int test_mtp_qwen4exp(const size_t seed) {
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true, true);
+    // block_count includes the NextN block: two trunk layers (linear + QSA) and
+    // one QSA MTP layer, each QSA layer with the same compress ratio
+    gguf_set_val_u32(gguf_ctx.get(), "qwen4exp.block_count", 3);
+    {
+        const uint32_t ratios[] = { 4, 4, 4 };
+        gguf_set_arr_data(gguf_ctx.get(), "qwen4exp.attention.compress_ratios", GGUF_TYPE_UINT32, ratios, 3);
+    }
+
+    llama_model_params model_params = llama_model_default_params();
+    model_params.progress_callback = silent_model_load_progress;
+    model_params.load_mtp = true;
+
+    tensor_data_params tensor_params = { seed, 0.05f };
+    llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tensor_params, model_params));
+    if (!model) {
+        throw std::runtime_error("failed to create the qwen4exp MTP fixture");
+    }
+    if (llama_model_n_layer_nextn(model.get()) != 1) {
+        throw std::runtime_error("the qwen4exp fixture did not load its NextN block");
+    }
+
+    constexpr int32_t n_vocab    = 128;
+    constexpr int32_t n_tokens   = 40;
+    const size_t      n_embd_out = llama_model_n_embd_out(model.get());
+
+    const auto tokens = get_tokens(n_tokens, n_vocab, seed + 7);
+
+    for (const int32_t n_ubatch : { 32, 512, 1024 }) {
+        llama_context_params cp = llama_context_default_params();
+        cp.n_ctx           = 2048;
+        cp.n_batch         = 512;
+        cp.n_ubatch        = n_ubatch;
+        cp.n_threads       = 2;
+        cp.n_threads_batch = 2;
+        cp.offload_kqv     = false;
+        // the production draft cache; a quantized V cache enables Flash Attention
+        cp.type_k = cp.type_v = GGML_TYPE_Q8_0;
+
+        llama_context_ptr ctx_tgt(llama_init_from_model(model.get(), cp));
+        if (!ctx_tgt) {
+            throw std::runtime_error("failed to create the qwen4exp target context");
+        }
+        llama_set_embeddings_nextn(ctx_tgt.get(), true, false);
+
+        common_batch prompt(ctx_tgt.get());
+        for (int32_t i = 0; i < n_tokens; ++i) {
+            prompt.add(tokens[i], i, 0, true);
+        }
+        if (llama_process(ctx_tgt.get(), LLAMA_PROCESS_TYPE_DECODE, prompt.get()) != 0) {
+            throw std::runtime_error("failed to decode the qwen4exp target prompt");
+        }
+
+        std::vector<float> h_target((size_t) n_tokens * n_embd_out);
+        for (int32_t i = 0; i < n_tokens; ++i) {
+            const float * h = llama_get_embeddings_nextn_ith(ctx_tgt.get(), i);
+            if (h == nullptr) {
+                throw std::runtime_error("the target did not produce the nextn hidden state");
+            }
+            std::memcpy(h_target.data() + (size_t) i * n_embd_out, h, n_embd_out * sizeof(float));
+            for (size_t j = 0; j < n_embd_out; ++j) {
+                if (!std::isfinite(h[j])) {
+                    throw std::runtime_error("the target nextn hidden state is not finite");
+                }
+            }
+        }
+
+        // the catch-up pairs each token with the target hidden of the previous
+        // position; the first row consumes the carry, use the last row as a stand-in
+        const float * pending = h_target.data() + (size_t) (n_tokens - 1) * n_embd_out;
+
+        llama_context_params dp = cp;
+        dp.ctx_type  = LLAMA_CONTEXT_TYPE_MTP;
+        dp.ctx_other = ctx_tgt.get();
+
+        llama_context_ptr ctx_dft(llama_init_from_model(model.get(), dp));
+        if (!ctx_dft) {
+            throw std::runtime_error("failed to create the qwen4exp MTP draft context");
+        }
+        llama_set_embeddings_nextn(ctx_dft.get(), true, true);
+
+        auto * mem = llama_get_memory(ctx_dft.get());
+
+        auto decode_range = [&](llama_pos pos, int32_t n, bool output) {
+            common_batch b(ctx_dft.get());
+            for (int32_t i = 0; i < n; ++i) {
+                const llama_pos p   = pos + i;
+                const int32_t   idx = b.add(tokens[p], p, 0, output);
+                const float *   h   = p == 0 ? pending : h_target.data() + (size_t) (p - 1) * n_embd_out;
+                if (!b.set_embd_state(idx, { h, 1, n_embd_out })) {
+                    throw std::runtime_error("the MTP context rejected the hidden state input");
+                }
+            }
+            return llama_process(ctx_dft.get(), LLAMA_PROCESS_TYPE_DECODE, b.get());
+        };
+
+        // KV-only catch-up: no row asks for output, so the graph must stop after
+        // the attention write and still advance the KV and the QSA pool state
+        if (decode_range(0, n_tokens, false) != 0) {
+            throw std::runtime_error("failed to decode the MTP KV-only catch-up");
+        }
+        if (llama_memory_seq_pos_max(mem, 0) != n_tokens - 1) {
+            throw std::runtime_error("the MTP KV-only catch-up did not advance the draft cache");
+        }
+
+        // rejected suffixes: 0, 1, 2 and 4 accepted drafts all roll back here
+        for (const int32_t n_back : { 1, 2, 3, 5 }) {
+            const llama_pos cut = n_tokens - n_back;
+            if (!llama_memory_seq_rm(mem, 0, cut, -1)) {
+                throw std::runtime_error("failed to roll back the draft cache");
+            }
+            if (llama_memory_seq_pos_max(mem, 0) != cut - 1) {
+                throw std::runtime_error("the draft cache rollback left a stale suffix");
+            }
+            if (decode_range(cut, n_back, false) != 0) {
+                throw std::runtime_error("failed to replay the accepted draft suffix");
+            }
+            if (llama_memory_seq_pos_max(mem, 0) != n_tokens - 1) {
+                throw std::runtime_error("the replayed draft suffix did not reach the anchor");
+            }
+        }
+
+        // a full draft step (attention + MoE FFN + head): logits and the next
+        // hidden state must both come back finite
+        {
+            common_batch b(ctx_dft.get());
+            const int32_t idx = b.add(tokens[0], n_tokens, 0, true);
+            if (!b.set_embd_state(idx, { pending, 1, n_embd_out })) {
+                throw std::runtime_error("the MTP context rejected the draft hidden state input");
+            }
+            if (llama_process(ctx_dft.get(), LLAMA_PROCESS_TYPE_DECODE, b.get()) != 0) {
+                throw std::runtime_error("failed to decode a full MTP draft step");
+            }
+            const float * logits = llama_get_logits_ith(ctx_dft.get(), 0);
+            const float * h_dft  = llama_get_embeddings_nextn_ith(ctx_dft.get(), 0);
+            if (logits == nullptr || h_dft == nullptr) {
+                throw std::runtime_error("the MTP draft step did not produce logits and a hidden state");
+            }
+            for (int32_t i = 0; i < n_vocab; ++i) {
+                if (!std::isfinite(logits[i])) {
+                    throw std::runtime_error("the MTP draft logits are not finite");
+                }
+            }
+            for (size_t i = 0; i < n_embd_out; ++i) {
+                if (!std::isfinite(h_dft[i])) {
+                    throw std::runtime_error("the MTP draft hidden state is not finite");
+                }
+            }
+        }
+    }
+
+    // without the NextN block the MTP context must be refused before any decode
+    {
+        gguf_context_ptr no_mtp_ctx = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true, false);
+        llama_model_ptr no_mtp(llama_model_init_from_user(no_mtp_ctx.get(), set_tensor_data, &tensor_params, model_params));
+        if (!no_mtp) {
+            throw std::runtime_error("failed to create the trunk-only qwen4exp fixture");
+        }
+        llama_context_params cp = llama_context_default_params();
+        cp.n_ctx = 256;
+        cp.n_batch = cp.n_ubatch = 64;
+        cp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        llama_context_ptr ctx(llama_init_from_model(no_mtp.get(), cp));
+        if (ctx) {
+            throw std::runtime_error("an MTP context must be refused when the model has no NextN block");
+        }
+    }
+
+    LOG_INF("%s: qwen4exp MTP decode, KV-only catch-up and rollback: OK\n", __func__);
     return 0;
 }
 
@@ -2175,6 +2353,7 @@ int main(int argc, char ** argv) {
     bool test_mtp_sync = false;
     bool test_mtp_reset = false;
     bool test_mtp_kvarn = false;
+    bool test_qwen4exp_mtp = false;
     bool test_kvarn_restore = false;
     bool test_qsa_tail = false;
 #endif
@@ -2252,6 +2431,8 @@ int main(int argc, char ** argv) {
             test_mtp_reset = true;
         } else if (strcmp(argv[i], "--test-mtp-kvarn-routing") == 0) {
             test_mtp_kvarn = true;
+        } else if (strcmp(argv[i], "--test-mtp-qwen4exp") == 0) {
+            test_qwen4exp_mtp = true;
         } else if (strcmp(argv[i], "--test-kvarn-state-restore") == 0) {
             test_kvarn_restore = true;
         } else if (strcmp(argv[i], "--test-qsa-exact-tail") == 0) {
@@ -2284,6 +2465,9 @@ int main(int argc, char ** argv) {
         }
         if (test_mtp_kvarn) {
             return test_mtp_kvarn_routing(seed);
+        }
+        if (test_qwen4exp_mtp) {
+            return test_mtp_qwen4exp(seed);
         }
         if (test_kvarn_restore) {
             return test_kvarn_state_restore(seed);
