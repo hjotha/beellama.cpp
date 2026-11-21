@@ -177,7 +177,40 @@ const char * llama_version(void) {
 #endif
 }
 
+// Debug aid: with LLAMA_CRASH_BT=1, print a backtrace when the process dies by signal.
+// journald/dmesg only carry the faulting PC; this names the callers too (glibc prints the
+// module and the offset inside it, which addr2line resolves against the same binary).
+#include <execinfo.h>
+#include <csignal>
+#include <cstdlib>
+
+static void llama_crash_bt_handler(int sig, siginfo_t * si, void * /*uc*/) {
+    void * bt[64];
+    const int n = backtrace(bt, 64);
+    char hdr[160];
+    const int hlen = snprintf(hdr, sizeof(hdr),
+            "\n*** signal %d at %p (LLAMA_CRASH_BT) ***\n", sig, si ? si->si_addr : nullptr);
+    if (hlen > 0) { ssize_t w = write(2, hdr, (size_t) hlen); (void) w; }
+    backtrace_symbols_fd(bt, n, 2);
+    _exit(128 + sig);
+}
+
+static void llama_crash_bt_install() {
+    static bool done = false;
+    if (done || !getenv("LLAMA_CRASH_BT")) {
+        return;
+    }
+    done = true;
+    struct sigaction sa {};
+    sa.sa_sigaction = llama_crash_bt_handler;
+    sa.sa_flags = SA_SIGINFO | SA_RESETHAND;
+    sigaction(SIGSEGV, &sa, nullptr);
+    sigaction(SIGABRT, &sa, nullptr);
+    sigaction(SIGBUS, &sa, nullptr);
+}
+
 void llama_backend_init(void) {
+    llama_crash_bt_install();
     ggml_time_init();
 
     // needed to initialize f16 tables

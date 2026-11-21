@@ -4509,26 +4509,57 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
     return res;
 }
 
+// Debug aid for the Flash-Next load crash: the graph destructor dies on a corrupted
+// sinq_inputs first-node link. With LLAMA_DEBUG_GRAPH_GUARD=1, check that the map is
+// still empty after every build phase, so the phase that overwrites the graph object is
+// named instead of guessed. Implementation-specific: libstdc++ unordered_map layout is
+// { buckets, bucket_count, before_begin{ nxt }, ... }.
+static void graph_guard(const llm_graph_context * g, const char * where) {
+    static const bool enabled = getenv("LLAMA_DEBUG_GRAPH_GUARD") != nullptr;
+    if (!enabled) {
+        return;
+    }
+    const uint64_t * raw = reinterpret_cast<const uint64_t *>(&g->sinq_inputs);
+    const uint64_t buckets = raw[0];
+    const uint64_t count   = raw[1];
+    const uint64_t nxt     = raw[2];
+    LLAMA_LOG_INFO("%s: graph guard %-18s buckets=%#llx count=%llu nxt=%#llx size=%zu\n",
+            __func__, where, (unsigned long long) buckets, (unsigned long long) count,
+            (unsigned long long) nxt, g->sinq_inputs.size());
+    if (nxt != 0) {
+        LLAMA_LOG_ERROR("%s: graph guard: sinq_inputs first-node link changed to %#llx after %s\n",
+                __func__, (unsigned long long) nxt, where);
+        GGML_ABORT("graph guard");
+    }
+}
+
 ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
     std::unique_ptr<llm_graph_context> llm = build_arch_graph(params);
+    graph_guard(llm.get(), "arch");
 
     // add on pooling layer
     llm->build_pooling(cls, cls_b, cls_out, cls_out_b, cls_norm);
+    graph_guard(llm.get(), "pooling");
 
     // add the LM head (if the context outputs logits)
     llm->build_logits();
+    graph_guard(llm.get(), "logits");
 
     // add backend sampling layers (if any)
     llm->build_sampling();
+    graph_guard(llm.get(), "sampling");
     llm->build_post_sampling();
+    graph_guard(llm.get(), "post_sampling");
 
     // if the gguf model was converted with --sentence-transformers-dense-modules
     // there will be two additional dense projection layers
     // dense linear projections are applied after pooling
     // TODO: move reranking logic here and generalize
     llm->build_dense_out(dense_2_out_layers, dense_2_out_layers_b, dense_3_out_layers);
+    graph_guard(llm.get(), "dense_out");
 
     llm->res->set_outputs(params);
+    graph_guard(llm.get(), "outputs");
 
     return llm->res->get_gf();
 }
