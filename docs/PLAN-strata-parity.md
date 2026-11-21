@@ -100,3 +100,85 @@ próprio; o caminho é implementar os mecanismos no ggml.
 3. P3 → protótipo atrás de `--moe-cpu-compute`; aceite = hit rate baixo (< 50%) sem queda
    de decode vs upload, em A100-40G com IQ3_S.
 4. P4/P5 → por último; cada um com teste próprio e métrica no `/metrics`.
+
+## Status 2026-11-21 (fase 1/2)
+
+Estado no commit `128411b6f` da branch `feat/strata-parity`. A A100-40G está medindo
+performance; esta seção registra só o que já foi validado e não antecipa números.
+
+### Fase 1 — QSA esparsa com KV Q8_0 (implementada)
+
+- `src/llama-graph.cpp`: o corpo KV local, com `q8_0/q8_0`, sem tail e fora do KVarN,
+  passa a habilitar o caminho esparso e a propagar `n_kv_max`. Antes só F16 entrava;
+  `q8_0` caía na conversão densa para F16 e varria o KV inteiro.
+- `ggml/src/ggml-cuda/fattn.cu`: dispatch `q8_direct` restrito a D=256, `ncols2=8`,
+  Ampere+ e `ncols1=1|8`. O helper `ggml_cuda_flash_attn_ext_uses_sparse_q8` espelha o
+  switch de `ncols1`/`ncols2` no cálculo do buffer, para que os fallbacks densos
+  (`ncols1=2/4`, GQA desalinhado) mantenham o buffer de conversão F16.
+- `ggml/src/ggml-cuda/fattn-mma-f16.cuh`: o gather da linha esparsa dequantiza 8 valores
+  `q8_0` por chunk (`dequantize_V_q8_0<half, 8>`) direto para a tile, de forma síncrona
+  (sem `cp.async`); instanciado em D=256, `ncols1=1` e `8`, `ncols2=8`, Ampere+.
+
+**Teste**: 28/28 testes da matriz QSA em `test-backend-ops` passaram no CUDA local
+(RTX 4070, build sm_80), incluindo KV 4096/16384/32768, `nq` 1/5/512, `nq=2/3/4`,
+`nq=13`, sem máscara e tail 1–3. O caso GQA ratio 2 (rota densa, `ncols2=2`) foi
+validado separadamente, 1/1. A A100-40G está medindo a performance agora; sem números
+novos nesta nota.
+
+### Correção do baseline (`MEASURED.md`, 21/11)
+
+A tabela de 21/11 foi medida com **F16** (default), não `q8_0`; a recipe
+`a100-40g/qwen38-fn-q20-beellama` usa `q8_0`. O baseline `q8_0` medido na A100
+(`b2048/ub1024/cache6144`, 2 runs da sessão anterior):
+
+| métrica | valor |
+|---|---:|
+| decode curto | 54,09 t/s |
+| prefill 4k | 1.505,5 t/s |
+| prefill ~28k | 1.528,8 t/s |
+| decode pós-28k | 38,90 t/s |
+
+O baseline antigo de ~1.175 t/s (prefill) era `ub512`; não é comparável ao `ub1024`.
+
+### Fase 2 — MTP com sidecar (sem reconverter os 66 GB)
+
+O GGUF Q2_0 publicado não tem `blk.48.nextn.*`, então não há cabeça MTP no alvo. O sidecar
+pronto é `unsloth/Qwen3.8-Flash-Next-GGUF` →
+`MTP/mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf` (1.907.151.936 B, sha256
+`f521868a9e143718bef513772f6e04d9642551e362cf2439636d2abdbd149dfc`), carregado com
+`-md <sidecar> --spec-type draft-mtp` (o auto-discovery não varre `MTP/`, então `-md` é
+obrigatório).
+
+- O sidecar tem `compress_ratios[48]=0`; foi criado um patch de 1 byte `0→4` para o A/B.
+- O cache de experts compartilhado entre contextos foi **removido** da integração por
+  risco de corrida entre streams (não validado). Com `-md`, o draft não compartilha o
+  cache do alvo.
+- Sem números de MTP (aceitação/throughput) nesta nota.
+
+### Fase 0 — instrumentação (em preparação)
+
+`GGML_SCHED_SPLIT_TIMING`, `LLAMA_GRAPH_PREP_PROFILE`, `nsys` e o A/B `lazy on/off` estão
+sendo preparados. As fases 3 e 4 continuam **gated por evidência**; não há código novo
+delas nesta branch.
+
+### Build A100 (nota curta)
+
+O build CUDA de referência agora é feito na `.57` (gokaya) em chroot Ubuntu 24.04
+(glibc 2.39, OpenSSL 3.0, GCC 13.3), para casar com a VM. Binários linkados contra a
+glibc 2.43 do host não carregam na VM.
+
+```bash
+cmake -S <src> -B <build> -DGGML_CUDA=ON -DGGML_CUDA_FA=ON \
+  -DCMAKE_CUDA_ARCHITECTURES=80 -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined
+cmake --build <build> -j
+```
+
+- usar diretório de build **novo**; nunca empacotar zip de build incremental
+  (`docs/FN40-CRASH-ROOTCAUSE.md`);
+- o CMake 3.28 do Ubuntu 24.04 não adiciona o include do CCCL: passe
+  `-DCMAKE_CUDA_FLAGS=-I/opt/cuda/targets/x86_64-linux/include/cccl` e garanta que
+  `/usr/include/cccl` exista dentro do chroot (o toolkit do host aponta para lá);
+- `-Wl,--allow-shlib-undefined` porque o CUDA do chroot traz libcublas 13.8;
+- antes de subir o zip, fazer o smoke de load com os dois headers + `truncate`
+  (mesmo doc).
