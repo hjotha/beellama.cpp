@@ -515,6 +515,29 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-dflash-pipeline-candidate.cpp)
     llama_build_and_test(test-dflash-shadow-observation.cpp)
     llama_build_and_test(test-dflash-proposal.cpp)
+
+    # Tiny Qwen4Exp (hc=4) target + DFlash2 drafter: pins the target-feature
+    # capture to the HC stream mean on the completed layer and exercises the
+    # prefill/decode/two-seq/rollback and common_speculative handoff paths.
+    if (Python3_Interpreter_FOUND)
+        set(QWEN4EXP_DFLASH_FIXTURE_DIR "${CMAKE_CURRENT_BINARY_DIR}/qwen4exp-dflash-fixture")
+        file(MAKE_DIRECTORY "${QWEN4EXP_DFLASH_FIXTURE_DIR}")
+        add_test(
+            NAME generate-qwen4exp-dflash-fixture
+            COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/gen-tiny-qwen4exp-hc.py
+                "${QWEN4EXP_DFLASH_FIXTURE_DIR}")
+        set_tests_properties(generate-qwen4exp-dflash-fixture PROPERTIES
+            LABELS "main model"
+            ENVIRONMENT "PYTHONPATH=${PROJECT_SOURCE_DIR}/gguf-py"
+            FIXTURES_SETUP qwen4exp-dflash-fixture)
+        llama_build_and_test(test-qwen4exp-dflash-capture.cpp ARGS
+            "${QWEN4EXP_DFLASH_FIXTURE_DIR}/qwen4exp-hc-target.gguf"
+            "${QWEN4EXP_DFLASH_FIXTURE_DIR}/dflash2-draft.gguf")
+        target_include_directories(test-qwen4exp-dflash-capture PRIVATE ${PROJECT_SOURCE_DIR}/src)
+        set_tests_properties(test-qwen4exp-dflash-capture PROPERTIES
+            FIXTURES_REQUIRED qwen4exp-dflash-fixture)
+    endif()
+
     llama_build_and_test(test-reasoning-budget.cpp  LABEL behavior)
     llama_build_and_test(test-grammar-parser.cpp  LABEL behavior  LINK llama)
     llama_build_and_test(test-grammar-integration.cpp  LABEL behavior)
