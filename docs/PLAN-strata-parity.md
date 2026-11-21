@@ -211,3 +211,18 @@ cmake --build <build> -j
 - `-Wl,--allow-shlib-undefined` porque o CUDA do chroot traz libcublas 13.8;
 - antes de subir o zip, fazer o smoke de load com os dois headers + `truncate`
   (mesmo doc).
+
+## Revisão do plano Kimi (Codex, 2026-11-21)
+
+Veredito: o plano segue útil como diagnóstico e controle de regressão, mas a ordem de implementação
+mudou. Relatório completo em `docs/agent-reports/kimi-plan-review-20261121.md`.
+
+1. **Prefill 28k primeiro**: parear `LLAMA_MOE_CACHE_PREFILL=0/1` sem MTP, Q8/Q8, cache fixo 6144,
+   b2048/ub1024, `-ncmoe 2`, mmap/lazy on; confirmar 100% dos slots, o log de lote grande, H2D
+   frio/repetido, +10% de pp28k e decode pós-28k ≥97% do braço pareado.
+2. **Overlap depois**: `LLAMA_MOE_UPLOAD_OVERLAP=0/1` com cache 1024 (misses) e 6144 + prefill
+   (residente), medindo H2D por stream e espera de evento separadamente do throughput, graphs on/off.
+3. **Decode**: repetir QSA e MTP em braços pareados; isolar `LLAMA_MTP_RESERVE_WEIGHTS` e
+   `LLAMA_MTP_KV_STORE_ONLY`; manter o sidecar original e n-max 2.
+4. **Fora da fila imediata**: port Q8, reformulação GDN, MTP embutido neste GGUF, n-max 4, patch
+   ratio 4, cache compartilhado do draft, CPU no miss e prefetch SLRU. DFlash2 fica em trilha separada.
