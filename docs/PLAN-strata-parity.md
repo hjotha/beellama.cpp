@@ -264,3 +264,42 @@ A Strata pré-compilada subiu de 2.394,7 para 4.629,3 t/s entre 4k e 28k com `--
 - **Prefetch SLRU especulativo ou CPU no miss.** O stream longo da Strata pode antecipar uma lista conhecida ou podá-la depois do router. O router de outra camada não prevê os IDs daqui. Uma nova partição CPU/GPU depende de misses residuais e de vantagem medida sobre upload + GPU.
 - **Trocar a matemática do score ou do scan por hipótese.** TF32 compensado, indexer em dois passes, heurísticas que descartam experts e reformulação de GDN ficam fora do primeiro teste. Preservar seleção e estado torna possível atribuir ganhos às mudanças de tráfego.
 - **Misturar DFlash2 ao A/B MTP.** Manter a trilha DFlash2 separada. O sidecar Q4_K_M original e n-max 2 são o caminho medido. As variantes n-max 4 e ratio alterado falharam.
+
+## A/B das flags na A100-40G (2026-11-21)
+
+Engine `parity5` (`feat/strata-opt` @ `f5b72f42a`), 2 runs por config, Q2_0, Q8_0/Q8_0,
+b2048/ub1024, `-ncmoe 2`, cache 6144 MiB salvo indicação.
+
+| config | short tg | pp4k | pp28k | decode 28k |
+|---|---:|---:|---:|---:|
+| base-q8 (release) | 48,3* | 1.410,8 | 1.511,3 | 39,63 |
+| p0, prefill off | 56,34 | 1.486,1 | 1.514,0 | 43,55 |
+| p1, `LLAMA_MOE_CACHE_PREFILL=1` | 56,76 | 1.556,8 | **1.567,4** | 44,11 |
+| m1, p1 + `LLAMA_MOE_MAP_DEVICE=1` | **59,72** | 1.565,4 | 1.574,0 | 44,40 |
+| MTP, `LLAMA_MTP_RESERVE_WEIGHTS=0` | 55,58 | 1.231,3 | 1.292,2 | 53,14 |
+| MTP, `LLAMA_MTP_RESERVE_WEIGHTS=1` | **59,95** | 1.234,6 | 1.292,3 | **57,70** |
+| MTP, reserve 1 + store-only | 56,80 | 1.241,9 | 1.311,6 | 58,53 |
+| overlap + ring 0/1 (cache 1024) | 56,6–56,8 | 1.500–1.502 | 1.536–1.538 | ~44,1 |
+| QSA indexer bounds 0/1 | 59,8/59,8 | 1.564/1.580 | 1.573/1.568 | 44,4/44,3 |
+| GDN conv+L2 0/1 | 59,6/60,6 | 1.564/1.567 | 1.573/1.576 | 44,3/44,3 |
+
+\* short da base pegou a primeira execução fria; a segunda foi 56,9.
+
+**Veredito**
+- `LLAMA_MOE_CACHE_PREFILL`: **+3,5%** em 28k, +4,8% em 4k, decode estável. Real, mas abaixo do
+  limiar de +10% do experimento: com `-ncmoe 2` só duas camadas (~1,5 GB) estão no host. A recipe
+  base passa a habilitar a flag.
+- `LLAMA_MOE_MAP_DEVICE`: +0,4% prefill, **+5,2% no decode curto**, +0,7% em 28k. Marginal; fica
+  desligado nas recipes.
+- `LLAMA_MTP_RESERVE_WEIGHTS`: **+8,6% no decode 28k** (53,14 → 57,70) e +7,9% no curto. A recipe
+  MTP habilita.
+- `LLAMA_MTP_KV_STORE_ONLY`: +1% (ruído); desligado.
+- `LLAMA_MOE_UPLOAD_OVERLAP`/`LLAMA_MOE_PINNED_RING`: sem efeito mensurável com cache 1024.
+- `LLAMA_QSA_INDEXER_BOUNDS` e `LLAMA_GDN_CONV_L2`: sem efeito mensurável no Flash-Next.
+- MTP vs sem spec: decode **+31%** em 28k, **+37%** em 4k, curto +5,6%; prefill **-17%**.
+  VRAM 39.052 MiB pronto / 39.740 pico.
+
+A lacuna de prefill para a Strata (4.629 vs 1.567) **não** é explicada pelo H2D das duas camadas
+host nem por essas flags. O próximo passo é atribuição por nsys/scheduler
+(`GGML_SCHED_SPLIT_TIMING`, `LLAMA_GRAPH_PREP_PROFILE`), não mais flags default-off. Recipes usam
+o zip `parity5`; a base com `LLAMA_MOE_CACHE_PREFILL=1` e a MTP com `LLAMA_MTP_RESERVE_WEIGHTS=1`.
