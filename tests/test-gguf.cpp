@@ -455,8 +455,8 @@ static FILE * get_handcrafted_file(const unsigned int seed, const enum handcraft
         }
 
         {
-            const int32_t wire_type = type == GGML_TYPE_F8_E4M3 ? 43 : type == GGML_TYPE_Q6_0 ? 144 : int32_t(type);
-            // GGML_TYPE_COUNT (144) is a valid private Q6_0 wire ID.
+            const int32_t wire_type = type == GGML_TYPE_F8_E4M3 ? 43 :
+                    type == GGML_TYPE_Q6_0 ? 144 : type == GGML_TYPE_SAW_INT4 ? 147 : int32_t(type);
             const int32_t type32 = hft == HANDCRAFTED_TENSORS_BAD_TYPE ? INT32_MAX : wire_type;
             helper_write(file, type32);
         }
@@ -1488,7 +1488,7 @@ static bool test_tensor_wire_types() {
     }
 
     // Exercise both directions explicitly, including raw writer wire IDs.
-    for (ggml_type type : { GGML_TYPE_F8_E4M3, GGML_TYPE_Q6_0 }) {
+    for (ggml_type type : { GGML_TYPE_F8_E4M3, GGML_TYPE_Q6_0, GGML_TYPE_SAW_INT4 }) {
         ggml_context * original = ggml_init({ 4096, nullptr, false });
         GGML_ASSERT(original);
         ggml_tensor * tensor = ggml_new_tensor_1d(original, type,
@@ -1510,7 +1510,7 @@ static bool test_tensor_wire_types() {
         GGML_ASSERT(fseek(file, type_offset, SEEK_SET) == 0);
         uint32_t wire_type = 0;
         GGML_ASSERT(fread(&wire_type, sizeof(wire_type), 1, file) == 1);
-        GGML_ASSERT(wire_type == (type == GGML_TYPE_F8_E4M3 ? 43u : 144u));
+        GGML_ASSERT(wire_type == (type == GGML_TYPE_F8_E4M3 ? 43u : type == GGML_TYPE_Q6_0 ? 144u : 147u));
         rewind(file);
         ggml_context * restored = nullptr;
         gguf_context * input = gguf_init_from_file_ptr(file, { false, &restored });

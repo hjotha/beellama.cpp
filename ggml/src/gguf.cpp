@@ -24,11 +24,13 @@
 // Upstream FP8 owns wire 43; Bee's cache-only Q6_0 keeps internal enum 43
 // and uses private wire 144 for GGUF roundtrips. Old ambiguous Q6_0 weight
 // files using wire 43 are not an advertised format and cannot be detected
-// safely. Private PQ2_0/PTQ1_0 wire IDs 142/143 remain unchanged.
+// safely. SAW_INT4 uses private wire 147 because its internal enum is 144.
+// Private PQ2_0/PTQ1_0 wire IDs 142/143 remain unchanged.
 static ggml_type gguf_type_from_wire(int32_t type) {
     switch (type) {
         case 43:  return GGML_TYPE_F8_E4M3;
         case 144: return GGML_TYPE_Q6_0;
+        case 147: return GGML_TYPE_SAW_INT4;
         // Internal FP8 ID 49 is not a GGUF wire ID.
         case GGML_TYPE_F8_E4M3: return GGML_TYPE_COUNT;
         default: return static_cast<ggml_type>(type);
@@ -39,6 +41,7 @@ static int32_t gguf_type_to_wire(ggml_type type) {
     switch (type) {
         case GGML_TYPE_F8_E4M3: return 43;
         case GGML_TYPE_Q6_0:   return 144;
+        case GGML_TYPE_SAW_INT4: return 147;
         default: return static_cast<int32_t>(type);
     }
 }
