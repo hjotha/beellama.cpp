@@ -650,6 +650,10 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         add_test(NAME test-strata-trace
             COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-strata-trace.py $<TARGET_FILE:test-llama-archs>)
         set_property(TEST test-strata-trace PROPERTY LABELS main)
+        add_test(NAME test-strata-prefill
+            COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-strata-prefill.py
+                $<TARGET_FILE:test-llama-archs> ${PROJECT_SOURCE_DIR}/scripts/strata-prefill-profile.py)
+        set_property(TEST test-strata-prefill PROPERTY LABELS main)
     endif()
 
     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")

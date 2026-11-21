@@ -75,6 +75,12 @@ static inline ggml_tensor * llama_mul_mat_hadamard(
 }
 
 // Prefetch the host pages needed to gather these rows.
+bool llama_prefill_profile_enabled();
+
+struct llama_model;
+struct llama_ubatch;
+void llama_qwen4exp_prefetch_next_ple(const llama_model & model, const llama_ubatch & ubatch);
+
 void llama_prefetch_rows(const ggml_tensor * tensor, const int32_t * rows, size_t n_rows);
 
 struct time_meas {

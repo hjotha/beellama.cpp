@@ -1520,6 +1520,81 @@ static std::vector<float> kvarn_restore_decode(
     return result;
 }
 
+static int test_ple_prefetch(const size_t seed, const std::string & path) {
+    auto gguf = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+    tensor_data_params data = { seed, 0.1f };
+    auto mp = llama_model_default_params();
+    ggml_backend_dev_t devices[] = { ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU), nullptr };
+    mp.devices = devices;
+    mp.progress_callback = silent_model_load_progress;
+    {
+        llama_model_ptr model(llama_model_init_from_user(gguf.get(), set_tensor_data, &data, mp));
+        if (!model) throw std::runtime_error("failed to create PLE fixture");
+        llama_model_save_to_file(model.get(), path.c_str());
+    }
+
+    auto tokens = get_tokens(41, 128, seed + 1);
+    tokens[20] = 0; // EOS in the lookahead window
+    std::vector<float> reference;
+    std::vector<float> gapped_reference;
+    for (auto mode : { LLAMA_LAZY_MODE_OFF, LLAMA_LAZY_MODE_ON }) {
+        mp.load_mode = LLAMA_LOAD_MODE_MMAP;
+        mp.lazy_mode = mode;
+        llama_model_ptr model(llama_model_load_from_file(path.c_str(), mp));
+        if (!model) throw std::runtime_error("failed to load PLE fixture");
+        auto cp = llama_context_default_params();
+        cp.n_ctx = 512;
+        cp.n_batch = 64;
+        cp.n_ubatch = 16;
+        cp.n_threads = cp.n_threads_batch = 2;
+        cp.offload_kqv = false;
+        cp.type_k = cp.type_v = GGML_TYPE_Q8_0;
+        llama_context_ptr ctx(llama_init_from_model(model.get(), cp));
+        if (!ctx) throw std::runtime_error("failed to create PLE context");
+        kvarn_restore_decode(ctx.get(), get_tokens(8, 128, seed + 2), 0, 0);
+        std::vector<uint8_t> snapshot(llama_state_get_size(ctx.get()));
+        if (snapshot.empty() || llama_state_get_data(ctx.get(), snapshot.data(), snapshot.size()) != snapshot.size()) {
+            throw std::runtime_error("failed to save PLE prefix");
+        }
+        const auto logits = kvarn_restore_decode(ctx.get(), tokens, 8, 0);
+        if (llama_state_set_data(ctx.get(), snapshot.data(), snapshot.size()) != snapshot.size()) {
+            throw std::runtime_error("failed to restore PLE prefix");
+        }
+        const auto replay = kvarn_restore_decode(ctx.get(), tokens, 8, 0);
+        if (!(nmse(logits, replay) <= 1e-6) || !std::all_of(replay.begin(), replay.end(), [](float x) { return std::isfinite(x); })) {
+            throw std::runtime_error("PLE prefill diverged after rollback");
+        }
+        if (mode == LLAMA_LAZY_MODE_OFF) {
+            reference = logits;
+        } else if (!(nmse(reference, logits) <= 1e-6)) {
+            throw std::runtime_error("lazy PLE prefill diverged from eager load");
+        }
+
+        // Bypass the lookahead for the gapped second ubatch. The ordinary input
+        // resolver must still supply valid rows from the committed history.
+        if (llama_state_set_data(ctx.get(), snapshot.data(), snapshot.size()) != snapshot.size()) {
+            throw std::runtime_error("failed to restore PLE prefix for gapped ubatch");
+        }
+        common_batch gapped(ctx.get());
+        for (size_t i = 0; i < 32; ++i) {
+            gapped.add(tokens[i], 80 + i + (i >= 17 ? 1 : 0), 0, true);
+        }
+        if (llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, gapped.get()) != 0) {
+            throw std::runtime_error("gapped PLE decode failed");
+        }
+        const auto * row = llama_get_logits_ith(ctx.get(), 31);
+        if (!row || !std::all_of(row, row + 128, [](float x) { return std::isfinite(x); })) {
+            throw std::runtime_error("gapped PLE produced invalid logits");
+        }
+        if (mode == LLAMA_LAZY_MODE_OFF) {
+            gapped_reference.assign(row, row + 128);
+        } else if (!(nmse(gapped_reference, std::vector<float>(row, row + 128)) <= 1e-6)) {
+            throw std::runtime_error("gapped lazy PLE diverged from eager load");
+        }
+    }
+    return 0;
+}
+
 // QSA can elide the ordinary mask, but exact-tail planning still needs it.
 static int test_qsa_exact_tail(const size_t seed) {
     auto gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
@@ -2434,6 +2509,7 @@ int main(int argc, char ** argv) {
     bool test_qwen4exp_mtp = false;
     bool test_kvarn_restore = false;
     bool test_qsa_tail = false;
+    std::string test_ple_path;
 #endif
 
     for (int i = 1; i < argc; i++) {
@@ -2513,6 +2589,8 @@ int main(int argc, char ** argv) {
             test_qwen4exp_mtp = true;
         } else if (strcmp(argv[i], "--test-kvarn-state-restore") == 0) {
             test_kvarn_restore = true;
+        } else if (strcmp(argv[i], "--test-ple-prefetch") == 0 && i + 1 < argc) {
+            test_ple_path = argv[++i];
         } else if (strcmp(argv[i], "--test-qsa-exact-tail") == 0) {
             test_qsa_tail = true;
 #endif
@@ -2552,6 +2630,9 @@ int main(int argc, char ** argv) {
         }
         if (test_qsa_tail) {
             return test_qsa_exact_tail(seed);
+        }
+        if (!test_ple_path.empty()) {
+            return test_ple_prefetch(seed, test_ple_path);
         }
 #endif
         if (!out.empty()) {

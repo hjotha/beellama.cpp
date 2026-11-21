@@ -9,6 +9,7 @@
 #include <cinttypes>
 #include <climits>
 #include <cstdarg>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -18,6 +19,14 @@ struct llama_logger_state {
 };
 
 static llama_logger_state g_logger_state;
+
+bool llama_prefill_profile_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("LLAMA_PREFILL_PROFILE");
+        return env && std::strcmp(env, "1") == 0;
+    }();
+    return enabled;
+}
 
 void llama_prefetch_rows(const ggml_tensor * tensor, const int32_t * rows, size_t n_rows) {
     if (!tensor || !tensor->data || !tensor->buffer || !ggml_backend_buffer_is_host(tensor->buffer) || n_rows == 0) {

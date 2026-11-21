@@ -423,6 +423,8 @@ extern "C" {
     GGML_API bool                 ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph); // returns success
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
+    // Submit unchanged splits and report host timing, node inventory and staged copies.
+    GGML_API enum ggml_status     ggml_backend_sched_graph_compute_profile(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
 
     // Reset all assignments and allocators - must be called before changing the node backends or allocating a new graph.

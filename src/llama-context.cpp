@@ -3166,7 +3166,12 @@ void llama_context::synchronize() {
         return;
     }
 
+    const auto sync_start = llama_prefill_profile_enabled() && !cparams.warmup && n_queued_tokens > 3 ? ggml_time_us() : 0;
     ggml_backend_sched_synchronize(sched.get());
+    if (sync_start) {
+        LLAMA_LOG_INFO("[PREFILL SYNC] start_us=%" PRId64 " wait_us=%" PRId64 " queued=%" PRId64 " ctx=%d\n",
+                sync_start, ggml_time_us() - sync_start, int64_t(n_queued_tokens), int(cparams.ctx_type));
+    }
     outputs_synced = true;
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
@@ -4526,10 +4531,13 @@ static bool llama_prefill_reference_attention_supported(const ggml_tensor * t, u
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
-    static const bool profile_prep = [] {
+    static const bool legacy_profile_prep = [] {
         const char * value = std::getenv("LLAMA_GRAPH_PREP_PROFILE");
         return value && std::strcmp(value, "0") != 0;
     }();
+    const bool prefill_profile = llama_prefill_profile_enabled() && !cparams.warmup &&
+        gtype != LLM_GRAPH_TYPE_ENCODER && ubatch.n_tokens > 3;
+    const bool profile_prep = legacy_profile_prep || prefill_profile;
     const int64_t prep_start = profile_prep ? ggml_time_us() : 0;
     llama_memory_context_finish_guard memory_finish_guard(mctx);
     if (backend_remote && cparams.remote_attn_position_split && cparams.n_seq_max > 1 && ubatch.n_tokens > 0 &&
@@ -4648,7 +4656,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
-    if (profile_prep) {
+    if (prefill_profile) {
+        LLAMA_LOG_INFO("[PREFILL PREP] start_us=%" PRId64 " nq=%u ctx=%d outputs=%d nextn=%d reused=%d "
+                       "prep_us=%" PRId64 " inputs_host_us=%" PRId64 "\n",
+                prep_start, ubatch.n_tokens, int(cparams.ctx_type), n_outputs, int(cparams.embeddings_nextn), int(reused),
+                prep_allocated - prep_start, ggml_time_us() - prep_allocated);
+    }
+    if (legacy_profile_prep) {
         fprintf(stderr, "[GRAPHPREP] start_us=%lld nq=%u reused=%d apply_ms=%.3f check_ms=%.3f reset_ms=%.3f build_ms=%.3f alloc_ms=%.3f inputs_ms=%.3f\n",
                 (long long) prep_start, ubatch.n_tokens, int(reused),
                 (prep_applied - prep_start)/1000.0, (prep_checked - prep_applied)/1000.0,
@@ -4709,7 +4723,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return env && std::strcmp(env, "1") == 0 && ggml_remote_attn_trace_enabled();
     }();
     const int64_t verify_begin = verify_trace && ubatch.n_tokens <= 3 ? ggml_time_us() : 0;
-    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1, prefill_profile);
     if (verify_begin) {
         // The scheduler starts the graph_run during submission. Its CUDA splits share that ID.
         auto e = ggml_remote_attn_trace_identity("strata_verify_ubatch", nullptr);
@@ -5302,6 +5316,14 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
 
+    static const bool ple_prefetch = [] {
+        const char * env = std::getenv("LLAMA_PLE_PREFETCH");
+        return env && std::strcmp(env, "1") == 0;
+    }();
+    const auto * ple_memory = ple_prefetch && model.arch == LLM_ARCH_QWEN4EXP &&
+            cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP && model.can_prefetch.count(model.per_layer_tok_embd) ?
+        dynamic_cast<const llama_memory_hybrid_context *>(mctx.get()) : nullptr;
+
     bool has_next_ubatch = false;
 
     do {
@@ -5529,8 +5551,16 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
                 const bool trace = llama_mtp_hidden_trace_enabled();
-                const int64_t start = trace ? ggml_time_us() : 0;
-                ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
+                const bool profile = llama_prefill_profile_enabled() && !cparams.warmup && ubatch.n_tokens > 3;
+                const auto bytes = n_rows*n_embd*sizeof(float);
+                const int64_t start = trace || profile ? ggml_time_us() : 0;
+                ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, bytes);
+                if (profile) {
+                    LLAMA_LOG_INFO("[PREFILL NEXTN] start_us=%" PRId64 " submit_host_us=%" PRId64
+                                   " nq=%u rows=%" PRId64 " bytes=%zu ctx=%d host=%d\n",
+                            start, ggml_time_us() - start, ubatch.n_tokens, n_rows, bytes, int(cparams.ctx_type),
+                            int(ggml_backend_buffer_is_host(t_h_nextn->buffer)));
+                }
                 if (trace) {
                     auto e = ggml_remote_attn_trace_identity("strata_nextn_read", t_h_nextn);
                     e.begin_us = start;
@@ -5567,6 +5597,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
+
+        if (ple_memory) {
+            if (const auto * next = ple_memory->peek_next_ubatch()) {
+                llama_qwen4exp_prefetch_next_ple(model, *next);
+            }
+        }
 
         has_next_ubatch = mctx->next();
 
@@ -6228,7 +6264,8 @@ void llama_context::sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph 
 
 ggml_status llama_context::graph_compute(
             ggml_cgraph * gf,
-                   bool   batched) {
+                   bool   batched,
+                   bool   profile) {
     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
 
@@ -6247,7 +6284,8 @@ ggml_status llama_context::graph_compute(
 
     copy_experts.reset();
 
-    auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
+    auto status = profile ? ggml_backend_sched_graph_compute_profile(sched.get(), gf) :
+        ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         // Finish writes into graph tensors before rollback or buffer reuse.
         ggml_backend_remote_attn_drain(backend_remote);
@@ -6288,10 +6326,22 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
     const int64_t n_expert    = src->ne[2];
     const size_t  expert_size = src->nb[2];
 
+    ggml_remote_attn_trace_scope bypass("strata_moe_bypass", src);
+    bypass.enabled &= llama_prefill_profile_enabled();
+    if (bypass.enabled) bypass.event.nq = ids->ne[1];
+
     if (ids != st.ids || (int64_t) st.used.size() != n_expert) {
         st.ids_data.resize(ggml_nbytes(ids)/sizeof(int32_t));
-        ggml_backend_tensor_get_async(backend, ids, st.ids_data.data(), 0, ggml_nbytes(ids));
-        ggml_backend_synchronize(backend);
+        {
+            ggml_remote_attn_trace_scope route("strata_moe_route", ids);
+            route.enabled &= bypass.enabled;
+            if (route.enabled) {
+                route.event.nq = ids->ne[1];
+                route.event.bytes = ggml_nbytes(ids);
+            }
+            ggml_backend_tensor_get_async(backend, ids, st.ids_data.data(), 0, ggml_nbytes(ids));
+            ggml_backend_synchronize(backend);
+        }
 
         st.used.assign(n_expert, false);
         for (int64_t i1 = 0; i1 < ids->ne[1]; i1++) {
@@ -6329,6 +6379,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
             if (next < e) {
                 upload.set(dst, (const uint8_t *) src->data + next*expert_size, next*expert_size, (e - next)*expert_size);
             }
+            if (bypass.enabled) bypass.event.bytes += n*expert_size; // resident D2D
             e   += n;
             next = e;
         }
