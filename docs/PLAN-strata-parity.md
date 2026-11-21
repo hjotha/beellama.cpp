@@ -65,7 +65,7 @@ residir).
    com `--no-moe-host-pinned`; decode 34,3/34,4/34,3 t/s vs 33,9/33,8/33,9 t/s
    (OLMoE-1B-7B q2_k, `-cmoe --moe-cache-mib 1024`, 4070) → **+1,5%**.
 3. **Limite**: o host buffer CUDA tem `max_size` de 4 GiB por alocação
-   (`ggml-cuda.cu:1681-1685`) e o loader aloca todos os experts num buffer só. Em modelos
+   (`ggml-cuda.cu:1688-1691`) e o loader aloca todos os experts num buffer só. Em modelos
    com >4 GiB de experts em host (Flash-Next no 40G: ~17 GiB) a alocação cai para pageable.
    Para pinar nessa escala é preciso uma arena em blocos (`cudaHostRegister` sobre ranges),
    que é o mesmo trabalho de P3/P4.
@@ -133,8 +133,9 @@ validado separadamente, 1/1.
 
 - Prefill em 28k: **+0,2%** (dentro do ruído); decode após 28k: **+9,9%**.
 - O alvo de **+25% no prefill longo não foi atingido**. O cache de experts é bypassado
-  em lotes > 32 tokens, então o prefill de 28k envia ~39,7 GB de experts do host; esse
-  H2D domina o custo e mascara o ganho da atenção esparsa.
+  em lotes > 32 tokens nesse benchmark. O volume de referência é ~39,7 GB de
+  experts enviados no prefill de 28k. O A/B de residência e o trace devem medir quanto
+  desse H2D fica no caminho crítico.
 
 ### Correção do baseline (`MEASURED.md`, 21/11)
 
@@ -175,7 +176,8 @@ obrigatório).
 
 - Decode: **+33%** após 4k e **+49%** após 28k; curto 53,96 (sem ganho).
 - Prefill: **-17% / -15%** — o alvo calcula o hidden NextN de todos os tokens do prompt
-  para o draft fazer o catch-up uma vez; esse é o custo.
+  para o catch-up do draft. O custo de extração, transferência, execução e espera ainda
+  precisa ser separado em braços com orçamento de cache pareado.
 - Cache fixo 2048/4096 = 40.404 MiB e OOM no primeiro request; n-max 4 falha no load;
   auto + reserve 4096 funciona em 39.052 MiB.
 - A recipe fica `experimental` até o caminho da recipe (zip clean) ser verificado; os
@@ -226,3 +228,39 @@ mudou. Relatório completo em `docs/agent-reports/kimi-plan-review-20261121.md`.
    `LLAMA_MTP_KV_STORE_ONLY`; manter o sidecar original e n-max 2.
 4. **Fora da fila imediata**: port Q8, reformulação GDN, MTP embutido neste GGUF, n-max 4, patch
    ratio 4, cache compartilhado do draft, CPU no miss e prefetch SLRU. DFlash2 fica em trilha separada.
+
+## Oportunidades adicionais (Strata × beellama, 2026-11-21)
+
+Manter a sequência revisada. Primeiro confirmar a residência de experts no prefill de 28k. Depois medir o overlap com misses residuais. Parear o MTP antes de otimizar o caminho especulativo. As propostas novas entram quando o perfil mostrar custo residual. A [revisão de código](agent-reports/strata-code-review-20261121.md) traz as referências em Strata `3142b66` e Bee `3d0f99732`, além das diferenças entre o benchmark e o clone.
+
+A Strata pré-compilada subiu de 2.394,7 para 4.629,3 t/s entre 4k e 28k com `--prefill auto`, INT8 e cache de experts de 24.576 slots reportados. No Bee com QSA Q8_0, foram 1.485,8 e 1.516,4 t/s com b2048/ub1024. Chunks maiores, reaproveitamento de pesos e agrupamento de experts são hipóteses verificáveis para a escala da Strata. O binário histórico não tem trace de dispatch disponível. Em decode, os 85,9/67,4/75,0 t/s da Strata incluem uma configuração com DFlash2. Os 58,86 t/s do Bee MTP pós-28k vieram de uma execução separada com auto-cache e reserva de 4096 MiB. A comparação ainda mistura estratégias especulativas e orçamentos.
+
+**Protocolo dos próximos A/B.** Usar a mesma revisão e GPU, os mesmos dois shards, prompts e tokens reais, contexto 32768, Q8/Q8, b2048/ub1024, `-ncmoe 2`, mmap/lazy on, greedy e `cache_prompt=false`. Para os itens de prefill, começar sem MTP. Rodar pelo menos três pares alternados com profiler desligado para throughput, e sessões separadas com trace para atribuição. Registrar bytes e tempo descoberto de H2D/D2H por fase e camada, primeiro pedido e repetição, TTFT, pico em MiB e flags/placement efetivos. Para aceitar uma otimização nova, exigir que a métrica do item melhore além da dispersão dos pares, pp4k/pp28k e decode curto/longo ≥97% nos casos fora do alvo, nenhum OOM e correção conforme a fixture indicada. S, M e L são ordens de esforço. Ganhos descritos são mecanismos ou metas de aceite para A/B futuro.
+
+### Prefill
+
+| Prioridade | Oportunidade e status | Evidência | Ganho esperado | Esforço | Risco | Teste e aceite |
+|---|---|---|---|---|---|---|
+| 1 | Residência de experts no pp28k · coberto, implementado sob flag | ~39,7 GB de H2D de referência. Bee `src/llama-moe-cache.cpp:495`. Strata exclui residentes da lista em `engine/src/prefill/prefill.cpp:4622`. | Remover fills recorrentes em grupos completos. | S | Capacidade/padding do banco, mudança no grafo. | `LLAMA_MOE_CACHE_PREFILL=0/1`, cache fixo 6144, verificar 100% dos slots, log de lote grande, primeira carga de até um working set e H2D de pesos próximo de zero nas repetições para os grupos integrais. Exigir pp28k ≥110% e decode pós-28k ≥97%. Exercitar ub32/33, grupo parcial e NMSE ≤1e-4 na fixture. |
+| 2 | Overlap de upload · coberto, implementado sob flag. Staging pinned limitado · novo, condicionado | Strata ring + thread emissora `engine/src/prefill/prefill.cpp:4660,4683`. Bee H2D direto e espera por split em `ggml/src/ggml-cuda/ggml-cuda.cu:3524`, host buffer com teto em `:1688`. | Recuperar apenas espera de cópia descoberta e bloqueio de submissão. | S para o A/B, M para staging | Reuso antes do DMA, RAM pinned e graphs. | Parear `LLAMA_MOE_UPLOAD_OVERLAP=0/1` com 1024 MiB e misses, mais controle residente 6144, graphs on/off. Exigir sobreposição no trace ou ≥3% nas medianas com misses. Se pageable ainda bloquear a submissão, testar ring pequeno com o mesmo volume transferido, menos tempo descoberto e pp28k acima do ruído. Testar wrap e fallback pageable. |
+| 3 | Mapa imutável para grupo integral · novo | Strata agrupa com endereços conhecidos em `engine/src/prefill/prefill.cpp:5592,5712`. Callback Bee ainda baixa IDs, sincroniza e sobe o mapa com todos os experts residentes (`src/llama-moe-cache.cpp:588,624`). | Remover ida ao host por camada no quente. Reutiliza o banco e MMQ atuais. | M | Publicação prematura, lookup obsoleto e bind de graph. | Preencher e publicar pesos/mapa uma vez no device para grupos completos. Comparar cache já aquecido com callback atual. Exigir zero D2H/sync de roteamento e zero H2D recorrente de pesos nesses grupos, mesmos IDs/logits greedy na fixture e pp28k acima da dispersão. Registrar tempo/VRAM adicionais a frio. |
+| 4 · se MMID aparecer no trace | Reusar agrupamento e entrada MMQ entre projeções compatíveis · novo | Strata agrupa no GPU e prepara entrada conjunta (`engine/src/prefill/moe_fused.cu:744`, `engine/src/prefill/prefill.cpp:6322`, trecho MMQ legado). Bee já deduplica por token dentro de cada chamada (`ggml/src/ggml-cuda/mmq.cu:393`) e suporta gate/up empacotado (`src/models/qwen4exp.cpp:1312`). | Menos agrupamentos e quantizações repetidas. | M | Strides, tipo, padding e ordem das linhas. | Identificar primeiro os tipos e as projeções realmente separadas no GGUF. Reusar mapa e Q8 de gate/up de layout igual. Para down, reusar só ordenação onde compatível. Testar roteamento uniforme e enviesado, grupo frio/quente. Exigir menos launches/tempo de preparo, pp28k acima do ruído e paridade de IDs e NMSE na fixture MoE. |
+| 4 · se indexer aparecer no trace | Limites de visibilidade compactos no indexer · novo | Strata limita o score por sub-batelada (`engine/src/prefill/prefill.cpp:5299`). Bee já calcula `[p0,p0+nv)` e expande máscara de pools (`src/llama-memory-hybrid-idx.cpp:1031`), com scorer tiled de quatro cabeças (`ggml/src/ggml-cuda/lightning-indexer.cu:700`). | Menos preenchimento/upload da máscara e tiles totalmente inválidos. | M | Limites causais, padding ou sequência errados. | Carregar dois I32 por query na rota qualificada e preservar a aritmética e -inf fora do intervalo. A/B em 4k/28k, prefixo e duas sequências. Exigir mesmos scores válidos/IDs, menos bytes H2D da máscara e menor tempo combinado de `set_input` + indexer. Comparar pp28k e exigir pico de VRAM ≤ controle. |
+| 4 · se máscara/FA aparecer no trace | IDs de QSA direto à FA · novo. Gather esparso Q8 já implementado | Strata fornece `sel_ids` à atenção (`engine/src/prefill/prefill.cpp:5320,5485`). Bee expande seleção em máscara e a varre para compactar por tile (`src/models/qwen4exp.cpp:994`, `ggml/src/ggml-cuda/fattn.cu:14`). | Menos trânsito de máscara densa e um passo de compactação mais curto. | L | Visibilidade por query, overflow da união, cauda e fallback. | Rota inicial CUDA Q8 local sm80, sem KVarN nem tail KV explícita. Emitir IDs/contagem e pertinência por query para tiles 1/8. Exigir os mesmos conjuntos válidos por query, fallback no overflow e NMSE da matriz QSA em KV 4k/16k/32k, incluindo cauda incompleta, GQA fallback e duas sequências. Medir menos bytes/tempo de seleção→FA e pico ≤ controle. |
+| 4 · se preparação GDN aparecer no trace | Fundir L2 de Q/K no conv+SiLU · novo detalhe da investigação GDN já prevista | Strata CONV-L2 (`engine/src/prefill/kernels.cu:3001`). Bee conv+SiLU já fundidos (`ggml/src/ggml-cuda/ggml-cuda.cu:5931`), L2 separado (`src/models/qwen4exp.cpp:1281`), scan MMA disponível. | Eliminar materializações e launches de L2 de Q/K. | M | Arredondamento e estado recorrente. | Isolar epílogo mantendo V/estado/dispatch. Comparar split de ubatches, duas sequências, rollback e replay. Exigir estado/logits dentro da tolerância das fixtures GDN e `GATED_DELTA_NET_CACHE_FUSION` de `test-backend-ops`, menor tempo/bytes na preparação e pp28k fora da dispersão. |
+
+### Decode
+
+| Prioridade | Oportunidade e status | Evidência | Ganho esperado | Esforço | Risco | Teste e aceite |
+|---|---|---|---|---|---|---|
+| 3 · após o A/B de overlap | MTP sidecar n-max 2 pareado · coberto, reserva e store-only implementados sob flags | 80,7%, 39.052 MiB e prefill −17%/−15% no ensaio isolado. Strata DFlash2 usa taps (`engine/src/program/generate.cpp:23190`). Bee catch-up (`common/speculative.cpp:4394`). | Confirmar ganho líquido de decode e localizar o custo de catch-up. | S | OOM, atribuir ganho ao draft quando placement/cache mudou. | Comparar sem spec e MTP com cache efetivo do alvo controlado, medindo placement, ubatch do draft e pico. No MTP isolar primeiro `LLAMA_MTP_RESERVE_WEIGHTS` e depois `LLAMA_MTP_KV_STORE_ONLY`. Exigir load/primeiro pedido sem OOM, saída greedy equivalente, ganho de decode além do ruído em 4k/28k e, para store-only, catch-up menor, aceitação ±1 p.p. e decode ≥97% do braço MTP completo. Aplicar o teto de 40,9 GB decimais do [A/B MTP](agent-reports/codex-rest-of-plan-20261121.md#ab-de-hardware), medido em pico e reportado também em MiB (~39.005 MiB). |
+| 5 · se houver lacunas de submissão | Estabilizar replay CUDA nas larguras reais de verificação · novo | Strata seleciona graph por largura (`engine/src/core/verify.cpp:3626`). Bee invalida por sync no MMID ou propriedades/pool (`ggml/src/ggml-cuda/ggml-cuda.cu:3729,6711`). | Menos launches e idle de host, se replay estiver sendo perdido. | M | Captura com parâmetros ou endereços obsoletos. | Separar métricas CUDA de `graphs reused` ggml. Em 1/2/3 linhas e curto/28k, parear graphs on/off e contar replay, capture e motivos de execução direta. Só alterar o motivo dominante. Exigir menos capturas ou gaps, menor p95 entre tokens, tokens iguais e stress de mudanças de forma/rollback sem replay obsoleto. |
+| 5 · se sobrar espera NextN | Hidden do MTP entre alvo e sidecar via D2D · novo | Strata MTP lê residuais no device (`engine/src/core/mtp.cpp:1648`). Bee extrai para host e reenvia estado (`src/llama-context.cpp:5485`, `src/llama-graph.cpp:325`). | Menos D2H/H2D e espera em catch-up e decode, se ambos os inputs estiverem no mesmo device. | L | Vida útil de buffers, carry, ordem por sequência e rollback. | Depois do store-only, medir bytes NextN e espera por fase. Prototipar staging D2D só no mesmo CUDA device e em sequência única contígua. Exigir remoção do tráfego host dessas linhas no trace, catch-up ou latência por rodada menor, logits/hidden dentro da tolerância de `test-mtp-qwen4exp-store-only`, carry e rollback/replay corretos, aceitação ±1 p.p. |
+
+### Não fazer agora
+
+- **Portar o motor, o KV INT8 ou o layer-major completo.** O KV usa outra representação. O escalonamento layer-major muda a vida de residuais e checkpoints. Primeiro testar chunks maiores no sweep já previsto com cache/placement pareados. Revisitar a reordenação apenas com H2D recorrente material em grupos parciais.
+- **Emprestar slots do cache ao scratch.** A Strata recarrega os slots antes da verificação. Medir a vida dos temporários de QSA/MMQ no alocador existente antes de introduzir refill no TTFT e movimentar endereços capturados.
+- **Prefetch SLRU especulativo ou CPU no miss.** O stream longo da Strata pode antecipar uma lista conhecida ou podá-la depois do router. O router de outra camada não prevê os IDs daqui. Uma nova partição CPU/GPU depende de misses residuais e de vantagem medida sobre upload + GPU.
+- **Trocar a matemática do score ou do scan por hipótese.** TF32 compensado, indexer em dois passes, heurísticas que descartam experts e reformulação de GDN ficam fora do primeiro teste. Preservar seleção e estado torna possível atribuir ganhos às mudanças de tráfego.
+- **Misturar DFlash2 ao A/B MTP.** Manter a trilha DFlash2 separada. O sidecar Q4_K_M original e n-max 2 são o caminho medido. As variantes n-max 4 e ratio alterado falharam.
