@@ -2827,6 +2827,20 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         // embd batches on an M-RoPE draft carry 4 position rows per token
         is_mrope = llama_model_rope_type(model_dft) == LLAMA_ROPE_TYPE_MROPE;
+        if (is_mrope) {
+            // batch_inject is a pure-embedding batch: llama_batch_compat reads
+            // n_pos_per_embd section-major positions per row, but llama_batch_init
+            // reserves only one. Without this the 4-row M-RoPE write below runs
+            // past the allocation and corrupts the heap.
+            std::free(batch_inject.pos);
+            batch_inject.pos = (llama_pos *) std::malloc(
+                    sizeof(llama_pos) * (size_t) llama_n_ubatch(ctx_dft) * GGML_MROPE_SECTIONS);
+            if (!batch_inject.pos) {
+                llama_batch_free(batch_inject);
+                batch_inject = {};
+                throw std::bad_alloc();
+            }
+        }
 
         smpls.resize(n_seq);
         for (auto & s : smpls) {
