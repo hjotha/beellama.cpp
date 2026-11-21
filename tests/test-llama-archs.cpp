@@ -531,8 +531,8 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         ms.add_kv(LLM_KV_PLE_HEAD_VOCAB_SIZES,        ple_head_vocab_sizes);
     }
 
-    // minimax-m3 keeps one indexer head per GQA head; the rest use a fixed 64 to match the fused
-    ms.add_kv(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT,   arch == LLM_ARCH_MINIMAX_M3 ? n_head : uint32_t(64));
+    const uint32_t indexer_heads = arch == LLM_ARCH_MINIMAX_M3 ? n_head : arch == LLM_ARCH_QWEN4EXP ? 4 : 64;
+    ms.add_kv(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, indexer_heads);
     // qwen4exp ropes indexer keys with the main rotary width, so its head can't be < n_rot
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH,
               arch == LLM_ARCH_QWEN4EXP ? n_embd_head : uint32_t(128));
@@ -765,8 +765,8 @@ static std::string get_tmp_gguf_path() {
 static llama_model_ptr get_model(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const float stdev,
         const std::vector<ggml_backend_dev_t> & devs,
-        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false,
-        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, const size_t moe_cache_size = 0, bool load_mtp = false) {
+        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER,
+        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, bool load_mtp = false) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
@@ -802,9 +802,11 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         ctx_params.n_ubatch = 64;
     }
     if (moe_cache_size > 0) {
-        // the MoE cache is only used for small ubatches
         ctx_params.moe_cache_size = moe_cache_size;
-        ctx_params.n_ubatch = 2;
+        // The small bank exercises SLRU. The full bank also exercises prefill.
+        if (moe_cache_size == 1536*1024) {
+            ctx_params.n_ubatch = 2;
+        }
     }
 
     llama_context_ptr lctx(llama_init_from_model(model.get(), ctx_params));
@@ -1564,6 +1566,59 @@ static int test_qsa_exact_tail(const size_t seed) {
             }
         }
     }
+    // Two sequences share a physical KV stream. Restore a prefix after both
+    // recurrent states and QSA pools have been advanced by a different suffix.
+    auto cp = llama_context_default_params();
+    cp.n_ctx = 512;
+    cp.n_seq_max = 2;
+    cp.kv_unified = true;
+    cp.n_batch = 64;
+    cp.n_ubatch = 32;
+    cp.n_threads = cp.n_threads_batch = 2;
+    cp.offload_kqv = false;
+    cp.type_k = cp.type_v = GGML_TYPE_Q8_0;
+    llama_context_ptr ctx(llama_init_from_model(model.get(), cp));
+    if (!ctx) {
+        throw std::runtime_error("failed to create two-sequence QSA context");
+    }
+    auto decode_pair = [&](int pos, int n, size_t salt) {
+        common_batch batch(ctx.get());
+        for (int seq = 0; seq < 2; ++seq) {
+            const auto ids = get_tokens(n, 128, seed + salt + seq);
+            for (int i = 0; i < n; ++i) {
+                batch.add(ids[i], pos + i, seq, true);
+            }
+        }
+        if (llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+            throw std::runtime_error("two-sequence QSA decode failed");
+        }
+        std::vector<float> logits;
+        for (int i = 0; i < 2*n; ++i) {
+            const float * row = llama_get_logits_ith(ctx.get(), i);
+            logits.insert(logits.end(), row, row + 128);
+        }
+        return logits;
+    };
+
+    decode_pair(0, 21, 10);
+    std::vector<uint8_t> snapshot(llama_state_get_size(ctx.get()));
+    if (snapshot.empty() || llama_state_get_data(ctx.get(), snapshot.data(), snapshot.size()) != snapshot.size()) {
+        throw std::runtime_error("failed to save two-sequence QSA/GDN prefix");
+    }
+    const auto first = decode_pair(21, 11, 20);
+    if (llama_state_set_data(ctx.get(), snapshot.data(), snapshot.size()) != snapshot.size()) {
+        throw std::runtime_error("failed to restore two-sequence QSA/GDN prefix");
+    }
+    decode_pair(21, 11, 30);
+    if (llama_state_set_data(ctx.get(), snapshot.data(), snapshot.size()) != snapshot.size()) {
+        throw std::runtime_error("failed to roll back two-sequence QSA/GDN state");
+    }
+    const auto replay = decode_pair(21, 11, 20);
+    const double replay_err = nmse(first, replay);
+    std::fprintf(stderr, "QSA/GDN two-sequence rollback/replay NMSE=%g\n", replay_err);
+    if (!std::isfinite(replay_err) || replay_err > 1e-6) {
+        throw std::runtime_error("two-sequence QSA/GDN replay differs after rollback");
+    }
     return 0;
 }
 
@@ -2050,7 +2105,7 @@ static int save_models(const std::string & arch_filter, const size_t seed, const
                 // Keep both trunk layer types and append one independently loadable head.
                 auto mtp_meta = get_gguf_ctx(arch, moe, true);
                 auto mtp_model = get_model(mtp_meta.get(), nullptr, seed, stdev, {},
-                        LLAMA_SPLIT_MODE_LAYER, false, nullptr, 0, true);
+                        LLAMA_SPLIT_MODE_LAYER, nullptr, true);
                 const std::string mtp_path = dir + "/qwen35-mtp.gguf";
                 LOG_INF("%s: Saving qwen35 MTP fixture to %s...\n", __func__, mtp_path.c_str());
                 llama_model_save_to_file(mtp_model.get(), mtp_path.c_str());
@@ -2151,6 +2206,11 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
             const enum ggml_backend_dev_type type = ggml_backend_dev_type(devices_meta[0]);
             if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
                 dev_configs.emplace_back(std::vector<ggml_backend_dev_t>{devices_meta[0]}, "MoE cache", LLAMA_SPLIT_MODE_LAYER, true, 1536*1024);
+                if (const char * full = std::getenv("LLAMA_TEST_MOE_FULL"); full && std::strcmp(full, "1") == 0) {
+                    dev_configs.emplace_back(std::vector<ggml_backend_dev_t>{devices_meta[0]}, "Full MoE cache",
+                            LLAMA_SPLIT_MODE_LAYER, true, 64*1024*1024);
+                    max_device_label_length = std::max(max_device_label_length, std::strlen("Full MoE cache"));
+                }
                 max_device_label_length = std::max(max_device_label_length, dev_configs.back().label.length());
                 // each GPU caches the layers assigned to it
                 if (devices_meta.size() > 1) {

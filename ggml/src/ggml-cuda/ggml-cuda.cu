@@ -828,6 +828,16 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     if (moe_upload_stream) {
         ggml_cuda_set_device(device);
+        if (moe_stage) {
+            CUDA_CHECK(cudaStreamSynchronize(moe_upload_stream));
+            for (cudaEvent_t event : moe_stage_done) {
+                CUDA_CHECK(cudaEventDestroy(event));
+            }
+            CUDA_CHECK(cudaFreeHost(moe_stage));
+            GGML_LOG_INFO("MoE pinned ring: backend=%s bytes=%llu chunks=%llu waits=%llu\n",
+                    name.c_str(), (unsigned long long) moe_stage_bytes_sent, (unsigned long long) moe_stage_chunks,
+                    (unsigned long long) moe_stage_waits);
+        }
         CUDA_CHECK(cudaStreamDestroy(moe_upload_stream));
         CUDA_CHECK(cudaEventDestroy(moe_upload_reuse));
         CUDA_CHECK(cudaEventDestroy(moe_upload_ready));
@@ -3546,7 +3556,56 @@ static void ggml_backend_cuda_moe_upload(ggml_backend_t backend, ggml_tensor * t
         CUDA_CHECK(cudaEventRecord(ctx->moe_upload_reuse, ctx->stream()));
         CUDA_CHECK(cudaStreamWaitEvent(ctx->moe_upload_stream, ctx->moe_upload_reuse, 0));
     }
-    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, ctx->moe_upload_stream));
+    static const bool use_ring = [] {
+        const char * env = std::getenv("LLAMA_MOE_PINNED_RING");
+        return env && strcmp(env, "1") == 0;
+    }();
+    char * dst = (char *) tensor->data + offset;
+    if (use_ring && !ctx->moe_stage_attempted) {
+        ctx->moe_stage_attempted = true;
+        ctx->moe_stage = ggml_cuda_host_malloc(ggml_moe_upload_ring::slots*ggml_moe_upload_ring::chunk_bytes);
+        if (ctx->moe_stage) {
+            for (auto & event : ctx->moe_stage_done) {
+                CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+            }
+        }
+        GGML_LOG_INFO("MoE pinned ring: backend=%s budget=%zu bytes active=%d\n",
+                ctx->name.c_str(), ggml_moe_upload_ring::slots*ggml_moe_upload_ring::chunk_bytes, ctx->moe_stage != nullptr);
+    }
+
+    if (ctx->moe_stage) {
+        cudaPointerAttributes attrs = {};
+        cudaError_t status = cudaPointerGetAttributes(&attrs, data);
+        if (status == cudaErrorInvalidValue) {
+            (void) cudaGetLastError(); // Unregistered host memory on older runtimes.
+        } else {
+            CUDA_CHECK(status);
+        }
+        if (status != cudaSuccess || attrs.type != cudaMemoryTypeHost) {
+            const char * src = (const char *) data;
+            for (size_t sent = 0; sent < size;) {
+                const size_t n = ctx->moe_ring.chunk(size - sent);
+                const size_t slot = ctx->moe_ring.take();
+                const auto done = ctx->moe_stage_done[slot];
+                status = cudaEventQuery(done);
+                if (status == cudaErrorNotReady) {
+                    ++ctx->moe_stage_waits;
+                    CUDA_CHECK(cudaEventSynchronize(done));
+                } else {
+                    CUDA_CHECK(status);
+                }
+                char * staged = (char *) ctx->moe_stage + slot*ggml_moe_upload_ring::chunk_bytes;
+                memcpy(staged, src + sent, n);
+                CUDA_CHECK(cudaMemcpyAsync(dst + sent, staged, n, cudaMemcpyHostToDevice, ctx->moe_upload_stream));
+                CUDA_CHECK(cudaEventRecord(done, ctx->moe_upload_stream));
+                ++ctx->moe_stage_chunks;
+                ctx->moe_stage_bytes_sent += n;
+                sent += n;
+            }
+            return;
+        }
+    }
+    CUDA_CHECK(cudaMemcpyAsync(dst, data, size, cudaMemcpyHostToDevice, ctx->moe_upload_stream));
 }
 #endif
 
@@ -4809,6 +4868,9 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     if (ops.size() == 2 && ops.begin()[0] == GGML_OP_SSM_CONV && ops.begin()[1] == GGML_OP_UNARY
      && unary_ops.size() == 1 && unary_ops.begin()[0] == GGML_UNARY_OP_SILU) {
         const ggml_tensor * ssm_conv = cgraph->nodes[node_idx];
+        if (ggml_get_op_params_i32(ssm_conv, 0) != 0) {
+            return false;
+        }
         const ggml_tensor * silu     = cgraph->nodes[node_idx+1];
         if (ggml_get_unary_op(silu) != unary_ops.begin()[0]) {
             return false;
@@ -4824,6 +4886,9 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     if (ops.size() == 3 && ops.begin()[0] == GGML_OP_SSM_CONV && ops.begin()[1] == GGML_OP_ADD
      && ops.begin()[2] == GGML_OP_UNARY && unary_ops.size() == 1 && unary_ops.begin()[0] == GGML_UNARY_OP_SILU) {
         const ggml_tensor * ssm_conv = cgraph->nodes[node_idx];
+        if (ggml_get_op_params_i32(ssm_conv, 0) != 0) {
+            return false;
+        }
         const ggml_tensor * add      = cgraph->nodes[node_idx+1];
         const ggml_tensor * silu     = cgraph->nodes[node_idx+2];
         if (ggml_get_unary_op(silu) != unary_ops.begin()[0]) {
@@ -6712,6 +6777,13 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             const bool pool_mutated = (graph->last_pool_epoch != 0) &&
                 (graph->last_pool_epoch != cuda_ctx->pool_epoch || graph->last_pool_malloc_count != cuda_ctx->pool_malloc_count);
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+            if (bookkeeping.enabled && (properties_changed || pool_mutated)) {
+                ggml_cuda_trace_counter("cuda_graph_invalidated", cgraph,
+                        uint64_t(properties_changed) | (uint64_t(pool_mutated) << 1));
+            }
+#endif
+
             if (!graph->warmup_complete) {
                 // Avoid capturing short-lived prefill shapes. Traditional KV commonly changes
                 // n_kv every few ubatches; requiring several matching calls keeps CUDA graphs
@@ -6813,6 +6885,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 #ifdef USE_CUDA_GRAPH
     if (graph) {
         if (cuda_ctx->pool_malloc_count != pool_malloc_count_before || cuda_ctx->pool_epoch != pool_epoch_before) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+            ggml_cuda_trace_counter("cuda_graph_pool_changed_during_execution", cgraph);
+#endif
             // Scratch was allocated or pool was cleared during this call; reset warmup to ensure pool stability before capture
             graph->warmup_complete = false;
             graph->warmup_stable_calls = 0;
@@ -8311,6 +8386,13 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         }
         case GGML_OP_SSM_CONV: {
             // assumes d_inner % threads == 0
+            const int head_dim = ggml_get_op_params_i32(op, 0);
+            if (head_dim != 0) {
+                const int64_t nc = op->src[1]->ne[0];
+                if (head_dim != 128 || (nc != 3 && nc != 4 && nc != 5 && nc != 7 && nc != 9 && nc != 15)) {
+                    return false;
+                }
+            }
             return op->src[0]->ne[1] % 128 == 0;
         }
         case GGML_OP_CONT:

@@ -28,6 +28,7 @@
 #include "llama-kvarn.h"
 #include "llama-kvarn-split-fused.h"
 #include "ggml-remote-attn.h"
+#include "ggml-remote-attn-trace.h"
 #include "ggml-remote-attn-policy.h"
 #include "rkva-native-state.h"
 #include "rkva-snapshot-digest.h"
@@ -2626,6 +2627,9 @@ llama_context::~llama_context() {
 
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+    if (ggml_remote_attn_trace_enabled()) {
+        ggml_remote_attn_trace_flush();
+    }
     // Fused position-split span: release THIS context's executor bundle (its
     // per-layer Vulkan/CUDA sub-graphs reference this context's backends and
     // caches) while the backends are still alive. The bundle is owned by the
@@ -3132,6 +3136,14 @@ void llama_context::record_backend_private_workspace(ggml_cgraph * gf) {
             }
         }
     }
+}
+
+static bool llama_mtp_hidden_trace_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("LLAMA_MTP_HIDDEN_TRACE");
+        return env && std::strcmp(env, "1") == 0 && ggml_remote_attn_trace_enabled();
+    }();
+    return enabled;
 }
 
 void llama_context::synchronize() {
@@ -4692,7 +4704,26 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return v != nullptr && *v != '\0' && std::strcmp(v, "0") != 0;
     }();
     const int64_t f5_t_mid = f5_stage_timing ? ggml_time_us() : 0;
+    static const bool verify_trace = [] {
+        const char * env = std::getenv("LLAMA_CUDA_VERIFY_TRACE");
+        return env && std::strcmp(env, "1") == 0 && ggml_remote_attn_trace_enabled();
+    }();
+    const int64_t verify_begin = verify_trace && ubatch.n_tokens <= 3 ? ggml_time_us() : 0;
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (verify_begin) {
+        // The scheduler starts the graph_run during submission. Its CUDA splits share that ID.
+        auto e = ggml_remote_attn_trace_identity("strata_verify_ubatch", nullptr);
+        e.nq = ubatch.n_tokens;
+        if (ubatch.pos) {
+            e.first_pos = ubatch.pos[0];
+            e.last_pos = ubatch.pos[ubatch.n_tokens - 1];
+        }
+        e.value = n_outputs;
+        e.flags = cparams.ctx_type;
+        e.begin_us = verify_begin;
+        e.end_us = ggml_time_us();
+        ggml_remote_attn_trace_record(&e);
+    }
     if (f5_stage_timing) {
         fprintf(stderr, "[F5STAGE] n_tokens=%u graph_compute_host_ms=%.3f\n",
                 ubatch.n_tokens, (ggml_time_us() - f5_t_mid)/1000.0);
@@ -5497,7 +5528,19 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 float * embd_nextn_out = embd_nextn.data + offset*n_embd;
 
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
+                const bool trace = llama_mtp_hidden_trace_enabled();
+                const int64_t start = trace ? ggml_time_us() : 0;
                 ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
+                if (trace) {
+                    auto e = ggml_remote_attn_trace_identity("strata_nextn_read", t_h_nextn);
+                    e.begin_us = start;
+                    e.end_us = ggml_time_us();
+                    e.nq = n_rows;
+                    e.bytes = n_rows*n_embd*sizeof(float);
+                    e.flags = (ggml_backend_buffer_is_host(t_h_nextn->buffer) ? 1u : 0u) |
+                        (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? 2u : 0u);
+                    ggml_remote_attn_trace_record(&e);
+                }
                 if (!masked) {
                     n_nextn_copied += n_rows;
                 }
@@ -9524,14 +9567,26 @@ llama_memory_t llama_get_memory(const struct llama_context * ctx) {
     return ctx->get_memory();
 }
 
-float * llama_get_embeddings_nextn(llama_context * ctx) {
+static void llama_mtp_hidden_synchronize(llama_context * ctx) {
+    const bool trace = llama_mtp_hidden_trace_enabled();
+    const int64_t start = trace ? ggml_time_us() : 0;
     ctx->synchronize();
+    if (trace) {
+        auto e = ggml_remote_attn_trace_identity("strata_nextn_wait", nullptr);
+        e.begin_us = start;
+        e.end_us = ggml_time_us();
+        ggml_remote_attn_trace_record(&e);
+    }
+}
+
+float * llama_get_embeddings_nextn(llama_context * ctx) {
+    llama_mtp_hidden_synchronize(ctx);
 
     return ctx->get_embeddings_nextn();
 }
 
 extern "C" LLAMA_API float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    llama_mtp_hidden_synchronize(ctx);
 
     return ctx->get_embeddings_nextn_ith(i);
 }

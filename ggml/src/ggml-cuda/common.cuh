@@ -2,6 +2,7 @@
 
 #include "ggml.h"
 #include "ggml-impl.h"
+#include "moe-upload-ring.h"
 #include "ggml-cuda.h"
 #include "graph-guard.h"
 #include "graph-policy.h"
@@ -1581,6 +1582,13 @@ struct ggml_backend_cuda_context {
     cudaStream_t moe_upload_stream = nullptr;
     cudaEvent_t moe_upload_reuse = nullptr;
     cudaEvent_t moe_upload_ready = nullptr;
+    ggml_moe_upload_ring moe_ring;
+    void * moe_stage = nullptr;
+    cudaEvent_t moe_stage_done[ggml_moe_upload_ring::slots] = {};
+    bool moe_stage_attempted = false;
+    uint64_t moe_stage_chunks = 0;
+    uint64_t moe_stage_bytes_sent = 0;
+    uint64_t moe_stage_waits = 0;
 #endif
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};

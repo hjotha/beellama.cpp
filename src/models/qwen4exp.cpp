@@ -1,4 +1,5 @@
 #include "models.h"
+#include "ggml-remote-attn-trace.h"
 #include "llama-impl.h"
 #include "llama-kv-cache-kvarn.h"
 #include "llama-memory-hybrid-idx.h"
@@ -813,6 +814,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
     return ggml_mul(ctx0, normalized, gated);
 }
 
+// These experimental layouts have reference implementations on CPU and CUDA.
+static bool qwen4exp_strata_backend_supported(const llama_model & model) {
+    return std::all_of(model.devices.begin(), model.devices.end(), [](const llama_device & device) {
+        const auto reg = ggml_backend_dev_backend_reg(device.dev);
+        return ggml_backend_dev_type(device.dev) == GGML_BACKEND_DEVICE_TYPE_CPU ||
+            (reg && std::strcmp(ggml_backend_reg_name(reg), "CUDA") == 0 &&
+                ggml_backend_dev_type(device.dev) == GGML_BACKEND_DEVICE_TYPE_GPU);
+    }) && model.split_mode() != LLAMA_SPLIT_MODE_TENSOR;
+}
+
 // QSA k-pool inputs, shared by the QSA layers: blocks of compress_ratio cells in sequence order, see llama_memory_hybrid_idx
 class llama_model_qwen4exp::llm_graph_input_kpool : public llm_graph_input_i {
 public:
@@ -821,6 +832,17 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override {
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
+        static const bool trace = [] {
+            const char * env = std::getenv("LLAMA_QSA_FA_TRACE");
+            return env && std::strcmp(env, "1") == 0;
+        }();
+        ggml_remote_attn_trace_scope timing("strata_qsa_pool_input", pool_mask);
+        timing.enabled &= trace;
+        if (timing.enabled) {
+            timing.event.bytes = ggml_nbytes(pool_mask);
+            timing.event.nq = ubatch->n_tokens;
+            timing.event.flags = pool_mask->type == GGML_TYPE_I32 ? 1u : 0u;
+        }
         mctx->set_input_kpool(pool_cells, pool_idxs, pool_mask, tail_idxs, nullptr, new_pool_idxs, new_pool_rep,
                               ubatch, new_pool_pos);
     }
@@ -849,7 +871,7 @@ public:
     ggml_tensor * k_idxs        = nullptr; // I64 [n_tokens]
     ggml_tensor * pool_cells    = nullptr; // I32 [n_pool]         cell caching each block's pooled key
     ggml_tensor * pool_idxs     = nullptr; // I32 [kpool, n_pool]  member cells per block, n_kv sentinel for the padded blocks
-    ggml_tensor * pool_mask     = nullptr; // F16 [n_pool, n_tokens]
+    ggml_tensor * pool_mask     = nullptr; // F16 [n_pool, n_tokens] or I32 [start/end, n_tokens]
     ggml_tensor * tail_idxs     = nullptr; // I32 [kpool - 1, n_tokens]
     ggml_tensor * new_pool_idxs = nullptr; // I32 [kpool, n_new]   members of the blocks to re-pool this ubatch
     ggml_tensor * new_pool_flat = nullptr; // I32 [kpool*n_new]    view of new_pool_idxs, shared by the QSA layers
@@ -875,7 +897,13 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
     inp->k_idxs     = mctx_idx->build_input_k_idxs(ctx0, ubatch);
     inp->pool_cells = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_pool);
     inp->pool_idxs  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool, n_pool);
-    inp->pool_mask  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_pool, n_tokens);
+    static const bool bounds_enabled = [] {
+        const char * env = std::getenv("LLAMA_QSA_INDEXER_BOUNDS");
+        return env && std::strcmp(env, "1") == 0;
+    }();
+    const bool bounds = bounds_enabled && n_pool > 4 && n_pool <= INT32_MAX && hparams.indexer_n_head == 4 &&
+        qwen4exp_strata_backend_supported(model);
+    inp->pool_mask = ggml_new_tensor_2d(ctx0, bounds ? GGML_TYPE_I32 : GGML_TYPE_F16, bounds ? 2 : n_pool, n_tokens);
     inp->tail_idxs  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool - 1, n_tokens);
     ggml_set_input(inp->pool_cells);
     ggml_set_input(inp->pool_idxs);
@@ -1242,13 +1270,29 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
     cb(state, "state_predelta", il);
 
-    ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
-    cb(conv_output_proper, "conv_output_raw", il);
-
-    ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
-    cb(conv_output_silu, "conv_output_silu", il);
-
-    ggml_tensor * conv_qkv_mix = conv_output_silu;
+    static const bool conv_l2_enabled = [] {
+        const char * env = std::getenv("LLAMA_GDN_CONV_L2");
+        return env && std::strcmp(env, "1") == 0;
+    }();
+    const float eps_norm = hparams.f_norm_rms_eps;
+    const auto layer_dev = conv_l2_enabled ? model.dev_layer(il) : nullptr;
+    const bool cpu = !layer_dev || ggml_backend_dev_type(layer_dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+    const bool cuda_shape = head_k_dim == 128 && conv_channels % 128 == 0 &&
+        (conv_kernel_size == 3 || conv_kernel_size == 4 || conv_kernel_size == 5 ||
+         conv_kernel_size == 7 || conv_kernel_size == 9 || conv_kernel_size == 15);
+    const bool fused = conv_l2_enabled && !cparams.training && std::isfinite(eps_norm) && eps_norm > 0.0f && (cpu || cuda_shape) &&
+        qwen4exp_strata_backend_supported(model);
+    ggml_tensor * conv = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+    ggml_tensor * conv_qkv_mix;
+    if (fused) {
+        ggml_ssm_conv_set_silu_l2(conv, head_k_dim, 2*head_k_dim*num_k_heads, eps_norm);
+        conv_qkv_mix = conv;
+        cb(conv_qkv_mix, "conv_output_silu_l2", il);
+    } else {
+        cb(conv, "conv_output_raw", il);
+        conv_qkv_mix = ggml_silu(ctx0, conv);
+        cb(conv_qkv_mix, "conv_output_silu", il);
+    }
 
     int64_t nb1_qkv = ggml_row_size(conv_qkv_mix->type, conv_channels);
 
@@ -1276,10 +1320,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     cb(v_conv, "v_conv", il);
 
 
-    const float eps_norm = hparams.f_norm_rms_eps;
-
-    q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
-    k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
+    if (!fused) {
+        q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
+        k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
+    }
 
     // repeat to match shapes when head keys != value keys; unneeded with the fused GDN
     if (num_k_heads != num_v_heads && (!cparams.fused_gdn_ar || !cparams.fused_gdn_ch)) {
@@ -1454,6 +1498,18 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
         ggml_tensor * ple = model.per_layer_tok_embd;
 
         const bool prefetch = model.can_prefetch.count(ple);
+        static const bool trace = [] {
+            const char * env = std::getenv("LLAMA_PLE_PREFETCH_TRACE");
+            return env && std::strcmp(env, "1") == 0;
+        }();
+        ggml_remote_attn_trace_scope timing("strata_ple_prefetch", ple);
+        timing.enabled &= trace;
+        if (timing.enabled) {
+            timing.event.nq = n_tokens;
+            timing.event.value = idx.size();
+            timing.event.bytes = prefetch ? idx.size()*ple->nb[1] : 0;
+            timing.event.flags = prefetch;
+        }
         if (prefetch) {
             llama_prefetch_rows(ple, idx.data(), idx.size());
         }

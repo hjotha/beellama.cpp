@@ -2775,6 +2775,14 @@ extern "C" {
             struct ggml_tensor  * sx,
             struct ggml_tensor  * c);
 
+    // CPU/CUDA epilogue for a packed [Q, K, V] SSM convolution. Apply SiLU to
+    // every channel and L2 normalization to the first n_qk channels by head.
+    GGML_API void ggml_ssm_conv_set_silu_l2(
+            struct ggml_tensor * conv,
+            int                  head_dim,
+            int                  n_qk,
+            float                eps);
+
     GGML_API struct ggml_tensor * ggml_ssm_scan(
             struct ggml_context * ctx,
             struct ggml_tensor  * s,
@@ -3130,7 +3138,7 @@ extern "C" {
     // q:       [n_embd_idx, n_head_idx, n_batch, ne3 ]
     // k:       [n_embd_idx, 1,          n_kv,    ne3 ]
     // weights: [n_head_idx, n_batch,    1,       ne3 ] !! prescaled !!
-    // mask:    [n_kv,       n_batch,    1,       ne33] !! f16 !!
+    // mask:    [n_kv,       n_batch,    1,       ne33] F16, or [2, n_batch, 1, ne33] I32 [start, end) for 4 heads on CPU/CUDA
     // res:     [n_kv,       n_batch,    1,       ne3 ]
     //
     // broadcast:

@@ -1,4 +1,5 @@
 #include "llama-graph.h"
+#include "ggml-remote-attn-trace.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -340,7 +341,22 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
     GGML_ASSERT(ubatch->embd_state && "this graph requires a state embedding, see llama_batch_ext_set_embd_state()");
     GGML_ASSERT(n_embd_state == h->ne[0]);
 
-    ggml_backend_tensor_set(h, ubatch->embd_state, 0, n_tokens*n_embd_state*ggml_element_size(h));
+    static const bool trace = [] {
+        const char * env = std::getenv("LLAMA_MTP_HIDDEN_TRACE");
+        return env && std::strcmp(env, "1") == 0 && ggml_remote_attn_trace_enabled();
+    }();
+    const int64_t start = trace ? ggml_time_us() : 0;
+    const size_t bytes = n_tokens*n_embd_state*ggml_element_size(h);
+    ggml_backend_tensor_set(h, ubatch->embd_state, 0, bytes);
+    if (trace) {
+        auto e = ggml_remote_attn_trace_identity("strata_mtp_state_write", h);
+        e.begin_us = start;
+        e.end_us = ggml_time_us();
+        e.nq = n_tokens;
+        e.bytes = bytes;
+        e.flags = ggml_backend_buffer_is_host(h->buffer) ? 1u : 0u;
+        ggml_remote_attn_trace_record(&e);
+    }
 }
 
 bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
@@ -3627,8 +3643,7 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
     }
     ids = ggml_reshape_1d(ctx0, ids, ggml_nelements(ids));
 
-    // the slot map is a host weight, so the scheduler starts a new split here and copies it with the copy callback
-    // the callback reads the selected experts, uploads the missing ones and updates the slot map
+    // Host slot maps start a split and invoke the fill callback. Immutable maps are already on the bank device.
     ggml_tensor * slots = ggml_get_rows(ctx0, slot_map, ids); // [1, n_expert_used*n_tokens]
     if (!ggml_backend_supports_op(moe_cache->backend(il), slots)) {
         return nullptr;

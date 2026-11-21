@@ -2,6 +2,7 @@
 #include "fattn.cuh"
 #include "fattn-common.cuh"
 #include "../ggml-turboquant-nc.h"
+#include "ggml-remote-attn-trace.h"
 #include "turboquant-nc-view.h"
 #include "fattn-kvarn-dispatch.cuh"
 #include "fattn-mma-f16.cuh"
@@ -16,7 +17,7 @@ template <int ncols1, bool oob>
 __launch_bounds__(256, 1)
 static __global__ void flash_attn_mask_to_sparse_indices(
         const half * mask_ptr, int32_t * indices_ptr, int32_t * counts_ptr, const int ne30, const int n_queries,
-        const int n_kv_max, const int64_t s31, const int64_t s33) {
+        const int n_kv_max, const int64_t s31, const int64_t s33, bool trace_overflow) {
     ggml_cuda_pdl_sync();
 
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
@@ -110,6 +111,10 @@ static __global__ void flash_attn_mask_to_sparse_indices(
     }
     if (tid == 0) {
         counts_ptr[int64_t(sequence)*gridDim.x + group] = count;
+        if (trace_overflow && row_count > n_kv_max) {
+            printf("QSA union overflow: seq=%d query=%d width=%d union=%d limit=%d\n",
+                    sequence, q0, ncols1, row_count, n_kv_max);
+        }
     }
     __syncthreads();
 
@@ -134,8 +139,21 @@ void ggml_cuda_flash_attn_ext_compact_mask(
     const auto kernel = ncols1 == 1       ? flash_attn_mask_to_sparse_indices<1, false> :
                         n_queries % 8 != 0 ? flash_attn_mask_to_sparse_indices<8, true>  :
                                              flash_attn_mask_to_sparse_indices<8, false>;
+    static const bool trace = [] {
+        const char * env = std::getenv("LLAMA_QSA_FA_TRACE");
+        return env && strcmp(env, "1") == 0;
+    }();
+    if (trace && ggml_remote_attn_trace_enabled()) {
+        auto e = ggml_remote_attn_trace_identity("strata_fa_sparse_mask", mask);
+        e.begin_us = e.end_us = ggml_time_us();
+        e.nq = n_queries;
+        e.flags = ncols1;
+        e.value = n_kv_max;
+        e.bytes = int64_t(n_queries)*mask->ne[3]*mask->ne[0]*sizeof(half);
+        ggml_remote_attn_trace_record(&e);
+    }
     ggml_cuda_kernel_launch(kernel, launch_params,
-        (const half *) mask->data, indices, counts, int(mask->ne[0]), n_queries, n_kv_max, s31, s33);
+        (const half *) mask->data, indices, counts, int(mask->ne[0]), n_queries, n_kv_max, s31, s33, trace);
     CUDA_CHECK(cudaGetLastError());
 #endif // !defined(GGML_USE_MUSA)
 }

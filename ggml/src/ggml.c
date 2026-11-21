@@ -6081,6 +6081,15 @@ struct ggml_tensor * ggml_ssm_conv(
     return result;
 }
 
+void ggml_ssm_conv_set_silu_l2(struct ggml_tensor * conv, int head_dim, int n_qk, float eps) {
+    GGML_ASSERT(conv->op == GGML_OP_SSM_CONV && head_dim > 0);
+    GGML_ASSERT(n_qk > 0 && n_qk < conv->ne[0] && n_qk % head_dim == 0);
+    GGML_ASSERT(isfinite(eps) && eps > 0.0f);
+    ggml_set_op_params_i32(conv, 0, head_dim);
+    ggml_set_op_params_i32(conv, 1, n_qk);
+    ggml_set_op_params_f32(conv, 2, eps);
+}
+
 // ggml_ssm_scan
 
 struct ggml_tensor * ggml_ssm_scan(
@@ -6905,9 +6914,9 @@ struct ggml_tensor * ggml_lightning_indexer(
 
     GGML_ASSERT(       q->type == GGML_TYPE_F32);
     GGML_ASSERT( weights->type == GGML_TYPE_F32);
-    GGML_ASSERT(    mask->type == GGML_TYPE_F16);
+    GGML_ASSERT(mask->type == GGML_TYPE_F16 || (mask->type == GGML_TYPE_I32 && q->ne[1] == 4));
     GGML_ASSERT(      q->ne[0] == k->ne[0]);
-    GGML_ASSERT(   mask->ne[0] == k->ne[2]);
+    GGML_ASSERT(mask->ne[0] == (mask->type == GGML_TYPE_I32 ? 2 : k->ne[2]));
     GGML_ASSERT(      q->ne[1] == weights->ne[0]);
     GGML_ASSERT(      k->ne[1] == 1);
     GGML_ASSERT(   mask->ne[1] == q->ne[2]);

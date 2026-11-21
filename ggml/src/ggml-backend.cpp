@@ -1060,6 +1060,14 @@ ggml_backend_buffer_t ggml_backend_dev_buffer_from_host_ptr(ggml_backend_dev_t d
 
 bool ggml_backend_dev_supports_op(ggml_backend_dev_t device, const struct ggml_tensor * op) {
     GGML_ASSERT(device);
+    if ((op->op == GGML_OP_SSM_CONV && ggml_get_op_params_i32(op, 0) != 0) ||
+            (op->op == GGML_OP_LIGHTNING_INDEXER && op->src[3] && op->src[3]->type == GGML_TYPE_I32)) {
+        const auto reg = ggml_backend_dev_backend_reg(device);
+        const char * name = reg ? ggml_backend_reg_name(reg) : "";
+        if (strcmp(name, "CPU") != 0 && strcmp(name, "CUDA") != 0) {
+            return false;
+        }
+    }
     return device->iface.supports_op(device, op);
 }
 

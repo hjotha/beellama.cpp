@@ -858,7 +858,8 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
 
     GGML_ASSERT(n_pool == kpool_pad(st.n_pool_real));
     GGML_ASSERT(st.is_new.size() == st.n_pool_real);
-    GGML_ASSERT(pool_mask->ne[0] == (int64_t) n_pool && pool_mask->ne[1] == (int64_t) n_tokens);
+    const bool compact = pool_mask->type == GGML_TYPE_I32;
+    GGML_ASSERT(pool_mask->ne[0] == (compact ? 2 : (int64_t) n_pool) && pool_mask->ne[1] == (int64_t) n_tokens);
     GGML_ASSERT(tail_idxs->ne[0] == (int64_t) kpool - 1 && tail_idxs->ne[1] == (int64_t) n_tokens);
     GGML_ASSERT(pool_idxs->ne[0] == (int64_t) kpool && pool_idxs->ne[1] == (int64_t) n_pool);
     GGML_ASSERT(ggml_backend_buffer_is_host(new_pool_idxs->buffer));
@@ -1029,41 +1030,41 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     }
 
     // a pool is visible when it belongs to the token's sequence and ends at or before it
-    auto fill_mask = [&](auto * data) {
+    auto fill_dense = [&](auto * data, uint32_t i, uint32_t p0, uint32_t end) {
         using T = std::remove_pointer_t<decltype(data)>;
-        const T keep = llama_cast<T>(0.0f);
+        T * row = data + (size_t) i*n_pool;
         const T drop = llama_cast<T>(-INFINITY);
-
-        for (uint32_t i = 0; i < n_tokens; ++i) {
-            const llama_seq_id s = ubatch->seq_id[i][0];
-            const llama_pos    p = ubatch->pos[i];
-
-            T * row = data + (size_t) i*n_pool;
-
-            const uint32_t p0 = seq_pool_start[s];
-            const uint32_t p1 = p0 + (uint32_t) lay.seqs[s].pools.size();
-            const uint32_t nv = by_order ? std::min(p1 - p0, (uint32_t) ((rank[i] + 1)/kpool)) :
-                (uint32_t) (std::upper_bound(pool_end.begin() + p0, pool_end.begin() + p1, p) - (pool_end.begin() + p0));
-
-            if (p0 > 0) {
-                std::fill(row, row + p0, drop);
-            }
-            std::fill(row + p0, row + p0 + nv, keep);
-            std::fill(row + p0 + nv, row + n_pool, drop);
-
-            // Finite visible pools occupy the first min(nv, n_top) ranked slots.
-            if (gm != nullptr) {
-                const uint32_t nvc = std::min(nv, n_top);
-                float * grow = gm + (size_t) i*n_sel;
-                std::fill(grow,                        grow + (size_t) nvc*kpool,  0.0f);
-                std::fill(grow + (size_t) nvc*kpool,   grow + (size_t) n_top*kpool, -INFINITY);
-            }
-        }
+        std::fill(row, row + p0, drop);
+        std::fill(row + p0, row + end, llama_cast<T>(0.0f));
+        std::fill(row + end, row + n_pool, drop);
     };
-    if (pool_mask->type == GGML_TYPE_F16) {
-        fill_mask((ggml_fp16_t *) pool_mask->data);
-    } else {
-        fill_mask((float *) pool_mask->data);
+
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        const llama_seq_id s = ubatch->seq_id[i][0];
+        const llama_pos    p = ubatch->pos[i];
+        const uint32_t p0 = seq_pool_start[s];
+        const uint32_t p1 = p0 + (uint32_t) lay.seqs[s].pools.size();
+        const uint32_t nv = by_order ? std::min(p1 - p0, (uint32_t) ((rank[i] + 1)/kpool)) :
+            (uint32_t) (std::upper_bound(pool_end.begin() + p0, pool_end.begin() + p1, p) - (pool_end.begin() + p0));
+
+        if (compact) {
+            GGML_ASSERT(p0 + nv <= INT32_MAX);
+            int32_t * row = (int32_t *) pool_mask->data + 2*(size_t) i;
+            row[0] = p0;
+            row[1] = p0 + nv;
+        } else if (pool_mask->type == GGML_TYPE_F16) {
+            fill_dense((ggml_fp16_t *) pool_mask->data, i, p0, p0 + nv);
+        } else {
+            fill_dense((float *) pool_mask->data, i, p0, p0 + nv);
+        }
+
+        // Finite visible pools occupy the first min(nv, n_top) ranked slots.
+        if (gm != nullptr) {
+            const uint32_t nvc = std::min(nv, n_top);
+            float * grow = gm + (size_t) i*n_sel;
+            std::fill(grow,                        grow + (size_t) nvc*kpool,  0.0f);
+            std::fill(grow + (size_t) nvc*kpool,   grow + (size_t) n_top*kpool, -INFINITY);
+        }
     }
 
     int32_t * tidx = (int32_t *) tail_idxs->data;

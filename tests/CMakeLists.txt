@@ -646,6 +646,12 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ARGS --test-qsa-exact-tail -s 12345
     )
 
+    if (Python3_EXECUTABLE)
+        add_test(NAME test-strata-trace
+            COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-strata-trace.py $<TARGET_FILE:test-llama-archs>)
+        set_property(TEST test-strata-trace PROPERTY LABELS main)
+    endif()
+
     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
     file(MAKE_DIRECTORY "${MODEL_DIR}")
 
@@ -2011,3 +2017,5 @@ endif()
 
 add_test(NAME test-rkva-low4-state COMMAND ${CMAKE_COMMAND} -E env
     GGML_LOW4_STATE_TEST_ONLY=1 $<TARGET_FILE:test-kv-mixed-state>)
+
+llama_build_and_test(test-strata-opt.cpp LINK ggml LABEL main)
