@@ -1667,7 +1667,8 @@ ggml_tensor * build_attn_mha_paged(
                   float   kq_scale,
                     int   il,
             ggml_tensor * kq_mask_override = nullptr,
-                int64_t   n_kv_max = 0) const;
+                int64_t   n_kv_max = 0,
+                     bool  store_only = false) const;
 
     // F3 position-split dual-range attention. True when P-mode is active,
     // global history exceeds P and current queries are overflow-range.

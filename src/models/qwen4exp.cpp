@@ -9,6 +9,8 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdlib>
+#include <cstring>
 #include <thread>
 #ifdef _OPENMP
 #include <omp.h>
@@ -715,13 +717,22 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     hc_mix attn_mix = build_hc_mix(res_hc, layer.hc_attn_norm, layer.hc_attn_down, layer.hc_attn_up, layer.hc_attn_inject, layer.hc_attn_down_inject, il);
     ggml_tensor * cur    = attn_mix.cur;
-    cur    = build_layer_attn(inp_hyb->get_attn(), mctx_hyb, inp_kpool, cur, inp_pos, sections, il);
 
     // A catch-up batch asks for no outputs: nothing consumes the FFN, the head
     // mixer or the LM head, so stop after the attention (and QSA) cache writes.
     // The masked flag is not required: n_outputs == 0 means no row is read.
     const bool kv_only = (n_outputs == 0) && !cparams.embeddings &&
                          (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked);
+    const char * env = std::getenv("LLAMA_MTP_KV_STORE_ONLY");
+    const bool store_only = kv_only && env && std::strcmp(env, "1") == 0 &&
+                            !cparams.training && cparams.kvarn.type == LLAMA_KVARN_TYPE_DISABLED &&
+                            cparams.kv_tail_tokens == 0 && cparams.kv_tail_tokens_swa == 0 &&
+                            !dynamic_cast<llm_graph_input_attn_kv_paged *>(inp_hyb->get_attn());
+    cur = build_layer_attn(inp_hyb->get_attn(), mctx_hyb, inp_kpool, cur, inp_pos, sections, il, store_only);
+    if (store_only) {
+        LLAMA_LOG_DEBUG("%s: skipping attention reads during KV-only catch-up\n", "graph_mtp");
+        return;
+    }
     if (kv_only) {
         LLAMA_LOG_DEBUG("%s: writing KV and QSA pools only (n_outputs == 0)\n", "graph_mtp");
         ggml_build_forward_expand(gf, cur);
@@ -903,7 +914,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
         ggml_tensor *                           cur,
         ggml_tensor *                           inp_pos,
         int *                                   sections,
-        int                                     il) {
+        int                                     il,
+        bool                              store_only) {
     const llama_kv_cache_context * mctx_idx = mctx_hyb->get_idx();
 
     const int64_t idx_dim = hparams.indexer_head_size;
@@ -948,6 +960,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     // scatter the fresh pooled keys into their rep rows, then gather all n_pool of them by cell:
     // the older pools come from the rows earlier ubatches wrote
     ggml_build_forward_expand(gf, kpool_cache.scatter_pooled(pooled_new, inp_kpool->new_pool_rep));
+    if (store_only) {
+        return nullptr;
+    }
     ggml_tensor * pooled = kpool_cache.gather_pooled(inp_kpool->pool_cells);
     pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, 1, n_pool);
     cb(pooled, "indexer_k", il);
@@ -1069,14 +1084,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
         ggml_tensor *             cur,
         ggml_tensor *             inp_pos,
         int *                     sections,
-        int                       il) {
+        int                       il,
+        bool                              store_only) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
     // indexer reads the same block input as q/k/v; no cache or no ratio means dense
     const bool qsa = mctx_hyb && mctx_hyb->get_idx() && inp_kpool && hparams.dsv4_compress_ratios[il] > 0;
 
-    ggml_tensor * sel = qsa ? build_qsa_sel(mctx_hyb, inp_kpool, cur, inp_pos, sections, il) : nullptr;
+    ggml_tensor * sel = qsa ? build_qsa_sel(mctx_hyb, inp_kpool, cur, inp_pos, sections, il, store_only) : nullptr;
 
     // Qwen3Next uses a single Q projection that outputs query + gate
     ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
@@ -1125,6 +1141,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     cb(Qcur, "Qcur", il);
     cb(Kcur, "Kcur", il);
     cb(Vcur, "Vcur", il);
+
+    if (store_only) {
+        return build_attn(inp, nullptr, nullptr, nullptr,
+                Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 0.0f, il, nullptr, 0, true);
+    }
 
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 

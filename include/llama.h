@@ -710,6 +710,10 @@ extern "C" {
         // Fixed CUDA KVarN / Vulkan Q4 position boundary; 0 leaves placement unchanged.
         // Appended so existing context-parameter member offsets remain stable.
         uint32_t kv_position_split_p;
+
+        // Extra single-device VRAM reserve for separate draft-MTP weights (automatic MoE cache only).
+        // Set by common when LLAMA_MTP_RESERVE_WEIGHTS=1. Zero disables the reserve.
+        size_t mtp_reserve_weights_bytes;
     };
 
     struct llama_model_tensor_override {

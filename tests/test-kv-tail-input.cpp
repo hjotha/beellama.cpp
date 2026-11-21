@@ -117,8 +117,8 @@ static void persistent_stage_descriptor(ggml_backend_t backend, int dimension) {
 
 static void mapped_local_tail_plan(ggml_backend_t backend) {
     std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_LLAMA, llama_model_default_params()));
-    llama_kv_cache cache(*model, model->hparams, GGML_TYPE_F16, GGML_TYPE_F16,
-            false, false, true, 512, 1, 1, 0, LLAMA_SWA_TYPE_NONE,
+    llama_kv_cache cache(*model, model->no_alloc(), model->hparams, GGML_TYPE_F16, GGML_TYPE_F16,
+            false, false, true, 512, 1, 0, LLAMA_SWA_TYPE_NONE,
             nullptr, {}, {}, {}, "", 4, 2, GGML_TYPE_F16, 2, true, 2);
     llama_kv_tail_layer_route route = {};
     route.capability.supported = true;
@@ -214,8 +214,8 @@ static void mapped_local_tail_plan(ggml_backend_t backend) {
 
 static void split_prefix_import() {
     std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_LLAMA, llama_model_default_params()));
-    llama_kv_cache cache(*model, model->hparams, GGML_TYPE_F16, GGML_TYPE_F16,
-            false, false, true, 512, 1, 1, 0, LLAMA_SWA_TYPE_NONE,
+    llama_kv_cache cache(*model, model->no_alloc(), model->hparams, GGML_TYPE_F16, GGML_TYPE_F16,
+            false, false, true, 512, 1, 0, LLAMA_SWA_TYPE_NONE,
             nullptr, {}, {}, {}, "", 4, 2, GGML_TYPE_F16, 2, true, 2);
     cache.set_position_split_p(256);
     for (const uint32_t size : {200u, 256u, 300u}) {

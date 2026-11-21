@@ -3810,6 +3810,25 @@ struct llama_context_params common_context_params_to_llama(const common_params &
             if (cparams.mtp_reserve_rollback_tokens == 0) {
                 cparams.mtp_reserve_rollback_tokens = 1;
             }
+
+            // Separate draft weights load after the target's automatic MoE cache.
+            const char * reserve_weights = std::getenv("LLAMA_MTP_RESERVE_WEIGHTS");
+            if (params.moe_cache_auto && draft.n_gpu_layers != 0 && !draft.mparams.path.empty() &&
+                    reserve_weights && std::strcmp(reserve_weights, "1") == 0) {
+                size_t total = 0;
+                for (const auto & part : common_download_get_all_parts(draft.mparams.path)) {
+                    std::error_code ec;
+                    const auto bytes = std::filesystem::file_size(std::filesystem::u8path(part), ec);
+                    if (ec) {
+                        LOG_WRN("%s: cannot reserve draft-MTP weights: '%s': %s\n",
+                                __func__, part.c_str(), ec.message().c_str());
+                        total = 0;
+                        break;
+                    }
+                    total += std::min<uintmax_t>(bytes, std::numeric_limits<size_t>::max() - total);
+                }
+                cparams.mtp_reserve_weights_bytes = total;
+            }
         }
     }
     cparams.moe_cache_size = params.moe_cache_auto ? std::numeric_limits<size_t>::max() : params.moe_cache_size;

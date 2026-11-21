@@ -1027,13 +1027,13 @@ const auto prefill = [&](const std::vector<uint8_t> & carry) {
 // block that ships in the target model. Covers the production Q8_0 draft cache,
 // the KV-only catch-up (n_outputs == 0 with masked nextn hidden output) and the
 // rollback of a rejected draft suffix at the production ubatch sizes.
-static int test_mtp_qwen4exp(const size_t seed) {
+static int test_mtp_qwen4exp(const size_t seed, uint32_t draft_ratio) {
     gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true, true);
     // block_count includes the NextN block: two trunk layers (linear + QSA) and
-    // one QSA MTP layer, each QSA layer with the same compress ratio
+    // one dense or QSA MTP layer
     gguf_set_val_u32(gguf_ctx.get(), "qwen4exp.block_count", 3);
     {
-        const uint32_t ratios[] = { 4, 4, 4 };
+        const uint32_t ratios[] = { 4, 4, draft_ratio };
         gguf_set_arr_data(gguf_ctx.get(), "qwen4exp.attention.compress_ratios", GGUF_TYPE_UINT32, ratios, 3);
     }
 
@@ -1059,7 +1059,7 @@ static int test_mtp_qwen4exp(const size_t seed) {
     for (const int32_t n_ubatch : { 32, 512, 1024 }) {
         llama_context_params cp = llama_context_default_params();
         cp.n_ctx           = 2048;
-        cp.n_batch         = 512;
+        cp.n_batch         = std::max(512, n_ubatch);
         cp.n_ubatch        = n_ubatch;
         cp.n_threads       = 2;
         cp.n_threads_batch = 2;
@@ -1109,10 +1109,15 @@ static int test_mtp_qwen4exp(const size_t seed) {
         }
         llama_set_embeddings_nextn(ctx_dft.get(), true, true);
 
+        llama_context_ptr ctx_full(llama_init_from_model(model.get(), dp));
+        if (!ctx_full) {
+            throw std::runtime_error("failed to create the reference MTP context");
+        }
+        llama_set_embeddings_nextn(ctx_full.get(), true, true);
         auto * mem = llama_get_memory(ctx_dft.get());
 
-        auto decode_range = [&](llama_pos pos, int32_t n, bool output) {
-            common_batch b(ctx_dft.get());
+        auto decode_range = [&](llama_context * ctx, llama_pos pos, int32_t n, bool output) {
+            common_batch b(ctx);
             for (int32_t i = 0; i < n; ++i) {
                 const llama_pos p   = pos + i;
                 const int32_t   idx = b.add(tokens[p], p, 0, output);
@@ -1121,12 +1126,13 @@ static int test_mtp_qwen4exp(const size_t seed) {
                     throw std::runtime_error("the MTP context rejected the hidden state input");
                 }
             }
-            return llama_process(ctx_dft.get(), LLAMA_PROCESS_TYPE_DECODE, b.get());
+            return llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, b.get());
         };
 
         // KV-only catch-up: no row asks for output, so the graph must stop after
         // the attention write and still advance the KV and the QSA pool state
-        if (decode_range(0, n_tokens, false) != 0) {
+        if (decode_range(ctx_dft.get(), 0, n_tokens, false) != 0 ||
+                decode_range(ctx_full.get(), 0, n_tokens, true) != 0) {
             throw std::runtime_error("failed to decode the MTP KV-only catch-up");
         }
         if (llama_memory_seq_pos_max(mem, 0) != n_tokens - 1) {
@@ -1136,13 +1142,15 @@ static int test_mtp_qwen4exp(const size_t seed) {
         // rejected suffixes: 0, 1, 2 and 4 accepted drafts all roll back here
         for (const int32_t n_back : { 1, 2, 3, 5 }) {
             const llama_pos cut = n_tokens - n_back;
-            if (!llama_memory_seq_rm(mem, 0, cut, -1)) {
+            if (!llama_memory_seq_rm(mem, 0, cut, -1) ||
+                    !llama_memory_seq_rm(llama_get_memory(ctx_full.get()), 0, cut, -1)) {
                 throw std::runtime_error("failed to roll back the draft cache");
             }
             if (llama_memory_seq_pos_max(mem, 0) != cut - 1) {
                 throw std::runtime_error("the draft cache rollback left a stale suffix");
             }
-            if (decode_range(cut, n_back, false) != 0) {
+            if (decode_range(ctx_dft.get(), cut, n_back, false) != 0 ||
+                    decode_range(ctx_full.get(), cut, n_back, true) != 0) {
                 throw std::runtime_error("failed to replay the accepted draft suffix");
             }
             if (llama_memory_seq_pos_max(mem, 0) != n_tokens - 1) {
@@ -1150,32 +1158,34 @@ static int test_mtp_qwen4exp(const size_t seed) {
             }
         }
 
-        // a full draft step (attention + MoE FFN + head): logits and the next
-        // hidden state must both come back finite
-        {
-            common_batch b(ctx_dft.get());
+        auto step = [&](llama_context * ctx) {
+            common_batch b(ctx);
             const int32_t idx = b.add(tokens[0], n_tokens, 0, true);
             if (!b.set_embd_state(idx, { pending, 1, n_embd_out })) {
                 throw std::runtime_error("the MTP context rejected the draft hidden state input");
             }
-            if (llama_process(ctx_dft.get(), LLAMA_PROCESS_TYPE_DECODE, b.get()) != 0) {
+            if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, b.get()) != 0) {
                 throw std::runtime_error("failed to decode a full MTP draft step");
             }
-            const float * logits = llama_get_logits_ith(ctx_dft.get(), 0);
-            const float * h_dft  = llama_get_embeddings_nextn_ith(ctx_dft.get(), 0);
-            if (logits == nullptr || h_dft == nullptr) {
-                throw std::runtime_error("the MTP draft step did not produce logits and a hidden state");
+            const float * logits = llama_get_logits_ith(ctx, 0);
+            const float * hidden = llama_get_embeddings_nextn_ith(ctx, 0);
+            if (!logits || !hidden ||
+                    !std::all_of(logits, logits + n_vocab, [](float x) { return std::isfinite(x); }) ||
+                    !std::all_of(hidden, hidden + n_embd_out, [](float x) { return std::isfinite(x); })) {
+                throw std::runtime_error("the MTP draft step did not produce finite logits and hidden state");
             }
-            for (int32_t i = 0; i < n_vocab; ++i) {
-                if (!std::isfinite(logits[i])) {
-                    throw std::runtime_error("the MTP draft logits are not finite");
-                }
-            }
-            for (size_t i = 0; i < n_embd_out; ++i) {
-                if (!std::isfinite(h_dft[i])) {
-                    throw std::runtime_error("the MTP draft hidden state is not finite");
-                }
-            }
+            return std::make_pair(std::vector<float>(logits, logits + n_vocab),
+                                  std::vector<float>(hidden, hidden + n_embd_out));
+        };
+
+        const auto [logits, hidden] = step(ctx_dft.get());
+        const auto [logits_full, hidden_full] = step(ctx_full.get());
+        const double logits_error = nmse(logits_full, logits);
+        const double hidden_error = nmse(hidden_full, hidden);
+        std::fprintf(stderr, "MTP catch-up ratio=%u ubatch=%d logits NMSE=%g hidden NMSE=%g\n",
+                draft_ratio, n_ubatch, logits_error, hidden_error);
+        if (!(logits_error <= 1e-6 && hidden_error <= 1e-6)) {
+            throw std::runtime_error("KV-only MTP catch-up diverged from a full decode");
         }
     }
 
@@ -1456,6 +1466,14 @@ static int test_mtp_kvarn_routing(const size_t seed) {
             if (llama_decode(ctx_draft.get(), batch) != 0) {
                 throw std::runtime_error("Qwen4Exp shared MTP decode failed");
             }
+            auto * mem = llama_get_memory(ctx_draft.get());
+            std::vector<uint8_t> state(llama_state_seq_get_size(ctx_draft.get(), 0));
+            if (state.empty() || llama_state_seq_get_data(ctx_draft.get(), state.data(), state.size(), 0) != state.size() ||
+                    !llama_memory_seq_rm(mem, 0, 0, -1) || llama_memory_seq_pos_max(mem, 0) != -1 ||
+                    llama_state_seq_set_data(ctx_draft.get(), state.data(), state.size(), 0) != state.size() ||
+                    llama_memory_seq_pos_max(mem, 0) != 0) {
+                throw std::runtime_error("Qwen4Exp shared MTP KVarN rollback or state restore failed");
+            }
         }
     }
 
@@ -1643,7 +1661,7 @@ static int test_kvarn_state_restore(const size_t seed) {
                     }
                     llama_memory_t mem = llama_get_memory(ctx.get());
                     const auto * hybrid = dynamic_cast<const llama_memory_hybrid *>(mem);
-                    if (dynamic_cast<const llama_kv_cache_kvarn *>(hybrid ? hybrid->get_mem_attn() : mem) == nullptr) {
+                    if (dynamic_cast<const llama_kv_cache_kvarn *>(hybrid ? hybrid->get_mem_attn_base() : mem) == nullptr) {
                         fprintf(stderr, "%s: KVarN restore test did not construct KVarN storage\n", llama_arch_name(arch));
                         return 1;
                     }
@@ -2467,7 +2485,7 @@ int main(int argc, char ** argv) {
             return test_mtp_kvarn_routing(seed);
         }
         if (test_qwen4exp_mtp) {
-            return test_mtp_qwen4exp(seed);
+            return test_mtp_qwen4exp(seed, 0) || test_mtp_qwen4exp(seed, 4);
         }
         if (test_kvarn_restore) {
             return test_kvarn_state_restore(seed);

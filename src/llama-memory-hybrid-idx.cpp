@@ -130,7 +130,7 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
                 ubatch = balloc.split_seq(n_ubatch);
             } else {
                 // Use non-sequential split when KV cache is unified (needed for hellaswag/winogrande/multiple-choice)
-                const bool unified = (get_mem_attn()->get_kv_n_stream() == 1);
+                const bool unified = (get_mem_attn_base()->get_kv_n_stream() == 1);
 
                 // [TAG_RECURRENT_ROLLBACK_SPLITS]
                 // the trailing (1 + n_rs_seq) tokens of each seq must stay in the same ubatch
@@ -161,7 +161,7 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
 
         // Prepare through the generic attention-memory boundary so wrappers such as
         // KVarN retain their specialized batch context.
-        auto ctx_attn = get_mem_attn()->init_kv_batch(ubatches);
+        auto ctx_attn = get_mem_attn_base()->init_kv_batch(ubatches);
         if (!ctx_attn || llama_memory_status_is_fail(ctx_attn->get_status())) {
             LLAMA_LOG_ERROR("%s: failed to prepare attention ubatches\n", __func__);
             return std::make_unique<llama_memory_hybrid_idx_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
@@ -254,7 +254,7 @@ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
             mem_idx_stale_set(seq_id, stale);
         }
     }
-    return get_mem_attn()->seq_rm(seq_id, p0, p1);
+    return get_mem_attn_base()->seq_rm(seq_id, p0, p1);
 }
 
 void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
@@ -332,13 +332,14 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
     llama_kv_cache::slot_info_vec_t sinfos_attn;
 
     const bool read_attn = (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0 ||
-            get_mem_attn()->requires_state_for_partial_restore();
+            get_mem_attn_base()->requires_state_for_partial_restore();
     if (read_attn) {
-        if (auto * kvarn = dynamic_cast<llama_kv_cache_kvarn *>(get_mem_attn())) {
+        if (auto * kvarn = dynamic_cast<llama_kv_cache_kvarn *>(get_mem_attn_base())) {
             kvarn->state_read_sinfo(io, seq_id, flags, mem_idx ? &sinfos_attn : nullptr, nullptr);
+        } else if (auto * kv = get_mem_attn()) {
+            kv->state_read_sinfo(io, seq_id, flags, mem_idx ? &sinfos_attn : nullptr, nullptr);
         } else {
-            static_cast<llama_kv_cache *>(get_mem_attn())->state_read_sinfo(
-                    io, seq_id, flags, mem_idx ? &sinfos_attn : nullptr, nullptr);
+            throw std::runtime_error("indexed hybrid state requires standard or KVarN attention memory");
         }
     }
     get_mem_recr()->state_read(io, seq_id, flags);

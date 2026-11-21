@@ -825,6 +825,14 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     }
 #endif
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (moe_upload_stream) {
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaStreamDestroy(moe_upload_stream));
+        CUDA_CHECK(cudaEventDestroy(moe_upload_reuse));
+        CUDA_CHECK(cudaEventDestroy(moe_upload_ready));
+    }
+#endif
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
@@ -3511,6 +3519,36 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
 
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+static void ggml_backend_cuda_moe_upload(ggml_backend_t backend, ggml_tensor * tensor,
+        const void * data, size_t offset, size_t size, bool first) {
+    auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+    ggml_cuda_set_device(ctx->device);
+
+    if (!tensor) {
+        // The callback runs before graph capture/replay. The split may consume the bank after this wait.
+        CUDA_CHECK(cudaEventRecord(ctx->moe_upload_ready, ctx->moe_upload_stream));
+        CUDA_CHECK(cudaStreamWaitEvent(ctx->stream(), ctx->moe_upload_ready, 0));
+        return;
+    }
+
+    const auto buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+    GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(ctx->device));
+    GGML_ASSERT(offset <= ggml_nbytes(tensor) && size <= ggml_nbytes(tensor) - offset);
+    if (!ctx->moe_upload_stream) {
+        CUDA_CHECK(cudaStreamCreateWithFlags(&ctx->moe_upload_stream, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaEventCreateWithFlags(&ctx->moe_upload_reuse, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&ctx->moe_upload_ready, cudaEventDisableTiming));
+    }
+    if (first) {
+        // A bank slot or scheduler copy may still be read by an earlier split.
+        CUDA_CHECK(cudaEventRecord(ctx->moe_upload_reuse, ctx->stream()));
+        CUDA_CHECK(cudaStreamWaitEvent(ctx->moe_upload_stream, ctx->moe_upload_reuse, 0));
+    }
+    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, ctx->moe_upload_stream));
+}
+#endif
 
 static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
@@ -8651,6 +8689,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
         return (void *) ggml_backend_cuda_set_graph_min_stable_calls;
     }
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (strcmp(name, "ggml_backend_cuda_moe_upload") == 0) {
+        return (void *) ggml_backend_cuda_moe_upload;
+    }
     if (strcmp(name, "ggml_backend_cuda_mask_pack_stats") == 0) {
         return (void *) ggml_backend_cuda_mask_pack_stats;
     }

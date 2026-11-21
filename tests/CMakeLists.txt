@@ -631,6 +631,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         LABEL main
         ARGS --test-mtp-qwen4exp
     )
+    llama_test(test-llama-archs NAME test-mtp-qwen4exp-store-only LABEL main ARGS --test-mtp-qwen4exp)
+    set_tests_properties(test-mtp-qwen4exp-store-only PROPERTIES ENVIRONMENT "LLAMA_MTP_KV_STORE_ONLY=1")
     llama_test(
         test-llama-archs
         NAME test-kvarn-state-restore
@@ -762,67 +764,73 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
     set_tests_properties(test-save-load-state-archs PROPERTIES FIXTURES_REQUIRED generate-models)
 
+    set(QWEN35_MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models-qwen35")
+    file(MAKE_DIRECTORY "${QWEN35_MODEL_DIR}")
+    llama_test(test-llama-archs NAME test-generate-qwen35-models LABEL main
+        ARGS -a "^qwen35$" -s 12345 -o "${QWEN35_MODEL_DIR}")
+    set_tests_properties(test-generate-qwen35-models PROPERTIES FIXTURES_SETUP generate-qwen35-models)
+
     foreach(mode target prepare-failure)
         llama_test(
             test-save-load-state
             NAME test-context-lifecycle-${mode}
             LABEL main
-            ARGS --context-lifecycle ${mode} -m "${MODEL_DIR}/qwen35-dense.gguf"
+            ARGS --context-lifecycle ${mode} -m "${QWEN35_MODEL_DIR}/qwen35-dense.gguf"
                  -c 256 -b 16 -ub 16 -n 2 -t 2 --backend-sampling --fit off
         )
-        set_tests_properties(test-context-lifecycle-${mode} PROPERTIES FIXTURES_REQUIRED generate-models)
+        set_tests_properties(test-context-lifecycle-${mode} PROPERTIES FIXTURES_REQUIRED generate-qwen35-models)
     endforeach()
     llama_test(
         test-save-load-state
         NAME test-context-lifecycle-yarn-zero-orig
         LABEL main
-        ARGS --context-lifecycle target -m "${MODEL_DIR}/qwen35-dense.gguf"
+        ARGS --context-lifecycle target -m "${QWEN35_MODEL_DIR}/qwen35-dense.gguf"
              -c 256 -b 16 -ub 16 -n 2 -t 2 --backend-sampling --fit off
              --rope-scaling yarn --rope-scale 2 --override-kv qwen35.rope.scaling.original_context_length=int:0
     )
-    set_tests_properties(test-context-lifecycle-yarn-zero-orig PROPERTIES FIXTURES_REQUIRED generate-models)
+    set_tests_properties(test-context-lifecycle-yarn-zero-orig PROPERTIES FIXTURES_REQUIRED generate-qwen35-models)
     llama_test(
         test-save-load-state
         NAME test-context-lifecycle-mtp
         LABEL main
-        ARGS --context-lifecycle mtp -m "${MODEL_DIR}/qwen35-mtp.gguf"
+        ARGS --context-lifecycle mtp -m "${QWEN35_MODEL_DIR}/qwen35-mtp.gguf"
              -c 256 -b 16 -ub 16 -n 2 -t 2 --backend-sampling --fit off --load-mode none --no-repack
     )
-    set_tests_properties(test-context-lifecycle-mtp PROPERTIES FIXTURES_REQUIRED generate-models)
+    set_tests_properties(test-context-lifecycle-mtp PROPERTIES FIXTURES_REQUIRED generate-qwen35-models)
     llama_test(
         test-save-load-state
         NAME test-mtp-carry-state
         LABEL main
-        ARGS --context-lifecycle mtp-state -m "${MODEL_DIR}/qwen35-mtp.gguf"
+        ARGS --context-lifecycle mtp-state -m "${QWEN35_MODEL_DIR}/qwen35-mtp.gguf"
              -c 256 -b 16 -ub 16 -n 2 -t 2 --backend-sampling --fit off --load-mode none --no-repack
     )
-    set_tests_properties(test-mtp-carry-state PROPERTIES FIXTURES_REQUIRED generate-models)
+    set_tests_properties(test-mtp-carry-state PROPERTIES FIXTURES_REQUIRED generate-qwen35-models)
     llama_test(
         test-save-load-state
         NAME test-mtp-context-cache-transfer
         LABEL main
-        ARGS --context-lifecycle mtp-cache -m "${MODEL_DIR}/qwen35-mtp.gguf"
+        ARGS --context-lifecycle mtp-cache -m "${QWEN35_MODEL_DIR}/qwen35-mtp.gguf"
              -c 256 -b 16 -ub 16 -n 2 -t 2 --backend-sampling --fit off --load-mode none --no-repack
     )
-    set_tests_properties(test-mtp-context-cache-transfer PROPERTIES FIXTURES_REQUIRED generate-models)
+    set_tests_properties(test-mtp-context-cache-transfer PROPERTIES FIXTURES_REQUIRED generate-qwen35-models)
     llama_test(
         test-save-load-state
         NAME test-mtp-target-only-bootstrap
         LABEL main
-        ARGS --context-lifecycle mtp-bootstrap -m "${MODEL_DIR}/qwen35-mtp.gguf"
+        ARGS --context-lifecycle mtp-bootstrap -m "${QWEN35_MODEL_DIR}/qwen35-mtp.gguf"
              -c 256 -b 16 -ub 16 -n 8 -t 2 --backend-sampling --fit off --load-mode none --no-repack
              --device none -ngl 0
     )
-    set_tests_properties(test-mtp-target-only-bootstrap PROPERTIES FIXTURES_REQUIRED generate-models)
+    set_tests_properties(test-mtp-target-only-bootstrap PROPERTIES FIXTURES_REQUIRED generate-qwen35-models)
     llama_test(
         test-save-load-state
         NAME test-mtp-bootstrap-native-rollback
         LABEL main
-        ARGS --context-lifecycle mtp-bootstrap-multi -m "${MODEL_DIR}/qwen35-mtp.gguf"
+        ARGS --context-lifecycle mtp-bootstrap-multi -m "${QWEN35_MODEL_DIR}/qwen35-mtp.gguf"
              -c 256 -b 16 -ub 16 -n 8 -t 2 --backend-sampling --fit off --load-mode none --no-repack
              --device none -ngl 0
     )
-    set_tests_properties(test-mtp-bootstrap-native-rollback PROPERTIES FIXTURES_REQUIRED generate-models)
+    set_tests_properties(test-mtp-bootstrap-native-rollback PROPERTIES FIXTURES_REQUIRED generate-qwen35-models)
     llama_build(test-fusion.cpp)
 endif()
 
@@ -966,6 +974,8 @@ llama_build_and_test(test-kv-mixed-mtp-budget.cpp)
 target_include_directories(test-kv-mixed-mtp-budget PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include)
 llama_build_and_test(test-kv-mixed-mtp-params.cpp)
 target_include_directories(test-kv-mixed-mtp-params PRIVATE ${PROJECT_SOURCE_DIR}/common ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include)
+llama_test(test-kv-mixed-mtp-params NAME test-mtp-sidecar-weight-reserve LABEL main)
+set_tests_properties(test-mtp-sidecar-weight-reserve PROPERTIES ENVIRONMENT "LLAMA_MTP_RESERVE_WEIGHTS=1")
 llama_build_and_test(test-kv-qx-convert.cpp)
 target_include_directories(test-kv-qx-convert PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_build_and_test(test-kv-kvarn-materializer.cpp)

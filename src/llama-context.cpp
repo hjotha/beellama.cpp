@@ -2569,14 +2569,27 @@ std::vector<ggml_backend_t> layer_backends;
                             budget += free_b - need;
                         }
                     }
-                    budget = std::min(budget, host_moe_bytes);
-                    if (budget < 256*MiB) {
+                    if (params.mtp_reserve_weights_bytes > 0 && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT) {
+                        if (model.devices.size() == 1) {
+                            const size_t weights_bytes = params.mtp_reserve_weights_bytes;
+                            LLAMA_LOG_INFO("%s: MoE cache auto: reserving %.2f MiB of draft-MTP weights\n",
+                                    __func__, weights_bytes/(double)MiB);
+                            budget = budget > weights_bytes ? budget - weights_bytes : 0;
+                        } else {
+                            LLAMA_LOG_WARN("%s: MoE cache auto: draft-MTP weight reserve requires a single target device\n", __func__);
+                        }
+                    }
+                    // The banks need an extra MMQ padding slot. The cache allocator still caps each group at its full size.
+                    if (!llama_moe_cache::prefill_enabled() || model.devices.size() != 1) {
+                        budget = std::min(budget, host_moe_bytes);
+                    }
+                    if (std::min(budget, host_moe_bytes) < 256*MiB) {
                         LLAMA_LOG_INFO("%s: MoE cache auto: %.2f MiB of host experts, but only %.2f MiB of device memory is free after the compute buffers (reserve %.2f MiB), cache disabled\n",
                                 __func__, host_moe_bytes/(double)MiB, budget/(double)MiB, reserve/(double)MiB);
                     } else {
                         cparams.moe_cache_size = budget;
-                        LLAMA_LOG_INFO("%s: MoE cache auto: %.2f MiB for %.2f MiB of host experts (%.1f%% of the experts can be cached)\n",
-                                __func__, budget/(double)MiB, host_moe_bytes/(double)MiB, 100.0*budget/(double)host_moe_bytes);
+                        LLAMA_LOG_INFO("%s: MoE cache auto: budget %.2f MiB for %.2f MiB of host experts (up to %.1f%% before padding)\n",
+                                __func__, budget/(double)MiB, host_moe_bytes/(double)MiB, 100.0*std::min(budget, host_moe_bytes)/(double)host_moe_bytes);
                         make_moe_cache();
                         // the cache changes the graph: reserve again with its slot maps in place
                         sched_reserve();
@@ -6249,6 +6262,8 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         st.ids = ids;
     }
 
+    llama_moe_upload upload(backend);
+
     // group consecutive experts and copy them together
     for (int64_t first = 0; first < n_expert; ) {
         if (!st.used[first]) {
@@ -6269,7 +6284,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
                 continue;
             }
             if (next < e) {
-                ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + next*expert_size, next*expert_size, (e - next)*expert_size);
+                upload.set(dst, (const uint8_t *) src->data + next*expert_size, next*expert_size, (e - next)*expert_size);
             }
             e   += n;
             next = e;
@@ -6280,7 +6295,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         const size_t padding = last < n_expert - 1 ? std::min<size_t>(expert_size, 512) : 0;
         const size_t size    = (last + 1 - next)*expert_size + padding;
         if (size > 0) {
-            ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, size);
+            upload.set(dst, (const uint8_t *) src->data + offset, offset, size);
         }
 
         first = last + 1;
@@ -9033,6 +9048,7 @@ llama_context_params llama_context_default_params() {
         /*.mtp_reserve_type_v          =*/ GGML_TYPE_F16,
         /*.mtp_reserve_rollback_tokens =*/ 0,
         /*.kv_position_split_p       =*/ 0,
+        /*.mtp_reserve_weights_bytes  =*/ 0,
     };
 
     return result;

@@ -44,7 +44,9 @@ def main() -> None:
     model = (ROOT / "src/llama-model.cpp").read_text(encoding="utf-8")
     for needle in (
         'ml.get_weight(tn(trunk_probe, "weight", 0).str().c_str()) == nullptr',
-        'ml.get_weight(tn(LLM_TENSOR_NEXTN_EH_PROJ, "weight", hparams.n_layer()).str().c_str()) == nullptr',
+        'const std::string eh_proj = tn(LLM_TENSOR_NEXTN_EH_PROJ, "weight", hparams.n_layer()).str();',
+        "ml.get_weight(eh_proj.c_str()) == nullptr",
+        "ml.get_weight(e_proj.c_str()) == nullptr",
         "trunk = TENSOR_NOT_REQUIRED;",
         "mtp |= TENSOR_SKIP;",
     ):

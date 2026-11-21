@@ -8,6 +8,23 @@
 
 struct llama_model;
 
+// One batch of expert uploads in a scheduler copy callback.
+class llama_moe_upload {
+public:
+    explicit llama_moe_upload(ggml_backend_t backend);
+    ~llama_moe_upload();
+    llama_moe_upload(const llama_moe_upload &) = delete;
+    llama_moe_upload & operator=(const llama_moe_upload &) = delete;
+
+    void set(ggml_tensor * tensor, const void * data, size_t offset, size_t size);
+
+private:
+    using upload_fn = void (*)(ggml_backend_t, ggml_tensor *, const void *, size_t, size_t, bool);
+    ggml_backend_t backend;
+    upload_fn upload = nullptr;
+    bool pending = false;
+};
+
 // keeps recently and repeatedly used experts of host-resident MoE layers in a device buffer
 // each layer has a slot map in host memory: when the scheduler copies it to the device, the copy callback uploads the missing experts
 class llama_moe_cache {
@@ -16,10 +33,13 @@ public:
     llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size);
     ~llama_moe_cache();
 
+    static bool prefill_enabled();
+
     // the device that caches layer il
     ggml_backend_t backend(int32_t il) const;
 
     // the slot map of layer il, if its experts can be read from the cache for n_tokens tokens, nullptr otherwise
+    // LLAMA_MOE_CACHE_PREFILL=1 also admits large batches when all experts of the group fit
     ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const;
 
     // the experts of w in the cache, nullptr if w is not cached

@@ -2500,7 +2500,15 @@ static void test_moe_cache_auto_sizing() {
     assert(!cmoe.tensor_buft_overrides.empty());
     cmoe.n_parallel = 1;
     const auto mparams_cmoe = common_model_params_to_llama(cmoe);
-    assert(mparams_cmoe.keep_host_pinned);
+    bool has_pinned_backend = false;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        auto * dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU && ggml_backend_dev_host_buffer_type(dev)) {
+            has_pinned_backend = true;
+            break;
+        }
+    }
+    assert(mparams_cmoe.keep_host_pinned == has_pinned_backend);
 
     common_params cmoe_unpinned;
     assert(parse(cmoe_unpinned, {"binary", "-cmoe", "--no-moe-host-pinned"}));

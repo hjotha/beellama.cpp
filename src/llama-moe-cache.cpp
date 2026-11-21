@@ -7,6 +7,9 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <cinttypes>
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
@@ -154,6 +157,18 @@ struct moe_cache_slru {
     }
 };
 
+static constexpr bool moe_cache_admit(int64_t n_tokens, int64_t n_expert_used, int64_t n_expert,
+        size_t n_layers, int64_t n_slots, bool prefill) {
+    return n_tokens > 0 && std::min(n_tokens*n_expert_used, n_expert) <= n_slots &&
+        (n_tokens <= 32 || (prefill && (int64_t) n_layers*n_expert <= n_slots));
+}
+
+static_assert(moe_cache_admit(32, 8, 128, 2, 128, false), "small batch can use a partial group");
+static_assert(!moe_cache_admit(32, 8, 128, 2, 127, true), "selected experts must fit");
+static_assert(!moe_cache_admit(33, 8, 128, 2, 255, true), "large batch bypasses a partial group");
+static_assert(!moe_cache_admit(33, 8, 128, 2, 256, false), "large batch stays opt-in");
+static_assert(moe_cache_admit(1024, 8, 128, 2, 256, true), "large batch can use a full group");
+
 // gate, up, down or gate_up, down
 static std::vector<ggml_tensor *> llama_moe_cache_layer_experts(const llama_layer & layer) {
     std::vector<ggml_tensor *> res;
@@ -207,6 +222,7 @@ struct llama_moe_cache::impl {
         std::vector<ggml_tensor *> banks; // device storage of all slots, one per expert tensor
         size_t host_bytes = 0;
         int32_t n_slots = 0;
+        mutable bool logged_prefill = false;
         moe_cache_slru slru;
     };
 
@@ -228,8 +244,6 @@ struct llama_moe_cache::impl {
         size_t bytes  = 0;
     };
 
-    static constexpr int64_t max_batch = 32;
-
     int32_t n_expert_used;
 
     stats stats_small; // up to 8 tokens per ubatch
@@ -244,6 +258,8 @@ struct llama_moe_cache::impl {
 
     std::vector<int32_t> ids;
     std::vector<moe_cache_slru::fill> fills;
+
+    const bool prefill = llama_moe_cache::prefill_enabled();
 
     // slot maps in host memory
     ggml_context_ptr ctx_host;
@@ -481,11 +497,18 @@ struct llama_moe_cache::impl {
             return nullptr;
         }
         const layer & l = layers[il];
+        const group & g = groups[l.ig];
 
-        // large batches use most experts of a layer, so they gain little from the cache and would evict the experts used in generation
-        if (n_tokens == 0 || n_tokens > max_batch || std::min(n_tokens*n_expert_used, l.slot_map->ne[1]) > groups[l.ig].n_slots) {
+        const int64_t n_expert = l.slot_map->ne[1];
+        if (!moe_cache_admit(n_tokens, n_expert_used, n_expert, g.layers.size(), g.n_slots, prefill)) {
             return nullptr;
         }
+        if (n_tokens > 32 && !g.logged_prefill) {
+            g.logged_prefill = true;
+            LLAMA_LOG_INFO("%s: large batch of %" PRId64 " tokens uses the MoE cache of group %d: %zu layers, %" PRId64 " experts, %d slots\n",
+                __func__, n_tokens, l.ig, g.layers.size(), n_expert, g.n_slots);
+        }
+
         return l.slot_map;
     }
 
@@ -505,7 +528,7 @@ struct llama_moe_cache::impl {
             return 0;
         }
 
-        // large batches only read the cache, so the experts used in generation stay in it
+        // this path only reads the cache, it never fills slots, so the experts used in generation stay in it
         const int32_t * slots = g.slru.slot_map[b.il];
         if (slots == nullptr || slots[e] < 0) {
             return 0;
@@ -568,11 +591,16 @@ struct llama_moe_cache::impl {
 
         size_t n_hit = 0;
         if (!g.slru.plan(il, ids.data(), ids.size(), fills, n_hit)) {
-            GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
+            // get_slot_map enables the cache only when the experts selected by one layer fit in the
+            // slots of the group, so a plan that does not fit means the decision and the selection
+            // disagree; the graph is already built, abort instead of changing it here
+            GGML_ABORT("the MoE cache cannot plan layer %d: %d slots, %zu layers, %d experts, %zu selected ids",
+                il, g.n_slots, g.layers.size(), (int) g.ref[0]->ne[2], ids.size());
         }
 
         // upload the missing experts, consecutive experts going to consecutive slots are uploaded together
         size_t bytes = 0;
+        llama_moe_upload upload(backend);
         for (size_t ip = 0; ip < l.experts.size(); ++ip) {
             const ggml_tensor * w    = l.experts[ip];
             ggml_tensor       * bank = g.banks[ip];
@@ -582,7 +610,7 @@ struct llama_moe_cache::impl {
                 while (i + n < fills.size() && fills[i + n].expert == fills[i].expert + (int32_t) n && fills[i + n].slot == fills[i].slot + (int32_t) n) {
                     n++;
                 }
-                ggml_backend_tensor_set_async(backend, bank, (const uint8_t *) w->data + fills[i].expert*expert_size, fills[i].slot*expert_size, n*expert_size);
+                upload.set(bank, (const uint8_t *) w->data + fills[i].expert*expert_size, fills[i].slot*expert_size, n*expert_size);
                 bytes += n*expert_size;
                 i += n;
             }
@@ -615,6 +643,40 @@ struct llama_moe_cache::impl {
         }
     }
 };
+
+llama_moe_upload::llama_moe_upload(ggml_backend_t backend) : backend(backend) {
+    static const bool enabled = [] {
+        const char * env = std::getenv("LLAMA_MOE_UPLOAD_OVERLAP");
+        return env && std::strcmp(env, "1") == 0;
+    }();
+    if (enabled) {
+        const auto dev = ggml_backend_get_device(backend);
+        const auto reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        if (reg) {
+            upload = reinterpret_cast<upload_fn>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_moe_upload"));
+        }
+    }
+}
+
+llama_moe_upload::~llama_moe_upload() {
+    if (pending) {
+        upload(backend, nullptr, nullptr, 0, 0, false);
+    }
+}
+
+void llama_moe_upload::set(ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    if (upload) {
+        upload(backend, tensor, data, offset, size, !pending);
+        pending = true;
+    } else {
+        ggml_backend_tensor_set_async(backend, tensor, data, offset, size);
+    }
+}
+
+bool llama_moe_cache::prefill_enabled() {
+    const char * env = std::getenv("LLAMA_MOE_CACHE_PREFILL");
+    return env && std::strcmp(env, "1") == 0;
+}
 
 llama_moe_cache::llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size) :
     pimpl(new impl(model, no_alloc, backends, bufts, size)) {

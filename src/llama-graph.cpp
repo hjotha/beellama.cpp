@@ -354,7 +354,7 @@ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
 }
 
 void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
-    if (ubatch->pos && pos) {
+    if (ubatch->pos && pos && pos->buffer) {
         const int64_t n_tokens = ubatch->n_tokens;
 
         const bool has_embd = ubatch->is_mixed() || ubatch->token == nullptr;
@@ -4853,10 +4853,13 @@ ggml_tensor * llm_graph_context::build_attn(
             float     kq_scale,
             int       il,
         ggml_tensor * kq_mask_override,
-            int64_t   n_kv_max) const {
+            int64_t   n_kv_max,
+                 bool store_only) const {
     GGML_ASSERT(v_mla == nullptr);
+    GGML_ASSERT(!store_only || !cparams.training);
 
     if (auto * paged = dynamic_cast<llm_graph_input_attn_kv_paged *>(inp)) {
+        GGML_ASSERT(!store_only);
         return build_attn(paged, wo, wo_b, wo_s, q_cur, k_cur, v_cur, kq_b, sinks, v_mla, kq_scale, il);
     }
 
@@ -4908,7 +4911,9 @@ ggml_tensor * llm_graph_context::build_attn(
     // these nodes are added to the graph together so that they are not reordered
     // by doing so, the number of splits in the graph is reduced
     // expand k later to enable rope fusion which directly writes into k-v cache
-    ggml_build_forward_expand(gf, q_cur);
+    if (!store_only) {
+        ggml_build_forward_expand(gf, q_cur);
+    }
     ggml_build_forward_expand(gf, v_cur);
     ggml_build_forward_expand(gf, k_cur);
 
@@ -4959,6 +4964,10 @@ ggml_tensor * llm_graph_context::build_attn(
                     ggml_build_forward_expand(gf, v_tail_written);
                 }
             }
+        }
+
+        if (store_only) {
+            return nullptr;
         }
 
         k = use_kvarn ?

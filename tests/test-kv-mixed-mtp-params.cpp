@@ -12,6 +12,10 @@
 #include "speculative.h"
 
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -96,7 +100,7 @@ static void test_active_representations() {
                                           GGML_TYPE_F16, GGML_TYPE_F16);
         auto cp = mtp_cparams(p);
         CHECK(cp.mtp_reserve_kvarn == LLAMA_KVARN_K4V4_G128);
-        CHECK(cp.mtp_reserve_kvarn_bits == (uint32_t(4) << 16) | 4);
+        CHECK(cp.mtp_reserve_kvarn_bits == ((uint32_t(4) << 16) | 4));
     }
     // asymmetric KVarN (K3V8)
     {
@@ -104,7 +108,7 @@ static void test_active_representations() {
                                           GGML_TYPE_F16, GGML_TYPE_F16);
         auto cp = mtp_cparams(p);
         CHECK(cp.mtp_reserve_kvarn == LLAMA_KVARN_K3V8_G128);
-        CHECK(cp.mtp_reserve_kvarn_bits == (uint32_t(8) << 16) | 3);
+        CHECK(cp.mtp_reserve_kvarn_bits == ((uint32_t(8) << 16) | 3));
     }
 }
 
@@ -207,11 +211,52 @@ static void test_mixed_target_draft_remote_policy() {
     }
 }
 
+static void test_sidecar_weight_reserve() {
+    auto p = make_mtp_params(2, LLAMA_KVARN_TYPE_DISABLED, GGML_TYPE_F16, GGML_TYPE_F16);
+    p.moe_cache_auto = true;
+
+    CHECK(mtp_cparams(p).mtp_reserve_weights_bytes == 0);
+    const char * env = std::getenv("LLAMA_MTP_RESERVE_WEIGHTS");
+    const bool enabled = env && std::strcmp(env, "1") == 0;
+    const std::string prefix = enabled ? "test-mtp-reserve-on" : "test-mtp-reserve-off";
+    const std::string first = prefix + "-00001-of-00002.gguf";
+    const std::string second = prefix + "-00002-of-00002.gguf";
+    std::ofstream(first, std::ios::binary) << "one";
+    std::ofstream(second, std::ios::binary) << "second";
+    p.speculative.draft.mparams.path = first;
+    CHECK(mtp_cparams(p).mtp_reserve_weights_bytes == (enabled ? 9 : 0));
+    CHECK(mtp_cparams(p).moe_cache_size == std::numeric_limits<size_t>::max());
+
+    const auto draft = common_base_params_to_speculative(p);
+    CHECK(!draft.moe_cache_auto);
+    CHECK(common_context_params_to_llama(draft).moe_cache_size == 0);
+    CHECK(common_context_params_to_llama(draft).mtp_reserve_weights_bytes == 0);
+
+    p.moe_cache_auto = false;
+    p.moe_cache_size = 512*1024*1024;
+    CHECK(mtp_cparams(p).mtp_reserve_weights_bytes == 0);
+    CHECK(mtp_cparams(p).moe_cache_size == p.moe_cache_size);
+
+    p.moe_cache_auto = true;
+    p.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE };
+    CHECK(mtp_cparams(p).mtp_reserve_weights_bytes == 0);
+    p.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+
+    p.speculative.draft.n_gpu_layers = 0;
+    CHECK(mtp_cparams(p).mtp_reserve_weights_bytes == 0);
+    p.speculative.draft.n_gpu_layers = -1;
+
+    CHECK(std::remove(second.c_str()) == 0);
+    CHECK(mtp_cparams(p).mtp_reserve_weights_bytes == 0);
+    CHECK(std::remove(first.c_str()) == 0);
+}
+
 int main() {
     test_inactive_and_model_head_irrelevant();
     test_active_representations();
     test_actual_rollback();
     test_mixed_target_draft_remote_policy();
+    test_sidecar_weight_reserve();
 
     std::printf("%s: %d checks, %d failures\n", g_failures == 0 ? "PASS" : "FAIL", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
