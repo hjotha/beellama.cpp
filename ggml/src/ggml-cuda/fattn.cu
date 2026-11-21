@@ -239,21 +239,20 @@ static bool ggml_cuda_flash_attn_ext_uses_sparse_q8(const int device, const ggml
         return false;
     }
 
-    // switch_ncols1 for ncols2 = 8. Only the ncols1=1 and ncols1=8 instances
-    // have an instantiated sparse kernel; ncols1=2 and ncols1=4 are dense.
+    // switch_ncols1 for ncols2 = 8. The sparse branch is tried first: up to
+    // one full dense tile (Q->ne[1] <= 32/ncols2) it gathers the union with
+    // ncols1=1, so that case is sparse whenever shall_use_sparse(1, 8) holds.
+    // Above that the wide ncols1=8 kernel is used, except on a Turing-compiled
+    // binary, where switch_ncols1 falls back to the dense ncols1=4 case.
     const bool narrow = ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(256, 256, 1, 8) &&
         ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, 1, 8);
     const bool wide = ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(256, 256, 8, 8) &&
         ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, 8, 8);
 
-    if (turing_mma_available(cc) && Q->ne[1] <= 8/8) {
+    if (Q->ne[1] <= 32/8) {
         return narrow;
     }
-    if (Q->ne[1] <= 16/8) {
-        return false;
-    }
-    if (Q->ne[1] <= 32/8 ||
-            (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING)) {
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING) {
         return false;
     }
     return wide;

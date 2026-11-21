@@ -2368,7 +2368,12 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
         if constexpr (ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, ncols1, ncols2)) {
             if (ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, ncols1, ncols2)) {
                 if constexpr (can_sparse_q8) {
-                    if (K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0) {
+                    if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE &&
+                            K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0) {
+                        // the per-row dequantizer gathers 8-value chunks: the tile
+                        // widths must keep every chunk inside one Q8_0 block
+                        static_assert(ggml_cuda_fattn_mma_get_nbatch_K2(DKQ, DV, ncols) % 4 == 0, "Q8_0 K chunks must be 8-aligned");
+                        static_assert(ggml_cuda_fattn_mma_get_nbatch_V2(DKQ, DV, ncols) % 4 == 0, "Q8_0 V chunks must be 8-aligned");
                         constexpr bool use_sparse_kernel = true;
                         fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, use_sparse_kernel>;
                         use_sparse = true;

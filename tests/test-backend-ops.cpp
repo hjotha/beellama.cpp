@@ -13769,12 +13769,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
-    // ncols1=2 and ncols1=4 have no sparse Q8_0 instance: those batches must
-    // keep the dense F16-conversion buffers and stay correct.
-    for (int64_t nq : {2, 3, 4}) {
+    // nq 2-4 still uses the sparse ncols1=1 gather (the union of up to one
+    // dense tile); nq=13 exercises the wide kernel with a full tile plus a
+    // partial one.
+    for (int64_t nq : {2, 3, 4, 13}) {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 32768, nq, true, false, 0, 0,
             GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 2048));
     }
+    // GQA ratio <= 4 drops to ncols2=2: the hint must fall back to the dense path.
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 12, {2, 1}, 32768, 1, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 2048));
     // No mask at all: sparse is not applicable even with n_kv_max set, so this
     // must stay on the dense kernel.
     for (int64_t nq : {1, 5, 512}) {
