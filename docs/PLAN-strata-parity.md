@@ -37,7 +37,9 @@ residir).
   dos pesos carregados:
   1. soma os bytes dos experts **host-residentes** (checa `ggml_backend_buft_is_host`);
   2. soma a VRAM livre de cada device e reserva 1,5 GiB de margem;
-  3. `cache = min(livre - margem, bytes_host)`; abaixo de 256 MiB, desliga;
+  3. `cache = min(livre - margem, bytes_host)`; abaixo de 256 MiB, desliga. A resolução
+     acontece **depois** do primeiro `sched_reserve()`, então a VRAM medida já desconta os
+     buffers de compute; com cache, um segundo `sched_reserve()` reserva o grafo de novo;
   4. loga o plano (`MoE cache auto: ...`).
 - Guardas: nunca resolve em contexto `no_alloc` (medição do `--fit`) nem quando não há
   expert em host (evita o `throw` do construtor com `n_tensors_host == 0`).
