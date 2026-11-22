@@ -668,6 +668,12 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         LABEL main
         ARGS --test-qsa-exact-tail -s 12345
     )
+    llama_test(
+        test-llama-archs
+        NAME test-moe-cache-partial
+        LABEL main
+        ARGS --test-moe-cache-partial -s 12345
+    )
 
     if (Python3_EXECUTABLE)
         add_test(NAME test-strata-trace

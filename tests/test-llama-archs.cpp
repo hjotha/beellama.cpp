@@ -11,6 +11,7 @@
 #ifdef TEST_LLAMA_ARCHS_INTERNAL
 #include "speculative.h"
 #include "../src/llama-context.h"
+#include "../src/llama-moe-cache.h"
 #include "../src/llama-kv-cache-kvarn.h"
 #include "../src/llama-memory-hybrid.h"
 #include "../src/llama-memory-hybrid-idx.h"
@@ -22,6 +23,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cstdint>
 #include <filesystem>
@@ -124,6 +126,24 @@ static void fill_exp_probs_b(std::vector<float> & dst, const char *, const tenso
     }
 }
 
+// the MoE cache partial-prefill test needs input-dependent routing, so it disables the
+// high router bias above: every token then selects different experts
+static bool g_moe_random_router = false;
+
+#ifdef TEST_LLAMA_ARCHS_INTERNAL
+static void moe_test_set_env(const char * name, const char * value) {
+#ifdef _WIN32
+    _putenv_s(name, value ? value : "");
+#else
+    if (value) {
+        setenv(name, value, 1);
+    } else {
+        unsetenv(name);
+    }
+#endif
+}
+#endif
+
 // a tensor whose values hold a property of their own, matched on a substring of its name, first match wins
 static const struct { const char * match; tensor_filler fill; } TENSOR_FILLERS[] = {
     { "ssm_a",       fill_ssm_a       },
@@ -137,6 +157,9 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
     tensor_filler fill = fill_normal;
     for (const auto & filler : TENSOR_FILLERS) {
         if (strstr(tensor->name, filler.match) != nullptr) {
+            if (g_moe_random_router && filler.fill == fill_exp_probs_b) {
+                continue;
+            }
             fill = filler.fill;
             break;
         }
@@ -174,6 +197,7 @@ static void usage(char ** argv) {
     LOG("      --test-mtp-qwen4exp     Run the qwen4exp native MTP decode/rollback regression\n");
     LOG("      --test-kvarn-state-restore Run the Bee KVarN self-contained state restore regression\n");
     LOG("      --test-qsa-exact-tail Run the QSA body/exact mask regression\n");
+    LOG("      --test-moe-cache-partial Run the MoE cache partial-prefill data path regression\n");
 #endif
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
@@ -1891,6 +1915,330 @@ static std::vector<float> get_logits(
     return ret;
 }
 
+#ifdef TEST_LLAMA_ARCHS_INTERNAL
+
+static std::vector<float> get_logits_two_seqs(
+        llama_model * model, llama_context * lctx,
+        const std::vector<llama_token> & tokens0,
+        const std::vector<llama_token> & tokens1) {
+    const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const uint32_t n_tokens = tokens0.size();
+    GGML_ASSERT(tokens1.size() == n_tokens);
+
+    common_batch batch(lctx);
+    for (uint32_t pos = 0; pos < n_tokens; pos++) {
+        batch.add(tokens0[pos], pos, 0, true);
+        batch.add(tokens1[pos], pos, 1, true);
+    }
+    if (llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
+        throw std::runtime_error("failed to decode the two-sequence batch");
+    }
+
+    std::vector<float> ret;
+    ret.reserve(2*n_tokens*n_vocab);
+    for (uint32_t i = 0; i < 2*n_tokens; i++) {
+        const float * logits_ith = llama_get_logits_ith(lctx, i);
+        GGML_ASSERT(logits_ith != nullptr);
+        ret.insert(ret.end(), logits_ith, logits_ith + n_vocab);
+    }
+    return ret;
+}
+
+struct moe_cache_test_run {
+    std::vector<float> logits;
+    llama_moe_cache_stats stats;
+    bool has_cache = false;
+};
+
+static std::vector<float> get_logits_at(
+        llama_model * model, llama_context * lctx,
+        const std::vector<llama_token> & tokens, llama_pos pos0) {
+    const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const uint32_t n_tokens = tokens.size();
+
+    common_batch batch(lctx);
+    for (uint32_t i = 0; i < n_tokens; i++) {
+        batch.add(tokens[i], pos0 + i, 0, true);
+    }
+    if (llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
+        throw std::runtime_error("failed to decode a chunk");
+    }
+
+    std::vector<float> ret;
+    ret.reserve(n_tokens*n_vocab);
+    for (uint32_t i = 0; i < n_tokens; i++) {
+        const float * logits_ith = llama_get_logits_ith(lctx, i);
+        GGML_ASSERT(logits_ith != nullptr);
+        ret.insert(ret.end(), logits_ith, logits_ith + n_vocab);
+    }
+    return ret;
+}
+
+static moe_cache_test_run run_moe_cache_test(
+        gguf_context * gguf_ctx, ggml_backend_dev_t dev,
+        const llama_model_tensor_buft_override * overrides,
+        size_t seed, float stdev, size_t cache_size, bool partial_flag,
+        bool random_router, const std::vector<llama_token> & tokens,
+        const std::vector<llama_token> & tokens_b) {
+    if (partial_flag) {
+        moe_test_set_env("LLAMA_MOE_CACHE_PARTIAL_PREFILL", "1");
+    } else {
+        moe_test_set_env("LLAMA_MOE_CACHE_PARTIAL_PREFILL", nullptr);
+    }
+    g_moe_random_router = random_router;
+
+    moe_cache_test_run res;
+    {
+        llama_model_ptr model = get_model(gguf_ctx, nullptr, seed, stdev, { dev }, LLAMA_SPLIT_MODE_LAYER, overrides);
+
+        llama_context_params ctx_params = llama_context_default_params();
+        ctx_params.n_ctx           = 256;
+        ctx_params.n_batch         = 128;
+        ctx_params.n_ubatch        = 64;
+        ctx_params.n_seq_max       = 2;
+        ctx_params.n_threads       = 4;
+        ctx_params.n_threads_batch = 4;
+        ctx_params.moe_cache_size  = cache_size;
+
+        llama_context_ptr lctx(llama_init_from_model(model.get(), ctx_params));
+        if (!lctx) {
+            throw std::runtime_error("failed to create the MoE cache test context");
+        }
+        res.logits = tokens_b.empty() ?
+            get_logits(model.get(), lctx.get(), tokens) :
+            get_logits_two_seqs(model.get(), lctx.get(), tokens, tokens_b);
+        if (const llama_moe_cache * cache = lctx->moe_cache_debug()) {
+            res.has_cache = true;
+            res.stats = cache->get_stats();
+        }
+    }
+    g_moe_random_router = false;
+    moe_test_set_env("LLAMA_MOE_CACHE_PARTIAL_PREFILL", nullptr);
+    return res;
+}
+
+static moe_cache_test_run run_moe_cache_mixed_test(
+        gguf_context * gguf_ctx, ggml_backend_dev_t dev,
+        const llama_model_tensor_buft_override * overrides,
+        size_t seed, float stdev, size_t cache_size, bool partial_flag,
+        const std::vector<llama_token> & head, const std::vector<llama_token> & tail) {
+    moe_test_set_env("LLAMA_MOE_CACHE_PARTIAL_PREFILL", partial_flag ? "1" : nullptr);
+
+    moe_cache_test_run res;
+    {
+        llama_model_ptr model = get_model(gguf_ctx, nullptr, seed, stdev, { dev }, LLAMA_SPLIT_MODE_LAYER, overrides);
+
+        llama_context_params ctx_params = llama_context_default_params();
+        ctx_params.n_ctx           = 256;
+        ctx_params.n_batch         = 128;
+        ctx_params.n_ubatch        = 64;
+        ctx_params.n_threads       = 4;
+        ctx_params.n_threads_batch = 4;
+        ctx_params.moe_cache_size  = cache_size;
+
+        llama_context_ptr lctx(llama_init_from_model(model.get(), ctx_params));
+        if (!lctx) {
+            throw std::runtime_error("failed to create the mixed MoE cache test context");
+        }
+        res.logits = get_logits_at(model.get(), lctx.get(), head, 0);
+        const std::vector<float> tail_logits = get_logits_at(model.get(), lctx.get(), tail, head.size());
+        res.logits.insert(res.logits.end(), tail_logits.begin(), tail_logits.end());
+        if (const llama_moe_cache * cache = lctx->moe_cache_debug()) {
+            res.has_cache = true;
+            res.stats = cache->get_stats();
+        }
+    }
+    moe_test_set_env("LLAMA_MOE_CACHE_PARTIAL_PREFILL", nullptr);
+    return res;
+}
+
+static int test_moe_cache_partial(size_t seed, float stdev) {
+    int failures = 0;
+    auto check = [&](bool ok, const char * what) {
+        if (!ok) {
+            LOG_ERR("%s: FAIL: %s\n", __func__, what);
+            failures++;
+        }
+    };
+
+    // admission and quota are compile-time checked too; this covers the runtime flag
+    check(llama_moe_cache_test_admit_partial(33, 128, 2, 255, true), "large batch cannot fill a partial group");
+    check(!llama_moe_cache_test_admit_partial(33, 128, 2, 255, false), "partial fill is not opt-in");
+    check(!llama_moe_cache_test_admit_partial(32, 128, 2, 255, true), "a small batch left the slot-map path");
+    check(!llama_moe_cache_test_admit_partial(33, 128, 2, 256, true), "a full group left the slot-map path");
+
+    // repeated ids: the second batch is a pure hit
+    {
+        const auto r = llama_moe_cache_test_plan_partial(4, 2, 2, {{ 1, 1, 2 }, { 1, 1, 2 }, { 2, 2 }});
+        check(r.size() == 3, "planner returned the wrong number of batches");
+        check(r[0].used == 2 && r[0].hits == 0 && r[0].fills == 2 && r[0].bypass == 0, "repeated ids: first batch");
+        check(r[1].used == 2 && r[1].hits == 2 && r[1].fills == 0 && r[1].bypass == 0, "repeated ids: second batch");
+        check(r[2].used == 1 && r[2].hits == 1 && r[2].fills == 0 && r[2].bypass == 0, "repeated ids: third batch");
+    }
+
+    // more selected experts than the group holds: part is resident, the rest is bypassed
+    {
+        const auto r = llama_moe_cache_test_plan_partial(4, 2, 2, {{ 0, 1, 2, 3 }, { 0, 1, 2, 3 }});
+        check(r[0].used == 4 && r[0].hits == 0 && r[0].fills == 2 && r[0].bypass == 2, "partial group: first batch");
+        check(r[1].used == 4 && r[1].hits == 2 && r[1].fills == 0 && r[1].bypass == 2, "partial group: second batch");
+    }
+
+    // an expert that was never seen replaces an unused resident expert once the quota is full
+    {
+        const auto r = llama_moe_cache_test_plan_partial(4, 2, 2, {{ 0, 1 }, { 2 }, { 0 }});
+        check(r[0].used == 2 && r[0].hits == 0 && r[0].fills == 2 && r[0].bypass == 0, "absent expert: first batch");
+        check(r[1].used == 1 && r[1].hits == 0 && r[1].fills == 1 && r[1].bypass == 0, "absent expert: second batch");
+        check(r[2].used == 1 && r[2].hits == 0 && r[2].fills == 1 && r[2].bypass == 0, "absent expert: third batch");
+    }
+
+    // each selected expert is exactly one of hit, fill or bypass, so bank fills plus direct
+    // copies never exceed the selected experts of the no-cache path
+    {
+        const auto r = llama_moe_cache_test_plan_partial(16, 5, 5, {
+            { 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 },
+            { 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 12 },
+            { 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0 },
+        });
+        for (const auto & b : r) {
+            check(b.hits + b.fills + b.bypass == b.used, "planner lost or duplicated a selected expert");
+            check(b.fills <= b.used - b.hits, "bank fills exceed the absent experts");
+            check(b.fills <= b.used && b.hits <= b.used && b.bypass <= b.used, "planner counters are out of range");
+        }
+    }
+
+    ggml_backend_dev_t dev = nullptr;
+    size_t best_free = 0;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t candidate = ggml_backend_dev_get(i);
+        const auto type = ggml_backend_dev_type(candidate);
+        if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            continue;
+        }
+        size_t free_b = 0;
+        size_t total_b = 0;
+        ggml_backend_dev_memory(candidate, &free_b, &total_b);
+        if (dev == nullptr || free_b > best_free) {
+            dev = candidate;
+            best_free = free_b;
+        }
+    }
+    if (dev == nullptr) {
+        LOG("%s: planner checks done, no GPU backend, skipping the MoE cache data path\n", __func__);
+        return failures == 0 ? 0 : 1;
+    }
+
+    moe_test_set_env("LLAMA_MOE_CACHE_PARTIAL_PREFILL", nullptr);
+    if (llama_moe_cache::partial_prefill_enabled()) {
+        LOG_ERR("%s: partial prefill enabled without the environment flag\n", __func__);
+        return 1;
+    }
+    moe_test_set_env("LLAMA_MOE_CACHE_PARTIAL_PREFILL", "1");
+    if (!llama_moe_cache::partial_prefill_enabled()) {
+        LOG_ERR("%s: partial prefill flag is not read\n", __func__);
+        return 1;
+    }
+    moe_test_set_env("LLAMA_MOE_CACHE_PARTIAL_PREFILL", nullptr);
+
+    const llama_model_tensor_buft_override overrides[] = {
+        { LLM_FFN_EXPS_REGEX, ggml_backend_cpu_buffer_type() },
+        { nullptr, nullptr },
+    };
+
+    // one MoE layer with 64 experts and top-2; 2 MiB holds only a fraction of the group
+    constexpr size_t cache_size = 2*1024*1024;
+
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_DEEPSEEK2, true);
+    const std::vector<llama_token> tokens_a = get_tokens(128, 128, seed);
+    const std::vector<llama_token> tokens_b = get_tokens(128, 128, seed + 1);
+
+    for (const bool random_router : { false, true }) {
+        const moe_cache_test_run ref = run_moe_cache_test(gguf_ctx.get(), dev, overrides,
+                seed, stdev, 0, false, random_router, tokens_a, {});
+        const moe_cache_test_run off = run_moe_cache_test(gguf_ctx.get(), dev, overrides,
+                seed, stdev, cache_size, false, random_router, tokens_a, {});
+        const moe_cache_test_run on  = run_moe_cache_test(gguf_ctx.get(), dev, overrides,
+                seed, stdev, cache_size, true, random_router, tokens_a, {});
+
+        check(off.has_cache && on.has_cache, "the MoE cache was not created");
+        const double nmse_ref_off = nmse(ref.logits, off.logits);
+        const double nmse_ref_on  = nmse(ref.logits, on.logits);
+        const double nmse_off_on  = nmse(off.logits, on.logits);
+        LOG("%s: router=%s NMSE ref/off=%.3e ref/on=%.3e off/on=%.3e | off copy=%.2f MiB | "
+            "on hits=%zu fills=%zu bypass=%zu fill=%.2f MiB copy=%.2f MiB\n",
+            __func__, random_router ? "random" : "biased",
+            nmse_ref_off, nmse_ref_on, nmse_off_on,
+            off.stats.large_copy_bytes/1024.0/1024.0,
+            on.stats.large_hits, on.stats.large_fills, on.stats.large_bypass,
+            on.stats.large_fill_bytes/1024.0/1024.0, on.stats.large_copy_bytes/1024.0/1024.0);
+
+        check(nmse_ref_on  <= 1e-6, "NMSE of the partial prefill path against no cache is above 1e-6");
+        check(nmse_ref_off <= 1e-6, "NMSE of the cache with the flag off against no cache is above 1e-6");
+        check(nmse_off_on  <= 1e-6, "NMSE of the partial prefill path against the flag-off path is above 1e-6");
+        check(on.stats.large_batches > 0, "no large batch reached the partial prefill path");
+        check(on.stats.large_fills > 0, "the partial prefill path admitted no expert");
+        check(on.stats.large_hits > 0, "the partial prefill path reused no expert");
+        check(on.stats.large_fill_bytes + on.stats.large_copy_bytes <= off.stats.large_copy_bytes,
+                "the flag uploaded more bytes than the flag-off baseline");
+        if (random_router) {
+            check(on.stats.large_bypass > 0, "the random router did not exercise the bypass path");
+        }
+    }
+
+    // n_tokens <= 32 keeps using the slot map, with the flag on or off
+    {
+        const std::vector<llama_token> small(tokens_a.begin(), tokens_a.begin() + 6);
+        const moe_cache_test_run ref = run_moe_cache_test(gguf_ctx.get(), dev, overrides,
+                seed, stdev, 0, false, false, small, {});
+        const moe_cache_test_run on  = run_moe_cache_test(gguf_ctx.get(), dev, overrides,
+                seed, stdev, cache_size, true, false, small, {});
+        const double nmse_small = nmse(ref.logits, on.logits);
+        LOG("%s: small batch NMSE=%.3e, partial batches=%zu\n", __func__, nmse_small, on.stats.large_batches);
+        check(nmse_small <= 1e-6, "NMSE of the small-batch slot map path is above 1e-6");
+        check(on.stats.large_batches == 0, "a small batch entered the large-batch fill path");
+    }
+
+    // group of two sequences in the same ubatch
+    {
+        const std::vector<llama_token> ta(tokens_a.begin(), tokens_a.begin() + 64);
+        const std::vector<llama_token> tb(tokens_b.begin(), tokens_b.begin() + 64);
+        const moe_cache_test_run ref = run_moe_cache_test(gguf_ctx.get(), dev, overrides,
+                seed, stdev, 0, false, false, ta, tb);
+        const moe_cache_test_run on  = run_moe_cache_test(gguf_ctx.get(), dev, overrides,
+                seed, stdev, cache_size, true, false, ta, tb);
+        const double nmse_two = nmse(ref.logits, on.logits);
+        LOG("%s: two sequences NMSE=%.3e, hits=%zu fills=%zu bypass=%zu\n",
+                __func__, nmse_two, on.stats.large_hits, on.stats.large_fills, on.stats.large_bypass);
+        check(nmse_two <= 1e-6, "NMSE of the two-sequence partial prefill is above 1e-6");
+        check(on.stats.large_batches > 0, "two sequences did not exercise the large-batch path");
+    }
+
+    // prefill then decode in the same context: the large batch fills the group and the
+    // 2-token batch goes back through the slot map, sharing the same SLRU
+    {
+        const std::vector<llama_token> head(tokens_a.begin(), tokens_a.begin() + 64);
+        const std::vector<llama_token> tail(tokens_b.begin(), tokens_b.begin() + 2);
+        const moe_cache_test_run ref = run_moe_cache_mixed_test(gguf_ctx.get(), dev, overrides,
+                seed, stdev, 0, false, head, tail);
+        const moe_cache_test_run off = run_moe_cache_mixed_test(gguf_ctx.get(), dev, overrides,
+                seed, stdev, cache_size, false, head, tail);
+        const moe_cache_test_run on  = run_moe_cache_mixed_test(gguf_ctx.get(), dev, overrides,
+                seed, stdev, cache_size, true, head, tail);
+        const double nmse_mixed = nmse(ref.logits, on.logits);
+        LOG("%s: prefill+decode NMSE ref/on=%.3e ref/off=%.3e off/on=%.3e, hits=%zu fills=%zu bypass=%zu\n",
+                __func__, nmse_mixed, nmse(ref.logits, off.logits), nmse(off.logits, on.logits),
+                on.stats.large_hits, on.stats.large_fills, on.stats.large_bypass);
+        check(nmse_mixed <= 1e-6, "NMSE of the prefill-then-decode path is above 1e-6");
+        check(nmse(ref.logits, off.logits) <= 1e-6, "NMSE of the flag-off prefill-then-decode path is above 1e-6");
+        check(nmse(off.logits, on.logits) <= 1e-6, "the flag changed the prefill-then-decode logits");
+        check(on.stats.large_batches > 0, "prefill did not exercise the partial path");
+        check(on.stats.large_fills > 0, "prefill admitted no expert before the decode");
+    }
+
+    return failures == 0 ? 0 : 1;
+}
+
+#endif // TEST_LLAMA_ARCHS_INTERNAL
+
 // entries [n/4, n/2) are embd rows, decoded either as token/embd/token chunks or as one mixed batch
 // returns the llama_process() error code
 static int32_t get_logits_mixed(
@@ -2509,6 +2857,7 @@ int main(int argc, char ** argv) {
     bool test_qwen4exp_mtp = false;
     bool test_kvarn_restore = false;
     bool test_qsa_tail = false;
+    bool test_moe_partial = false;
     std::string test_ple_path;
 #endif
 
@@ -2593,6 +2942,8 @@ int main(int argc, char ** argv) {
             test_ple_path = argv[++i];
         } else if (strcmp(argv[i], "--test-qsa-exact-tail") == 0) {
             test_qsa_tail = true;
+        } else if (strcmp(argv[i], "--test-moe-cache-partial") == 0) {
+            test_moe_partial = true;
 #endif
         } else {
             LOG_ERR("%s: unknown argument: %s\n", __func__, argv[i]);
@@ -2630,6 +2981,9 @@ int main(int argc, char ** argv) {
         }
         if (test_qsa_tail) {
             return test_qsa_exact_tail(seed);
+        }
+        if (test_moe_partial) {
+            return test_moe_cache_partial(seed, stdev);
         }
         if (!test_ple_path.empty()) {
             return test_ple_prefetch(seed, test_ple_path);

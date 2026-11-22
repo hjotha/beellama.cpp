@@ -6283,6 +6283,9 @@ ggml_status llama_context::graph_compute(
     }
 
     copy_experts.reset();
+    if (moe_cache) {
+        moe_cache->begin_batch();
+    }
 
     auto status = profile ? ggml_backend_sched_graph_compute_profile(sched.get(), gf) :
         ggml_backend_sched_graph_compute_async(sched.get(), gf);
@@ -6343,17 +6346,25 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
             ggml_backend_synchronize(backend);
         }
 
+        st.ids_flat.resize((size_t) ids->ne[0]*ids->ne[1]);
         st.used.assign(n_expert, false);
         for (int64_t i1 = 0; i1 < ids->ne[1]; i1++) {
             for (int64_t i0 = 0; i0 < ids->ne[0]; i0++) {
                 const int32_t id = st.ids_data[i1*ids->nb[1]/sizeof(int32_t) + i0*ids->nb[0]/sizeof(int32_t)];
                 GGML_ASSERT(id >= 0 && id < n_expert);
                 st.used[id] = true;
+                st.ids_flat[i1*ids->ne[0] + i0] = id;
             }
         }
 
         st.ids = ids;
     }
+
+    // a large batch of a partial group fills its slots here, before the copy of this tensor
+    if (lctx->moe_cache && !st.ids_flat.empty()) {
+        lctx->moe_cache->prepare_layer(backend, src, st.ids_flat.data(), st.ids_flat.size(), ids->ne[1]);
+    }
+    const bool moe_cached = lctx->moe_cache && lctx->moe_cache->get_experts(src) != nullptr;
 
     llama_moe_upload upload(backend);
 
@@ -6377,7 +6388,11 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
                 continue;
             }
             if (next < e) {
-                upload.set(dst, (const uint8_t *) src->data + next*expert_size, next*expert_size, (e - next)*expert_size);
+                const size_t bytes = (size_t) (e - next)*expert_size;
+                upload.set(dst, (const uint8_t *) src->data + next*expert_size, next*expert_size, bytes);
+                if (moe_cached) {
+                    lctx->moe_cache->note_copy_upload(bytes);
+                }
             }
             if (bypass.enabled) bypass.event.bytes += n*expert_size; // resident D2D
             e   += n;
@@ -6390,6 +6405,9 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         const size_t size    = (last + 1 - next)*expert_size + padding;
         if (size > 0) {
             upload.set(dst, (const uint8_t *) src->data + offset, offset, size);
+            if (moe_cached) {
+                lctx->moe_cache->note_copy_upload(size);
+            }
         }
 
         first = last + 1;
@@ -8995,6 +9013,9 @@ void llama_context::opt_epoch_iter(
                 }
             }
             copy_experts.reset();
+            if (moe_cache) {
+                moe_cache->begin_batch();
+            }
             ggml_opt_eval(opt_ctx, result);
             if (callback) {
                 callback(train, opt_ctx, dataset, result, idata_in_loop + (pos_ctx + pos_batch)/n_ubatch + 1, ndata_in_loop, t_loop_start);
