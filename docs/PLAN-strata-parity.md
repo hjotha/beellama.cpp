@@ -347,6 +347,36 @@ sobe de 12,7 para 26,0 s) deu +0,07% (1.550,44 → 1.551,49 t/s), dentro da disp
 plano de grafo entre ubatches de mesma forma (2,6 s de `prep`), e só então otimizar kernels por
 classe com trace.
 
+## Integração 2026-11-22 (parity12): cache parcial, MMQ gate/up e atribuição por op
+
+Branch de integração `feat/strata-merge` = `main` + `feat/moe-partial` + `feat/op-gpu` + `feat/mmq-gate-up`
++ correções de política e de build. O protótipo de fallback CPU ficou **fora** (revisão independente deu
+BLOCK: perda de write-back com mais de um miss por token e escala `amax`).
+
+**Admissão parcial do cache de experts** (`LLAMA_MOE_CACHE_PARTIAL_PREFILL=1`, A100, IQ3_S, `-ub 2048`):
+
+| config | pp4k | pp28k | decode 28k | VRAM |
+|---|---:|---:|---:|---:|
+| `parity7`, `-ncmoe 44`, cache 16 GB | 479,5 | 647,2 | 25,2 | 26.996 |
+| `parity9` parcial, `-ncmoe 44`, cache 16 GB | 545,6 (+13,8%) | 818,9 (+26,5%) | 24,5 | 26.996 |
+| `parity9` parcial, `-ncmoe 44`, cache 20 GB | 578,9 | **914,8 (+41,4%)** | 25,5 | 30.994 |
+
+Saída greedy **idêntica** nos três braços. Contra o melhor placement anterior (740,9 t/s), +23%.
+
+**MMQ gate/up compartilhado** (`LLAMA_MMQ_GATE_UP_SHARED_Q8=1`, Q2_0, `-ub 2048`, 3 execuções):
+pp4k 1.754,3 → 1.782,8 (+1,6%), pp28k 1.831,4 → **1.850,2 (+1,0%)**, decode igual; saída idêntica e
+`test-mmq-gate-up` bit-exato em CUDA (q2_0/iq3_s).
+
+**Atribuição por op de GPU** (`LLAMA_OP_PROFILE_GPU=1`, IQ3_S, `-ncmoe 36`): `MUL_MAT_ID` 42,9%,
+`MUL_MAT` 29,8%, `TOP_K` 6,9%, `FLASH_ATTN_EXT` 5,2%, `GATED_DELTA_NET` 3,3%. A soma dos grafos de GPU é
+4,665 s contra 43,8 s de parede: **89% do prefill do IQ3_S é o split de CPU**, não a GPU.
+
+**Artefato final (parity12)**: `deepseek2` 3/3 (off e parcial), `MUL_MAT_ID`/`MUL_MAT` 2/2, ctest CPU 5/5.
+A100 com Q2_0: sem spec pp28k **1.827,0** t/s (igual ao parity6), DFlash2 n-max 7 **82,0 t/s** no decode
+pós-28k e 84,7 no pós-4k (2 execuções; dispersão 77,6-93,7), hashes idênticos aos registros anteriores.
+Diferença restante para a Strata: prefill 1.850 vs 4.629 (2,5×) e, com IQ3_S, 915 vs 4.629 (5,1×) —
+compute por token, com o tier de CPU como maior alvo.
+
 ## Prefill: ubatch e teto de compute (A100, 2026-11-22, `feat/strata-prefill`)
 
 Medição com o mesmo alvo/engine, `-b/-ub` variando e o resto fixo (2 runs, pp28k estável):

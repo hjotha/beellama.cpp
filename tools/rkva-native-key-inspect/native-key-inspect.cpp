@@ -153,7 +153,7 @@ rkva_native_key_inspect::result inspect_impl(int fd) {
     const uint64_t prefix_end=r.pos;
     need(sha256(raw,size_t(rkva_native_state::kHeaderBytes+h.payload_bytes))==rkva_snapshot::hex(native_footer),"RKVK checksum mismatch");
     for(uint32_t i=0;i<h.layers;i++) {
-        const uint64_t positions_offset=native_start+rkva_native_state::kHeaderBytes+uint64_t(i)*h.layer_bytes+h.layer_bytes-rkva_native_state::positions_bytes();
+        const uint64_t positions_offset=native_start+rkva_native_state::kHeaderBytes+uint64_t(i)*h.layer_bytes+h.layer_bytes-rkva_native_state::positions_bytes(h.layout);
         check_ring(b+positions_offset,h.layout);
     }
     check_sckp(r,tokens);

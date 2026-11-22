@@ -668,6 +668,12 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         LABEL main
         ARGS --test-qsa-exact-tail -s 12345
     )
+    llama_test(
+        test-llama-archs
+        NAME test-moe-cache-partial
+        LABEL main
+        ARGS --test-moe-cache-partial -s 12345
+    )
 
     if (Python3_EXECUTABLE)
         add_test(NAME test-strata-trace
@@ -1424,6 +1430,8 @@ endif()
 
 # Bee backend coverage uses the canonical cache-type registry from common/arg.cpp.
 llama_build(test-backend-ops.cpp LINK llama-common)
+llama_build(test-mmq-gate-up.cpp LINK ggml)
+target_include_directories(test-mmq-gate-up PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 llama_build_and_test(test-turboquant-nc.cpp LINK ggml)
 target_include_directories(test-turboquant-nc PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 if (TARGET ggml-cpu)
