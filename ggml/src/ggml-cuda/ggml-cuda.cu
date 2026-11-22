@@ -6093,18 +6093,6 @@ static bool ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     // scratch pool is stack-like, so all releases happen globally in reverse.
     std::vector<std::unique_ptr<ggml_cuda_pool_alloc<char>>> gb10_pool_allocations;
 
-    std::map<const ggml_tensor *, std::array<int, GGML_TYPE_COUNT>> gb10_shared_q8_consumer_counts;
-    for (int j = 0; j < cgraph->n_nodes; ++j) {
-        const ggml_tensor * candidate = cgraph->nodes[j];
-        if (candidate->op == GGML_OP_MUL_MAT && candidate->src[0] && candidate->src[1]) {
-            ++gb10_shared_q8_consumer_counts[candidate->src[1]][candidate->src[0]->type];
-        }
-    }
-    const auto gb10_shared_q8_consumer_count = [&](const ggml_tensor * src1, ggml_type type) {
-        const auto it = gb10_shared_q8_consumer_counts.find(src1);
-        return it == gb10_shared_q8_consumer_counts.end() ? 0 : it->second[type];
-    };
-
     static const bool virtual_rms_q8_enabled = [] {
         const char * env = getenv("GGML_CUDA_GB10_VIRTUAL_RMS_Q8");
         return !env || std::atoi(env) != 0;
@@ -6113,6 +6101,25 @@ static bool ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         const char * env = getenv("GGML_CUDA_GB10_SHARED_Q8");
         return !env || std::atoi(env) != 0;
     }();
+
+    // Only the DGX Spark (GB10) path reads the consumer counts; building the
+    // map on every other device is pure host work per graph execution.
+    const bool gb10_shared_q8_device = shared_q8_enabled &&
+        ggml_cuda_info().devices[cuda_ctx->device].cc == GGML_CUDA_CC_DGX_SPARK;
+
+    std::map<const ggml_tensor *, std::array<int, GGML_TYPE_COUNT>> gb10_shared_q8_consumer_counts;
+    if (gb10_shared_q8_device) {
+        for (int j = 0; j < cgraph->n_nodes; ++j) {
+            const ggml_tensor * candidate = cgraph->nodes[j];
+            if (candidate->op == GGML_OP_MUL_MAT && candidate->src[0] && candidate->src[1]) {
+                ++gb10_shared_q8_consumer_counts[candidate->src[1]][candidate->src[0]->type];
+            }
+        }
+    }
+    const auto gb10_shared_q8_consumer_count = [&](const ggml_tensor * src1, ggml_type type) {
+        const auto it = gb10_shared_q8_consumer_counts.find(src1);
+        return it == gb10_shared_q8_consumer_counts.end() ? 0 : it->second[type];
+    };
 
 
     const auto try_launch_concurrent_event = [&](const ggml_tensor * node) {
@@ -6216,8 +6223,34 @@ static bool ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     }
                 }
             }
+            int64_t op_profile_us[GGML_OP_COUNT] = {};
+            int64_t op_profile_submit_us = 0;
+            int64_t op_profile_fuse_us   = 0;
+            bool    op_profile_reported  = false;
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
+
+                // Local env-gated diagnostic: host-side submit time per op for the
+                // first 15 ms of a prefill graph. Zero overhead when unset.
+                static const bool op_profile = [] {
+                    const char * v = getenv("LLAMA_OP_PROFILE");
+                    return v != nullptr && *v != '\0' && strcmp(v, "0") != 0;
+                }();
+                if (op_profile && !op_profile_reported && op_profile_submit_us >= 15000) {
+                    op_profile_reported = true;
+                    char buf[512];
+                    size_t off = (size_t) snprintf(buf, sizeof(buf),
+                            "nodes=%d submit_ms=%.1f fuse_ms=%.1f",
+                            cgraph->n_nodes, op_profile_submit_us / 1000.0, op_profile_fuse_us / 1000.0);
+                    for (int op = 0; op < GGML_OP_COUNT && off + 64 < sizeof(buf); ++op) {
+                        if (op_profile_us[op] * 50 < op_profile_submit_us) {
+                            continue;
+                        }
+                        off += (size_t) snprintf(buf + off, sizeof(buf) - off, " %s=%.0f",
+                                ggml_op_name((enum ggml_op) op), op_profile_us[op] / 1000.0);
+                    }
+                    GGML_LOG_INFO("[OP PROF] %s\n", buf);
+                }
 #ifdef USE_CUDA_GRAPH
                 // A cut never splits a fusion or an unjoined concurrent region.
                 if (use_cuda_graph && chunk_size > 0 && i >= chunk_end && !is_concurrent_event_active) {
@@ -6327,7 +6360,11 @@ static bool ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     }
                 }
 
+                const int64_t op_fuse_t0 = op_profile ? ggml_time_us() : 0;
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i, has_shifted_reference_plan);
+                if (op_profile) {
+                    op_profile_fuse_us += ggml_time_us() - op_fuse_t0;
+                }
 
                 if (nodes_to_skip != 0) {
 #ifdef GGML_CUDA_DEBUG
@@ -6408,7 +6445,13 @@ static bool ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
+                const int64_t op_submit_t0 = op_profile ? ggml_time_us() : 0;
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                if (op_profile) {
+                    const int64_t op_submit_us = ggml_time_us() - op_submit_t0;
+                    op_profile_us[node->op] += op_submit_us;
+                    op_profile_submit_us  += op_submit_us;
+                }
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
@@ -6976,6 +7019,13 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         ggml_cuda_set_device(cuda_ctx->device);
         for (int i = 0; i + 5 < cgraph->n_nodes; ++i) {
             if (cgraph->nodes[i]->op != GGML_OP_MUL_MAT_ID) {
+                continue;
+            }
+            // ggml_cuda_match_shared_expert only accepts the routed prefix
+            // (MUL_MAT_ID, MUL_MAT_ID, GLU); without it the forward scan can
+            // never match, so skip it instead of walking to the next pair.
+            if (cgraph->nodes[i + 1]->op != GGML_OP_MUL_MAT_ID ||
+                cgraph->nodes[i + 2]->op != GGML_OP_GLU) {
                 continue;
             }
             for (int j = i + 3; j + 2 < cgraph->n_nodes; ++j) {
