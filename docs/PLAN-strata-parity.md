@@ -346,3 +346,36 @@ sobe de 12,7 para 26,0 s) deu +0,07% (1.550,44 → 1.551,49 t/s), dentro da disp
 **Próximo alvo de prefill**, na ordem: reduzir submissões host por token (splits/ubatch), reusar o
 plano de grafo entre ubatches de mesma forma (2,6 s de `prep`), e só então otimizar kernels por
 classe com trace.
+
+## Prefill: ubatch e teto de compute (A100, 2026-11-22, `feat/strata-prefill`)
+
+Medição com o mesmo alvo/engine, `-b/-ub` variando e o resto fixo (2 runs, pp28k estável):
+
+| config | pp4k | pp28k | pp28k+dec tg | VRAM pronto |
+|---|---:|---:|---:|---:|
+| `-b 2048 -ub 1024` | 1.449,7\* | 1.575,7 | 40,75 | 37.098 |
+| `-b 2048 -ub 2048` | 1.762,9 | **1.831,7** | 44,24 | 37.528 |
+| `-b 4096 -ub 4096` | erro 500 | erro 500 | — | 38.382 |
+
+\* primeira execução fria; a segunda deu 1.551,9.
+
+Modelo de dois pontos: **181 ms fixos por ubatch** + **457 µs/token (~2.190 t/s
+assintótico)**. Em `-ub 1024` o custo fixo responde por 5,1 s dos 18,1 s do pp28k; por isso
+`-ub 2048` rende +16% e o teto com ubatch maior é ~2,0-2,2k t/s. A Strata (4.629 t/s em 28k) está
+~2,1× acima desse teto: a diferença restante é compute por token, não agendamento.
+
+`-ub 4096` carrega mas devolve `500 Compute error` em todo request (não é OOM; pico 38.456 MiB) —
+limite de geometria/kernel a investigar só se o teto de ubatch importar.
+
+A leitura anterior de "96,7% host" fica corrigida: `device_host_us` inclui sincronizações internas
+do nó e, principalmente, **back-pressure da fila CUDA** (o host bloqueia no launch quando a GPU está
+atrás). O perfil por op (`LLAMA_OP_PROFILE=1`) mostra `submit_ms` crescendo com nós de `TOP_K`,
+`FLASH_ATTN_EXT` e `MUL_MAT` a ~1 ms/nó, sem sync no código do top-k: é o dispositivo que manda.
+Conclusão: o prefill é **compute-bound** no teto de ~2,19k t/s; o que resta contra a Strata são
+kernels por token, não agendamento.
+
+Os dois patches default-on (poda da busca de fusão em `graph_optimize` e mapa de consumidores GB10
+só em DGX Spark) deram **empate técnico** no A/B `parity6` × `parity7` (`-ub 2048`, 3 runs:
+1.830,2 vs 1.830,5 t/s no pp28k; 1.766,2 vs 1.768,4 no pp4k) com saída bit-idêntica; ficam como
+remoção de trabalho impossível, não como ganho. Detalhes em
+[strata-prefill-ub-20261122.md](agent-reports/strata-prefill-ub-20261122.md).
