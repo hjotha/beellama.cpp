@@ -41,6 +41,79 @@ See [split attention and RKVA](#split-attention-and-xbox-rkva) below and [tools/
 - **DFlash multi-device experiments**: explicit target-feature exchange, optional prefetch, and an auxiliary shadow drafter alongside MTP, with observation as the default.
 - **Serving extensions from this fork**: adaptive resident contexts, unified disk snapshots, cross-tier q4_0-to-KVarN conversion, CUDA recovery, paged KV/SnapKV and AMD/NVIDIA power controls, detailed below.
 
+## Feature catalog (what this fork supports)
+
+A dense inventory for agents and users. Exact option names live in [common/arg.cpp](common/arg.cpp) and [docs/beellama-args.md](docs/beellama-args.md); this list exists so that a capability is visible before reading the parser.
+
+### Models
+
+- **173 architecture drivers** in [src/models](src/models), including Qwen2/2.5/3/3-MoE/3.5/3-Next/4-Exp, Qwen2-VL/3-VL, DeepSeek-V2/V3/3.2/V4/V4.1, GLM4/4-MoE/5-Next, Llama/3/4, Mistral 3/4/Large-4, Gemma 2/3/3n/4 (+assistant/embedding), Cohere2/2-MoE, DBRX, Jamba, Falcon/Falcon-H1, Mamba/Mamba2, RWKV6/7, Nemotron/H, OLMoE/OLMo2, ArrowMoe, BailingMoE2/3, Hunyuan (dense/MoE/VL), Exaone (dense/4/MoE), Granite (dense/MoE/hybrid/SWA/switch), Phi2/3, MiniCPM3, Kimi-K3/Linear, MiniMax-01/M2/M3, Seed-OSS, PLaMo, LFM2/3, Grok, DSpark, Eagle3, DFlash, Gemma embedding, BERT family (ModernBERT, Jina, Nomic, Neo, EuroBERT), OCR (DeepSeek-OCR, PaddleOCR), TTS (Qwen3-TTS, PocketTTS, WavTokenizer, Fish/Spark), `llada`/`llada-moe`, `bitnet`, and more.
+- **Vision/multimodal** through `mtmd` (Qwen2-VL, Qwen3-VL, Gemma3, MiniCPM-V, LLaVA-style CLIP/projectors, DeepSeek-OCR, Hunyuan-VL, InternVL-style).
+
+### Weight formats
+
+- Standard GGUF quants (Q2_K…Q8_0, IQ1_S…IQ4_XS, MXFP4, NVFP4) plus fork types `Q1_0`, `Q2_0`, `Q2_0S`, `PQ2_0`, `PTQ1_0`, `Q2_1`, `Q3_0`, `Q3_1`, `Q6_0`, `Q6_1`.
+- **EXL3** tensors, **PrismML/Bonsai** (`PQ2_0`/`PTQ1_0`) with folded Hadamard/FWHT execution.
+- **SINQ-conditioned** GGUF/IQ files (`--sinq-*`, see [docs/sinq.md](docs/sinq.md)) — these require BeeLlama.
+- `--hf-repo`/`--hf-file` and `--model-url` downloads, including **stream-to-VRAM** (`--hf-stream-vram`, `--hf-stream-disk-mode`, `--hf-stream-chunk-mb`, `--hf-download-threads`).
+
+### KV cache
+
+- **Types** (`--cache-type-k/-v`): `f32`, `f16`, `bf16`, `q8_0`, `q4_0`, `q4_1`, `iq4_nl`, `q5_0`, `q5_1`, `q6_0`, `q6_1`, `q3_0`, `q3_1`, `q2_0`, `q2_1`, `saw_int4`, `tqnc_k`/`tqnc_v` (TurboQuant NC), and **KVarN** `kvarn2`…`kvarn8` with independent K/V widths, 64/128/256/512-dim heads, SWA overrides (`--cache-type-k-swa`, `--cache-type-v-swa`) and `--kvarn-window-chunk`.
+- **Precision tail** for quantized caches: `--kv-tail-tokens` (`N`, `N0,N1`, `full=N,swa=N`, `auto`, `none`) and `--kv-tail-type` (`f16`/`bf16`).
+- **Placement and growth**: `--kv-offload`/`--no-kv-offload`, `--kv-unified`/`--kv-unified-per-slot`, `--kv-position-split-p`, `--kv-paged` (+ `--kv-paged-admission-blocks`, `--kv-paged-dynamic`, `--kv-paged-prealloc-max`, `--kv-paged-watermark`, `--paged-attn-cuda`), SnapKV (`--snapkv`, `--snapkv-budget-blocks`, `--snapkv-pinned`, `--snapkv-recent`, `--snapkv-retention`), `--swa-checkpoints`, `--swa-full`, `--kv-block-size`, `--kv-mean-center`.
+- **Draft-owned caches**: `--spec-draft-type-k/-v`, `--spec-draft-kvarn-window-chunk`, plus the 7 context-size tiers (`-short/-s`, `-m`, `-l`, `-xl`, `-xxl`, `-xxxl`, `-long/-xlong/-xxlong/-xxxlong`) for cache type, draft depth and `p-min`.
+
+### Speculative decoding
+
+- **Types** (`--spec-type`, repeatable): `draft-simple`, `draft-dflash` (DFlash1/DFlash2, incl. Qwen3.5/4-Exp target-feature capture), `draft-mtp` (Qwen MTP sidecars and shared Gemma 4 MTP), `draft-eagle3`, `draft-dspark`, `ngram-simple`, `ngram-map-k`, `ngram-map-k4v`, `ngram-mod`.
+- **Drafter placement**: `--spec-draft-ngl`, `--spec-draft-ncmoe`/`--spec-draft-n-cpu-moe`, `--spec-draft-cpu-moe`, CPU masks (`--spec-draft-cpu-mask`, `-batch`, `--spec-draft-cpu-range`, `-batch`, `--spec-draft-cpu-strict`, `-batch`), `--spec-draft-device`, `--spec-draft-override-tensor`, `--spec-draft-threads`, `--spec-draft-ubatch-size`/`--spec-draft-n-ubatch`, `--spec-draft-no-op-offload`.
+- **Scheduling and profit control**: `--spec-draft-n-max`/`-n-min`, per-tier `--spec-draft-n-max-*` and `--spec-draft-p-min-*`, `--spec-draft-p-split`, `--spec-draft-prio`/`-batch`, `--spec-draft-poll`/`-batch`, `--spec-dm-controller` and its `--spec-dm-profit-*` knobs (adaptive draft depth from measured profit), `--spec-draft-backend-sampling`, `--spec-default`.
+- **DFlash2 extras**: local split (`--spec-draft-local-split`, `--spec-draft-local-prefetch`), Xbox RPC capture (`DFLASH_XBOX_RPC` and its env family), shadow/auxiliary drafter (`--spec-draft-shadow-model`, `-ngl`, `-device`, `-n-max`, `-p-min`).
+- **N-gram tuning**: `--spec-ngram-*` (sizes, min hits, mod match length) and `--spec-synth-len`/`--spec-synth-rates` for synthetic probing.
+
+### MoE placement and expert cache
+
+- Static placement: `--n-cpu-moe`/`--cpu-moe`, `--cpu-moe-draft`, `--moe-host-pinned`/`--no-moe-host-pinned`.
+- **Expert cache in VRAM** (`--moe-cache-mib N`, `-1` = auto-sized from free device memory) with an SLRU, complete-group admission for large prefill batches, an optional immutable device map, upload overlap and a pinned ring. Tuning via environment: `LLAMA_MOE_CACHE_PREFILL`, `LLAMA_MOE_MAP_DEVICE`, `LLAMA_MOE_UPLOAD_OVERLAP`, `LLAMA_MOE_PINNED_RING`, `LLAMA_MOE_CACHE_PARTIAL_PREFILL` (partial-group admission for prefill; default off), `LLAMA_MOE_CPU_FALLBACK` (experimental CPU-computes-misses tier; default off, prototype).
+- **Fused expert GEMM**: `LLAMA_MMQ_GATE_UP_SHARED_Q8=1` shares expert routing and the Q8_1 activation between adjacent gate/up MMQ pairs (Q2_0/IQ3_S; bit-exact, default off).
+
+### Loading, memory and long context
+
+- Fit and load: `--fit`, `--fit-ctx`, `--fit-target`, `--fit-print`, `--lazy-mode`, `--load-mode` (`auto`/`none`/`mmap`/`mlock`/`mmap+mlock`/`dio`), `--cache-ram`.
+- **Adaptive context and disk restore**: `--adaptive-target`, `--adaptive-decay`, `--adaptive-direct-pure-disk-restore`, `--native-snapshot-auto-save`/`-auto-restore`, `--rkva-disk-snapshots`.
+- **Overflow**: `--ovf-cont-kv`, `--ovf-packed-view`, `--ovf-qwht-cuda`, `--ovf-tail-local-cuda` (+ `--no-ovf-*`), for keeping a long prefix in a packed overflow tier.
+- **Remote/split attention**: `--remote-attn`, `--remote-attn-layers`, `--remote-attn-format`, `--remote-attn-wire-format`, `--remote-attn-upload-format`, `--remote-attn-activation-format`, `--remote-attn-cache-type-k/-v`, `--remote-attn-min-context`, `--remote-attn-prefill`, `--remote-attn-stats`, `--remote-attn-cuda-reserve`, `--remote-attn-vulkan-reserve` (TCP/Vulkan/Xbox RKVA companion).
+
+### Serving and state
+
+- OpenAI-compatible `llama-server`, `llama-cli`, `llama-bench`, `llama-perplexity`, `llama-quantize`, `llama-imatrix`, `llama-gemma3-cli`, `llama-llava-cli`, `llama-minicpmv-cli`, etc.
+- **Router mode**: `--models-preset`, `--models-dir`, `--models-max`, `--models-autoload`, `--models-memory-margin` (multi-model server with LRU eviction).
+- **INI presets**: `--models-preset PATH` sections with reusable arguments for the router ([docs/preset.md](docs/preset.md)).
+- **Slot disk cache**: `--slot-save-path`, `--slot-save-auto`, `--slot-save-block`, `--slot-save-max-count`, `--slot-save-max-mb`, `--slot-save-split-prefix`.
+- **Native snapshots** (`--native-snapshot-*`), RKVA disk snapshots, conversation cache (`--cache-ram`), `--metrics`, `--slots`.
+- **Reasoning loop guard** and the opted-in realtime `/v1/chat/completions/control` endpoint ([docs/beellama-features.md](docs/beellama-features.md)).
+- Keep-reasoning, autoparser (tool-call parsing presets) and vision offload (`--vision on|off|gpu|cpu`).
+
+### Compute and diagnostics
+
+- CUDA builds with FlashAttention, KVarN direct attention, QSA/lightning indexer (Qwen3.5/4-Exp sparse attention), GDN/DeltaNet hybrids, EXL3 MMA, MMQ/MMVQ, CUDA graphs with recovery and chunking, PDL, batch-invariant mode.
+- Environment knobs (selection): `GGML_CUDA_DISABLE_GRAPHS`, `GGML_CUDA_GRAPH_MIN_STABLE_CALLS`, `GGML_CUDA_GRAPH_CHUNK_SIZE`, `GGML_CUDA_GRAPH_RECOVERY_HEADROOM_MB`, `GGML_CUDA_MMQ_J_MAX`, `GGML_CUDA_MMQ_PREC`, `GGML_CUDA_PDL`, `GGML_CUDA_BATCH_INVARIANT`, `GGML_CUDA_EXL3_MMA`, `GGML_CUDA_GDN_SEGMENTED`, `GGML_CUDA_GDN_PREFIX_MMA`, `GGML_HOPPER_Q1_DISABLE`, `GGML_METAL_FUSE_GATHER_MV`, `GGML_KVARN_PROFILE`, `GGML_KVARN_WINDOW_CHUNK`, `GGML_RKVA_*`.
+- **Profiling**: `LLAMA_PREFILL_PROFILE=1` (`[PREFILL …]`, needs `-lv 4`), `LLAMA_GRAPH_PREP_PROFILE=1` (`[GRAPHPREP]`), `LLAMA_OP_PROFILE=1` (host submit time per op), `LLAMA_OP_PROFILE_GPU=1` (per-node CUDA-event GPU time, `[OP GPU]`), `GGML_RKVA_TRACE_FILE`, `GGML_SCHED_SPLIT_TIMING`, `GGML_SCHED_SPLIT_SPAN`, `LLAMA_KVARN_PROFILE`, `LLAMA_QSA_FA_TRACE`, `LLAMA_PLE_PREFETCH_TRACE`.
+- **KLD/quality**: `llama-perplexity` KLD with `--ppl-full`, forced-token KL, cache-quality comparisons at the serving batch/ubatch.
+
+### Backends and platforms
+
+- CPU (AVX2/AVX-512, NEON, RVV; s390x and RISC-V build notes in `docs/`), CUDA (sm_60 through sm_121a, Hopper/GB10/Ada specializations), HIP/ROCm, Vulkan (incl. KVarN shaders and shared-memory limits), SYCL, Metal, D3D12/Xbox UWP, Android.
+- Xbox Series S|X app and RKVA attention server in [tools/xbox](tools/xbox).
+
+### Known limitations (2026-11)
+
+- `--parallel 1` is currently required for the 32k DFlash2 recipe on a 40 GB A100 (the recurrent-state buffer grows ~32× with 4 slots).
+- `-ub 4096` with the 240B Q2_0 target hits a graph-allocation OOM (~2.2 GiB); `-ub 2048` is the validated ceiling.
+- `LLAMA_MOE_CPU_FALLBACK=1` is a prototype: it can lose write-backs when one token has more than one cache miss, and it is **not** validated for production.
+- `tools/rkva-native-key-inspect` builds again after this fork's fix; `tests/test-hybrid-rpc-prefix-state.cpp` still targets older `llama_kv_cache`/`llama_memory_recurrent` constructors and does not compile.
+
 The [Bee feature guide](docs/beellama-features.md) and [argument reference](docs/beellama-args.md) cover the inherited Bee controls. For the newer fork extensions below, consult the linked implementation guides and the current [argument parser](common/arg.cpp); older documents can describe an earlier compatibility envelope.
 
 ## About this fork
