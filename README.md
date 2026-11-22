@@ -75,8 +75,8 @@ A dense inventory for agents and users. Exact option names live in [common/arg.c
 ### MoE placement and expert cache
 
 - Static placement: `--n-cpu-moe`/`--cpu-moe`, `--cpu-moe-draft`, `--moe-host-pinned`/`--no-moe-host-pinned`.
-- **Expert cache in VRAM** (`--moe-cache-mib N`, `-1` = auto-sized from free device memory) with an SLRU, complete-group admission for large prefill batches, an optional immutable device map, upload overlap and a pinned ring. Tuning via environment: `LLAMA_MOE_CACHE_PREFILL`, `LLAMA_MOE_MAP_DEVICE`, `LLAMA_MOE_UPLOAD_OVERLAP`, `LLAMA_MOE_PINNED_RING`, `LLAMA_MOE_CACHE_PARTIAL_PREFILL` (partial-group admission for prefill; default off), `LLAMA_MOE_CPU_FALLBACK` (experimental CPU-computes-misses tier; default off, prototype).
-- **Fused expert GEMM**: `LLAMA_MMQ_GATE_UP_SHARED_Q8=1` shares expert routing and the Q8_1 activation between adjacent gate/up MMQ pairs (Q2_0/IQ3_S; bit-exact, default off).
+- **Expert cache in VRAM** (`--moe-cache-mib N`, `-1` = auto-sized from free device memory) with an SLRU, complete-group admission for large prefill batches, an optional immutable device map, upload overlap and a pinned ring. Tuning via environment: `LLAMA_MOE_CACHE_PREFILL`, `LLAMA_MOE_MAP_DEVICE`, `LLAMA_MOE_UPLOAD_OVERLAP`, `LLAMA_MOE_PINNED_RING`, `LLAMA_MOE_CACHE_PARTIAL_PREFILL` (partial-group admission for prefill; default off).
+- **Fused expert GEMM**: `LLAMA_MMQ_GATE_UP_SHARED_Q8=1` shares expert routing and the Q8_1 activation between adjacent gate/up MMQ pairs (Q2_0/IQ3_S; bit-exact, default off). `LLAMA_MMQ_GATE_UP_GLU=1` fuses gate, up and GLU for supported Q2_0 shapes (default off). The [A100 recipes](docs/agent-reports/strata-parity-status-20261122.md#3-recipes-a100-40g) document the measured prefill and DFlash2 settings.
 
 ### Loading, memory and long context
 
@@ -110,9 +110,8 @@ A dense inventory for agents and users. Exact option names live in [common/arg.c
 ### Known limitations (2026-11)
 
 - `--parallel 1` is currently required for the 32k DFlash2 recipe on a 40 GB A100 (the recurrent-state buffer grows ~32× with 4 slots).
-- `-ub 4096` with the 240B Q2_0 target hits a graph-allocation OOM (~2.2 GiB); `-ub 2048` is the validated ceiling.
-- `LLAMA_MOE_CPU_FALLBACK=1` is a prototype: it can lose write-backs when one token has more than one cache miss, and it is **not** validated for production.
-- `tools/rkva-native-key-inspect` builds again after this fork's fix; `tests/test-hybrid-rpc-prefix-state.cpp` still targets older `llama_kv_cache`/`llama_memory_recurrent` constructors and does not compile.
+- The A100-40G Q2_0 prefill recipe uses `-ub 2048` with expert caching. With the cache enabled, `-ub 4096` exhausted VRAM while reserving a roughly 2.2 GiB graph buffer.
+- The hybrid RPC prefix-state fixture builds and remains disabled while its SWA and exact-tail expectations are revised.
 
 The [Bee feature guide](docs/beellama-features.md) and [argument reference](docs/beellama-args.md) cover the inherited Bee controls. For the newer fork extensions below, consult the linked implementation guides and the current [argument parser](common/arg.cpp); older documents can describe an earlier compatibility envelope.
 
