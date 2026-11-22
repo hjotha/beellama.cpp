@@ -92,7 +92,6 @@ A/B"). Fica como remoção de trabalho provadamente impossível, com saída
 bit-idêntica e `test-backend-ops -o MUL_MAT_ID` 2/2 no 4070.
 
 ## 5. `LLAMA_OP_PROFILE`: o que ele mostrou
-
 Primeiras amostras em `-ub 2048` (grafo de 6.636 nós):
 
 ```
@@ -114,7 +113,35 @@ Isso fecha a atribuição: o que resta contra a Strata (4.629 t/s) é eficiênci
 kernel por token — GEMMs MoE com Q2_0/MMQ, GDN e FA do QSA — não agendamento,
 cópia ou PLE.
 
-## 6. Comandos
+## 6. `--n-cpu-moe 0`: sem efeito
+
+Se o tráfego de experts das camadas host fosse relevante, tirá-las do host
+ajudaria. Não é o caso:
+
+| config | pp4k | pp28k | VRAM pronto |
+|---|---:|---:|---:|
+| `-ncmoe 0 -ub 1024` | 1.440,5\* | 1.577,8 | 37.095 |
+| `-ncmoe 2 -ub 1024` (referência) | 1.449,7\* | 1.575,7 | 37.098 |
+| `-ncmoe 0 -ub 2048` | 1.762,1 | **1.835,5** | 37.522 |
+| `-ncmoe 2 -ub 2048` | 1.751,7 | 1.826,2 | 37.528 |
+
+\* primeira execução fria em cada config.
+
+**+0,1% (ub 1024) e +0,5% (ub 2048), dentro do ruído**, e o VRAM pronto é
+praticamente idêntico (37.095 vs 37.098) — o `ncmoe` não muda o placement real
+neste GGUF. O custo de H2D de experts no prefill não é fator.
+
+## 7. Sugestão #3 do Codex (reuso de gate/up no MMQ): pré-condição falha
+
+O modelo **tem** gate/up separados (48 camadas com `ffn_gate_exps` e
+`ffn_up_exps`, sem `ffn_gate_up_exps` empacotado), então o alvo existe. Mas
+`ggml_cuda_mmq_fusion_supported` (`mmq.cuh:537`) só aceita
+Q4_K/Q5_K/Q6_K/Q8_0/IQ4_XS — **Q2_0 não está na lista**. Habilitar o reuso exige
+um caminho fundido novo para tiles Q2_0 (linhas intercaladas up/gate), não um
+ajuste de orquestração. O ganho máximo seria a quantização Q8 da ativação e um
+agrupamento por par, que são pequenos diante do GEMM: não compensa o risco agora.
+
+## 8. Comandos
 
 ```bash
 # varredura de ubatch (A100)
