@@ -114,7 +114,9 @@ int main() {
     envelope_tests(RKVA_RANGE_STORAGE_TURBOQUANT_NC, 8, 132);
     envelope_tests(RKVA_RANGE_STORAGE_Q4_1, RKVA_LAYOUT_Q4_1, 160);
     envelope_tests(RKVA_RANGE_STORAGE_IQ4_NL, RKVA_LAYOUT_IQ4_NL, 144);
-    assert(!rkva_e4_layout_allowed(~uint64_t(0), RKVA_RANGE_STORAGE_Q8_0, 5));
+    assert(rkva_e4_layout_allowed(RKVA_CAP_NATIVE_Q8_BULK_E4M3FN, RKVA_RANGE_STORAGE_Q8_0, 5));
+    assert(!rkva_e4_layout_allowed(RKVA_CAP_NATIVE_Q4_BULK_E4M3FN, RKVA_RANGE_STORAGE_Q8_0, 5));
+    assert(!rkva_e4_layout_allowed(~uint64_t(0), RKVA_RANGE_STORAGE_Q8_0, 4));
     assert(!rkva_e4_layout_allowed(~uint64_t(0), RKVA_RANGE_STORAGE_Q4_0 | RKVA_RANGE_STORAGE_SAW_INT4, 4));
     output_tests();
     std::puts("Native E4: capabilities, full envelope preflight, metadata, RNE, empty prefixes and N256 output passed");

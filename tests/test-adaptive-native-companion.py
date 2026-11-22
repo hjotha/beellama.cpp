@@ -23,6 +23,7 @@ def function(text, signature):
     raise RuntimeError('unterminated function')
 
 resolver = function(common, 'enum llama_remote_native_companion common_resolve_remote_native_companion(')
+format_bits = function(backend, 'static uint32_t rkva_kvarn_format_bits(')
 policy = function(backend, 'bool ggml_remote_attn_companion_format_matches(')
 start = server.index('        const auto native_selection = adaptive_remote_native_companion;')
 end = server.index(';', server.index('adaptive_remote_attn_cache_type_v == GGML_TYPE_Q4_0', start)) + 1
@@ -35,16 +36,13 @@ program = r'''
 #include <stdexcept>
 #include <string>
 #include <utility>
-enum ggml_type { GGML_TYPE_COUNT, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_IQ4_NL,
-    GGML_TYPE_Q8_0, GGML_TYPE_F16, GGML_TYPE_F32 };
-enum llama_remote_native_companion { LLAMA_REMOTE_COMPANION_AUTO, LLAMA_REMOTE_COMPANION_NONE,
-    LLAMA_REMOTE_COMPANION_KVARN4, LLAMA_REMOTE_COMPANION_SAW_INT4, LLAMA_REMOTE_COMPANION_TURBOQUANT_NC };
+#include "llama.h"
 struct common_params {
     ggml_type remote_attn_cache_type_k = GGML_TYPE_COUNT, remote_attn_cache_type_v = GGML_TYPE_COUNT;
     std::string remote_attn_native_cache_type_k, remote_attn_native_cache_type_v, remote_attn_format, remote_attn_host;
     unsigned kv_position_split_p = 1024;
 };
-''' + policy + r'''
+''' + format_bits + '\n' + policy + r'''
 bool common_remote_attn_is_local_vulkan(const std::string &host) { return host.rfind("vulkan:", 0) == 0; }
 ''' + resolver + r'''
 bool select_ahead(llama_remote_native_companion adaptive_remote_native_companion,
@@ -54,7 +52,10 @@ bool select_ahead(llama_remote_native_companion adaptive_remote_native_companion
 }
 int main() {
     unsetenv("GGML_RKVA_NATIVE_COMPANION");
-    for (const char *format : {"kvarn4", "kvarn", "saw_int4", "saw-int4", "saw4", "bdr_int4",
+    unsetenv("GGML_RKVA_UPLOAD_FORMAT");
+    unsetenv("GGML_RKVA_FORMAT");
+    unsetenv("GGML_RKVA_RANGE_STORAGE");
+    for (const char *format : {"saw_int4", "saw-int4", "saw4", "bdr_int4",
                                "turboquant_nc", "turboquant-nc", "tqnc", "turboquant_4bit_nc"}) {
         assert(ggml_remote_attn_companion_format_matches(format, GGML_TYPE_F32));
         assert(!ggml_remote_attn_companion_format_matches(format, GGML_TYPE_Q4_0));
@@ -73,8 +74,19 @@ int main() {
     assert(!ggml_remote_attn_companion_format_matches("auto", GGML_TYPE_F32));
     for (auto type : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_F16})
         assert(ggml_remote_attn_companion_format_matches("f32", type)); // explicit diagnostic transport
-    assert(!ggml_remote_attn_companion_format_matches("f32", GGML_TYPE_F32));
-    assert(!ggml_remote_attn_companion_format_matches("oscar_int2", GGML_TYPE_F32));
+    assert(ggml_remote_attn_companion_format_matches("f32", GGML_TYPE_F32));
+    assert(ggml_remote_attn_companion_format_matches("bf16", GGML_TYPE_BF16));
+    assert(!ggml_remote_attn_companion_format_matches("bf16", GGML_TYPE_F16));
+    assert(ggml_remote_attn_companion_format_matches("oscar_int2", GGML_TYPE_F32));
+    assert(ggml_remote_attn_companion_format_matches("oscar_int2", GGML_TYPE_Q2_0S));
+    assert(!ggml_remote_attn_companion_format_matches("oscar_int2", GGML_TYPE_Q4_0));
+    for (const char *format : {"kvarn2", "kvarn3", "kvarn4", "kvarn5", "kvarn6", "kvarn8", "kvarn"}) {
+        assert(ggml_remote_attn_companion_format_matches(format, GGML_TYPE_F32));
+        assert(ggml_remote_attn_companion_format_matches(format, GGML_TYPE_Q4_0));
+        assert(ggml_remote_attn_companion_format_matches(format, GGML_TYPE_Q8_0));
+        assert(!ggml_remote_attn_companion_format_matches(format, GGML_TYPE_F16));
+    }
+    assert(!ggml_remote_attn_companion_format_matches("kvarn7", GGML_TYPE_F32));
     for (const auto &entry : {std::pair<const char *, ggml_type>{"q4_1", GGML_TYPE_Q4_1},
                               {"iq4_nl", GGML_TYPE_IQ4_NL}}) {
         assert(ggml_remote_attn_companion_format_matches(entry.first, entry.second));
@@ -101,9 +113,11 @@ int main() {
     original.remote_attn_format = "kvarn4";
     original.remote_attn_cache_type_k = GGML_TYPE_Q4_0;
     original.remote_attn_cache_type_v = GGML_TYPE_Q4_0;
+    assert(common_resolve_remote_native_companion(original) == LLAMA_REMOTE_COMPANION_NONE);
+    original.remote_attn_format = "saw_int4";
     bool refused = false;
     try { (void) common_resolve_remote_native_companion(original); } catch (const std::invalid_argument &) { refused = true; }
-    assert(refused); // native KVarN cannot allocate a Q4 companion
+    assert(refused);
     original.remote_attn_format = "q4_0";
     auto captured = common_resolve_remote_native_companion(original);
     assert(captured == LLAMA_REMOTE_COMPANION_NONE);
@@ -123,6 +137,7 @@ with tempfile.TemporaryDirectory(prefix='beellama-adaptive-native-') as director
     source = Path(directory) / 'test.cpp'
     binary = Path(directory) / 'test'
     source.write_text(program)
-    subprocess.run(['c++', '-std=c++17', '-Wall', '-Werror', str(source), '-o', str(binary)], check=True)
+    subprocess.run(['c++', '-std=c++17', '-Wall', '-Werror',
+                    '-I', str(root / 'include'), '-I', str(root / 'ggml/include'), str(source), '-o', str(binary)], check=True)
     subprocess.run([str(binary)], check=True)
 print('PASS: ahead retains original Q4 companion selection across local-tier override clearing')
