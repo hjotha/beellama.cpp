@@ -2052,6 +2052,8 @@ void ggml_cuda_mul_mat_q(
         void * external_q8 = nullptr, bool quantize_external = true,
         const float * external_norm_scale = nullptr);
 
+void ggml_cuda_mul_mat_id_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * first, ggml_tensor * second);
+
 size_t ggml_cuda_mul_mat_q_q8_size(const ggml_tensor * src0, const ggml_tensor * src1);
 
 void ggml_cuda_mul_mat_q_fused_two(

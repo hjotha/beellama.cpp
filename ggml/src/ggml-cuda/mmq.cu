@@ -200,18 +200,32 @@ static int ggml_cuda_mmq_get_J_best(
     return J_best;
 }
 
-void ggml_cuda_mul_mat_q(
+static void ggml_cuda_mmq_clear_padding(const ggml_tensor * weight, cudaStream_t stream) {
+    // If weight is a temporary compute buffer, clear any potential padding.
+    if (ggml_backend_buffer_get_usage(weight->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+        const size_t size_data  = ggml_nbytes(weight);
+        const size_t size_alloc = ggml_backend_buffer_get_alloc_size(weight->buffer, weight);
+        if (size_alloc > size_data) {
+            GGML_ASSERT(ggml_is_contiguously_allocated(weight));
+            GGML_ASSERT(!weight->view_src);
+            CUDA_CHECK(cudaMemsetAsync((char *) weight->data + size_data, 0, size_alloc - size_data, stream));
+        }
+    }
+}
+
+static void ggml_cuda_mul_mat_q_impl(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
         ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion, const ggml_tensor * input_scale,
         const ggml_tensor * gate,
         const ggml_tensor * norm_weight, const ggml_tensor * norm_scale,
-        void * external_q8, bool quantize_external, const float * external_norm_scale) {
+        void * external_q8, bool quantize_external, const float * external_norm_scale, ggml_tensor * paired_dst) {
     // Upstream's fused gate/up/GLU MMQ is handled by ggml_cuda_should_fuse_mul_mat_q;
     // this fork keeps its own GLU-in-quantization path below.
     GGML_UNUSED(fusion);
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
+    GGML_ASSERT(!paired_dst || ids);
     GGML_ASSERT(!gate || (!ids && gate->type == GGML_TYPE_F32));
     GGML_ASSERT((norm_weight == nullptr) == (norm_scale == nullptr && external_norm_scale == nullptr));
     GGML_ASSERT(!norm_weight || (!ids && !gate && norm_weight->type == GGML_TYPE_F32 &&
@@ -238,16 +252,7 @@ void ggml_cuda_mul_mat_q(
     const float * src1_d = (const float *) src1->data;
     float       *  dst_d = (float       *)  dst->data;
 
-    // If src0 is a temporary compute buffer, clear any potential padding.
-    if (ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
-        const size_t size_data  = ggml_nbytes(src0);
-        const size_t size_alloc = ggml_backend_buffer_get_alloc_size(src0->buffer, src0);
-        if (size_alloc > size_data) {
-            GGML_ASSERT(ggml_is_contiguously_allocated(src0));
-            GGML_ASSERT(!src0->view_src);
-            CUDA_CHECK(cudaMemsetAsync((char *) src0->data + size_data, 0, size_alloc - size_data, stream));
-        }
-    }
+    ggml_cuda_mmq_clear_padding(src0, stream);
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
 
@@ -467,6 +472,31 @@ void ggml_cuda_mul_mat_q(
         ne12, J_best, ggml_cuda_prefill_reference_origin(dst)};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
+    if (paired_dst) {
+        CUDA_CHECK(cudaGetLastError());
+        const ggml_tensor * paired_weight = paired_dst->src[0];
+        ggml_cuda_mmq_clear_padding(paired_weight, stream);
+        mmq_args paired_args = args;
+        paired_args.x = (const char *) paired_weight->data;
+        paired_args.dst = (float *) paired_dst->data;
+        paired_args.reference_origin = ggml_cuda_prefill_reference_origin(paired_dst);
+        ggml_cuda_mul_mat_q_switch_type(ctx, paired_args, stream, prec_src1);
+        CUDA_CHECK(cudaGetLastError());
+    }
+}
+
+void ggml_cuda_mul_mat_q(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
+        ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion, const ggml_tensor * input_scale,
+        const ggml_tensor * gate, const ggml_tensor * norm_weight, const ggml_tensor * norm_scale,
+        void * external_q8, bool quantize_external, const float * external_norm_scale) {
+    ggml_cuda_mul_mat_q_impl(ctx, src0, src1, ids, dst, fusion, input_scale, gate, norm_weight, norm_scale,
+            external_q8, quantize_external, external_norm_scale, nullptr);
+}
+
+void ggml_cuda_mul_mat_id_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * first, ggml_tensor * second) {
+    ggml_cuda_mul_mat_q_impl(ctx, first->src[0], first->src[1], first->src[2], first,
+            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, true, nullptr, second);
 }
 
 // Custom prequantized RHS paths use Q8 and select their tile before sizing scratch.
