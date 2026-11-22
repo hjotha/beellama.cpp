@@ -1,5 +1,6 @@
 #pragma once
 
+#include "llama.h"
 #include "llama-kv-mixed-state.h"
 
 #include <cstdint>
