@@ -2310,12 +2310,26 @@ static bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_
     return true;
 }
 
+static bool ggml_cuda_mmq_gate_up_glu_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("LLAMA_MMQ_GATE_UP_GLU");
+        return env && std::atoi(env) == 1;
+    }();
+    return enabled;
+}
+
 // Buffer- and batch-size independent, so graph_optimize produces the same graph topology for every ubatch size (see #29986).
 static bool ggml_cuda_mul_mat_q_fusion_matches(const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * glu, const int device) {
     const ggml_tensor * x_up = up->src[0];
     const ggml_tensor * y    = up->src[1];
 
     if ((up->op != GGML_OP_MUL_MAT && up->op != GGML_OP_MUL_MAT_ID) || !ggml_cuda_mmq_fusion_supported(x_up->type) || y->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    if (x_up->type == GGML_TYPE_Q2_0 &&
+            (!ggml_cuda_mmq_gate_up_glu_enabled() || up->op != GGML_OP_MUL_MAT_ID || y->ne[1] != 1 ||
+             !ggml_is_contiguous(x_up) || !ggml_is_contiguous(y) || !ggml_is_contiguous(glu))) {
         return false;
     }
 
@@ -2338,40 +2352,33 @@ static bool ggml_cuda_mul_mat_q_fusion_matches(const ggml_tensor * up, const ggm
 }
 
 static bool ggml_cuda_should_fuse_mul_mat_q(const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * glu) {
-    // The fork's MMQ keeps its own GLU-in-quantization/fused-two paths; do not
-    // dispatch upstream's gate/up/GLU write-back kernel without validation here.
-    return false;
-    // A hinted matmul can be fused, but its unfused path may be faster (e.g. FWHT for GGML_HINT_SRC0_IS_HADAMARD).
-    if (ggml_get_op_params_i32(up, 1) != GGML_HINT_NONE || ggml_get_op_params_i32(gate, 1) != GGML_HINT_NONE) {
-        return false;
-    }
-
-    // The padding of a compute-buffer weight that is a view cannot be cleared, see ggml_cuda_mul_mat.
-    const auto bad_padding_clear = [](const ggml_tensor * x) {
-        return ggml_backend_buffer_get_usage(x->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
-            ggml_nbytes(x) != ggml_backend_buffer_get_alloc_size(x->buffer, x) && x->view_src;
-    };
-    const int device = ggml_cuda_get_device();
-    if (!ggml_cuda_mul_mat_q_fusion_matches(up, gate, glu, device) || bad_padding_clear(up->src[0]) || bad_padding_clear(gate->src[0])) {
-        return false;
-    }
-
-    // The batch size checks are done here, not in ggml_cuda_mul_mat_q_fusion_matches.
     const ggml_tensor * x_up = up->src[0];
-    const ggml_tensor * y    = up->src[1];
-    const int           cc   = ggml_cuda_info().devices[device].cc;
-
-    // For MUL_MAT_ID: same kernel choice as ggml_cuda_mul_mat_id, with the nominal tiles of all experts (the per-expert token counts are only known on the GPU).
-    const bool    is_id     = up->op == GGML_OP_MUL_MAT_ID;
-    const int64_t ncols     = is_id ? y->ne[2]    : y->ne[1];
-    const int64_t nchannels = is_id ? x_up->ne[2] : y->ne[2]*y->ne[3];
-    const bool    use_mmvq  = is_id ? ncols <= get_mmvq_mmid_max_batch(x_up->type, cc) : ggml_cuda_should_use_mmvq(x_up->type, cc, ncols);
-    if (use_mmvq || !ggml_cuda_should_use_mmq(x_up->type, cc, ncols, /*n_experts =*/ is_id ? x_up->ne[2] : 0)) {
+    const ggml_tensor * y = up->src[1];
+    if (x_up->type != GGML_TYPE_Q2_0 || up->op != GGML_OP_MUL_MAT_ID || gate->op != up->op ||
+            ggml_prec_get_src(up, 1) != ggml_prec_get_src(gate, 1)) {
         return false;
     }
 
-    // The fused kernel needs one block per tile (no stream-k split), so only fuse if the tiling is efficient.
-    return ggml_cuda_mmq_fusion_is_efficient(x_up->type, x_up->ne[1], ncols, nchannels, device);
+    for (const ggml_tensor * projection : { up, gate }) {
+        const ggml_prec src_prec = ggml_prec_get_src(projection, 1);
+        if (ggml_get_op_params_i32(projection, 1) != GGML_HINT_NONE ||
+                ggml_prec_get_acc(projection) != GGML_PREC_UNDEFINED ||
+                (src_prec != GGML_PREC_UNDEFINED && src_prec != GGML_PREC_Q8)) {
+            return false;
+        }
+
+        const ggml_tensor * weight = projection->src[0];
+        if (ggml_backend_buffer_get_usage(weight->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+                ggml_backend_buffer_get_alloc_size(weight->buffer, weight) > ggml_nbytes(weight) && weight->view_src) {
+            return false;
+        }
+    }
+
+    const int device = ggml_cuda_get_device();
+    const int cc = ggml_cuda_info().devices[device].cc;
+    return ggml_cuda_mul_mat_q_fusion_matches(up, gate, glu, device) &&
+        y->ne[2] > get_mmvq_mmid_max_batch(x_up->type, cc) &&
+        ggml_cuda_should_use_mmq(x_up->type, cc, y->ne[2], x_up->ne[2]);
 }
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -5151,6 +5158,30 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    if (node->op == GGML_OP_MUL_MAT_ID && ggml_cuda_mmq_gate_up_glu_enabled() &&
+            cuda_ctx->stream_context().concurrent_events.empty() && i + 2 < cgraph->n_nodes) {
+        ggml_tensor * glu = cgraph->nodes[i + 2];
+        ggml_tensor * gate = glu->src[0];
+        ggml_tensor * up = glu->src[1];
+        const ggml_tensor * second = cgraph->nodes[i + 1];
+        const ggml_op ops[] = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU };
+        const int outputs[] = { i + 2 };
+        if (glu->op == GGML_OP_GLU && ((gate == node && up == second) || (up == node && gate == second)) &&
+                ggml_can_fuse_subgraph(cgraph, i, 3, ops, outputs, 1) &&
+                ggml_cuda_should_fuse_mul_mat_q(up, gate, glu) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, outputs, 1)) {
+            ggml_cuda_mm_fusion_args_host fusion{};
+            fusion.gate = gate->src[0];
+            fusion.glu_op = ggml_get_glu_op(glu);
+            fusion.glu_limit = ggml_get_op_params_f32(glu, 3);
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+            ggml_cuda_trace_counter("cuda_mmq_gate_up_glu", cgraph);
+#endif
+            ggml_cuda_mul_mat_q(*cuda_ctx, up->src[0], up->src[1], up->src[2], glu, &fusion);
+            return 2;
+        }
+    }
+
     if (node->op == GGML_OP_MUL) {
         ggml_cuda_moe_weighted_reduction_match match;
         if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
@@ -5830,18 +5861,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.glu_limit = ggml_get_op_params_f32(glu, 3);
 
                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
-                fused_mul_mat_vec = true;
-                fused_node_count  = 3;
-                break;
-            }
-
-            if (ggml_cuda_should_fuse_mul_mat_q(up, gate, glu)) {
-                ggml_cuda_mm_fusion_args_host fusion_data{};
-                fusion_data.gate      = gate->src[0];
-                fusion_data.glu_op    = ggml_get_glu_op(glu);
-                fusion_data.glu_limit = ggml_get_op_params_f32(glu, 3);
-
-                ggml_cuda_mul_mat_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
                 fused_mul_mat_vec = true;
                 fused_node_count  = 3;
                 break;
