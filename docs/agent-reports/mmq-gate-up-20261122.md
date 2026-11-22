@@ -12,7 +12,7 @@ Cada projeção usa o mesmo kernel, geometria de tiles e fixup que usaria separa
 
 ## Validação no gokaya
 
-Fixture com pesos quantizados independentes para gate e up, 16 experts, top-4, duas sequências sintéticas com experts quentes diferentes e seis execuções com IDs e ativações novos. Para cada projeção, o resultado do par é comparado a um grafo de referência de um único `MUL_MAT_ID` no mesmo backend, com os mesmos endereços de pesos/entradas e geometria. Um traço `cuda_mmq_gate_up_shared_q8` distingue uma execução que realmente entra no caminho compartilhado. [Fixture](../../tests/test-mmq-gate-up.cpp)
+Fixture com pesos quantizados independentes para gate e up, 16 experts, top-4, duas sequências sintéticas com experts quentes diferentes e seis execuções com IDs e ativações novos. Os grafos têm UIDs estáveis para permitir captura e replay. Para cada projeção, o resultado do par é comparado a um grafo de referência de um único `MUL_MAT_ID` no mesmo backend, com os mesmos endereços de pesos/entradas e geometria. Um traço `cuda_mmq_gate_up_shared_q8` distingue uma execução que realmente entra no caminho compartilhado. [Fixture](../../tests/test-mmq-gate-up.cpp)
 
 Sanidade executada em CPU:
 
@@ -54,12 +54,14 @@ for flag in 0 1; do
   for op in MUL_MAT_ID MUL_MAT; do
     LLAMA_MMQ_GATE_UP_SHARED_Q8=$flag ./build-cuda-sm89/bin/test-backend-ops -b CUDA0 -o "$op"
   done
-  env -u GGML_CUDA_DISABLE_GRAPHS LLAMA_MMQ_GATE_UP_SHARED_Q8=$flag \
+  env -u GGML_CUDA_DISABLE_GRAPHS GGML_CUDA_GRAPH_MIN_STABLE_CALLS=1 LLAMA_MMQ_GATE_UP_SHARED_Q8=$flag \
     GGML_RKVA_TRACE_FILE="/tmp/mmq-gate-up-graph-$flag" ./build-cuda-sm89/bin/test-mmq-gate-up CUDA0
   GGML_CUDA_DISABLE_GRAPHS=1 LLAMA_MMQ_GATE_UP_SHARED_Q8=$flag \
     GGML_RKVA_TRACE_FILE="/tmp/mmq-gate-up-direct-$flag" ./build-cuda-sm89/bin/test-mmq-gate-up CUDA0
 done
 rg '"phase":"cuda_mmq_gate_up_shared_q8"' /tmp/mmq-gate-up-{graph,direct}-1.*.jsonl
+jq -r 'select(.node=="mmq_gate_up_pair" and (.phase=="cuda_graph_capture" or .phase=="cuda_graph_launch")) | .phase' \
+  /tmp/mmq-gate-up-graph-1.*.jsonl | sort | uniq -c
 # Após religar o serviço
 curl -fsS http://127.0.0.1:8090/health
 ```

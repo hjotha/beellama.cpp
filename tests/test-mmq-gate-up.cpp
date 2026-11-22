@@ -1,6 +1,7 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "ggml-impl.h"
 
 #include <algorithm>
 #include <array>
@@ -27,6 +28,7 @@ static bool check_pair(ggml_backend_t backend, ggml_type type, int tokens_per_se
     auto * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, tokens);
     auto * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, used, tokens);
     auto * pair_graph = ggml_new_graph_custom(ctx, graph_size, false);
+    pair_graph->uid = ggml_graph_next_uid();
 
     std::array<ggml_tensor *, 2> weights;
     std::array<ggml_tensor *, 2> paired;
@@ -37,9 +39,11 @@ static bool check_pair(ggml_backend_t backend, ggml_type type, int tokens_per_se
         paired[proj] = ggml_mul_mat_id(ctx, weights[proj], input, ids);
         reference[proj] = ggml_mul_mat_id(ctx, weights[proj], input, ids);
         reference_graphs[proj] = ggml_new_graph_custom(ctx, graph_size, false);
+        reference_graphs[proj]->uid = ggml_graph_next_uid();
         ggml_build_forward_expand(pair_graph, paired[proj]);
         ggml_build_forward_expand(reference_graphs[proj], reference[proj]);
     }
+    ggml_set_name(paired[0], "mmq_gate_up_pair");
     GGML_ASSERT(ggml_graph_n_nodes(pair_graph) == 2);
     GGML_ASSERT(ggml_graph_node(pair_graph, 0) == paired[0]);
     GGML_ASSERT(ggml_graph_node(pair_graph, 1) == paired[1]);
