@@ -284,7 +284,7 @@ static void test_hybrid_tail_graph_reuse() {
                 nullptr, nullptr, [](int32_t il) { return il == 0; }, GGML_TYPE_Q4_0,
                 GGML_TYPE_Q4_0, false, cpu, 256, true);
         auto * attn = attention.get();
-        auto recurrent = std::make_unique<llama_memory_recurrent>(model, GGML_TYPE_F32, GGML_TYPE_F32,
+        auto recurrent = std::make_unique<llama_memory_recurrent>(model, false, GGML_TYPE_F32, GGML_TYPE_F32,
                 false, 1, 1, 1, [](int32_t il) { return il == 1; });
         llama_memory_hybrid hybrid(model, std::move(attention), std::move(recurrent), 256);
         if (overflow) {
@@ -353,7 +353,7 @@ static void test_exact_tail_snapshot_layouts() {
         auto state = attention->init_kv_batch({batch(0, 128)});
         assert(state && state->get_status() == LLAMA_MEMORY_STATUS_SUCCESS && state->apply());
         state->graph_compute_finish(GGML_STATUS_SUCCESS);
-        auto recurrent = std::make_unique<llama_memory_recurrent>(model, GGML_TYPE_F32, GGML_TYPE_F32,
+        auto recurrent = std::make_unique<llama_memory_recurrent>(model, false, GGML_TYPE_F32, GGML_TYPE_F32,
                 false, 1, 1, 0, [](int32_t il) { return il == 1; });
         attention_owners.push_back(attention.get());
         owners.push_back(std::make_unique<llama_memory_hybrid>(
@@ -425,8 +425,8 @@ static void test_standard_tail_bounded_state() {
     model.layers.resize(4);
     auto cpu = [](int32_t) { return ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU); };
     const auto make_cache = [&]() {
-        return std::make_unique<llama_kv_cache>(model, model.hparams, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0,
-                false, false, false, 32768, 1, 256, 0, LLAMA_SWA_TYPE_NONE, nullptr,
+        return std::make_unique<llama_kv_cache>(model, false, model.hparams, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0,
+                false, false, false, 32768, 1, 0, LLAMA_SWA_TYPE_NONE, nullptr,
                 llama_memory_i::layer_filter_cb{}, llama_memory_i::layer_reuse_cb{},
                 llama_memory_i::layer_share_cb{}, "bounded_test_", 64, 128, GGML_TYPE_F16,
                 128, false, 1, 0, false, cpu);
@@ -435,13 +435,13 @@ static void test_standard_tail_bounded_state() {
     auto destination = make_cache();
     assert(source->requires_state_for_partial_restore() && source->state_streaming_restore_supported());
     {
-        llama_kv_cache multiple(model, model.hparams, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0,
-                false, false, false, 512, 2, 256, 0, LLAMA_SWA_TYPE_NONE, nullptr,
+        llama_kv_cache multiple(model, false, model.hparams, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0,
+                false, false, false, 512, 2, 0, LLAMA_SWA_TYPE_NONE, nullptr,
                 {}, {}, {}, "bounded_multi_", 64, 128, GGML_TYPE_F16, 128, false, 1, 0, false, cpu);
         assert(multiple.requires_state_for_partial_restore() && !multiple.state_streaming_restore_supported());
         // Construct followers before populating the shared cell arena.
-        llama_kv_cache follower(model, model.hparams, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0,
-                false, false, false, 512, 2, 256, 0, LLAMA_SWA_TYPE_NONE, &multiple,
+        llama_kv_cache follower(model, false, model.hparams, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0,
+                false, false, false, 512, 2, 0, LLAMA_SWA_TYPE_NONE, &multiple,
                 [](int32_t) { return false; }, {}, {}, "bounded_follower_", 64);
         for (llama_seq_id seq = 0; seq != 2; ++seq) {
             auto state = multiple.init_kv_batch({batch(0, 4, seq)});
@@ -634,8 +634,8 @@ static void test_standard_tail_bounded_state() {
         // cells to even slots. This exercises splitting a single wire run into
         // fragmented read_tensor operations rather than just multiple runs.
         const auto make_small = [&]() {
-            return std::make_unique<llama_kv_cache>(model, model.hparams, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0,
-                    false, false, false, 512, 1, 256, 0, LLAMA_SWA_TYPE_NONE, nullptr,
+            return std::make_unique<llama_kv_cache>(model, false, model.hparams, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0,
+                    false, false, false, 512, 1, 0, LLAMA_SWA_TYPE_NONE, nullptr,
                     llama_memory_i::layer_filter_cb{}, llama_memory_i::layer_reuse_cb{},
                     llama_memory_i::layer_share_cb{}, "bounded_small_", 64, 128, GGML_TYPE_F16,
                     128, false, 1, 0, false, cpu);
@@ -775,7 +775,7 @@ static void test_standard_overflow_full_state() {
                 format, false, cpu, 256, true);
         attention->set_mixed_state_identity(123, 456);
         auto * attn = attention.get();
-        auto recurrent = std::make_unique<llama_memory_recurrent>(model, GGML_TYPE_F32, GGML_TYPE_F32,
+        auto recurrent = std::make_unique<llama_memory_recurrent>(model, false, GGML_TYPE_F32, GGML_TYPE_F32,
                 false, 1, 1, 0, [](int32_t il) { return il == 1; });
         llama_memory_hybrid hybrid(model, std::move(attention), std::move(recurrent), 256);
         const auto append = [&](llama_pos p, uint32_t n) {
@@ -822,7 +822,7 @@ static void test_multistream_checkpoint_lineage() {
     model.hparams.n_embd_head_k_full = model.hparams.n_embd_head_v_full = 256;
     model.hparams.n_rot_full = 256;
     for (llama_seq_id pending : {0, 1}) {
-        llama_memory_recurrent recurrent(model, GGML_TYPE_F32, GGML_TYPE_F32,
+        llama_memory_recurrent recurrent(model, false, GGML_TYPE_F32, GGML_TYPE_F32,
                 false, 2, 2, 2, [](int32_t il) { return il == 1; });
         assert(recurrent.find_slot(batch(0, 4, 0)));
         assert(recurrent.find_slot(batch(0, 4, 1)));
@@ -984,7 +984,7 @@ static void test_multistream_checkpoint_lineage() {
             assert(state && state->get_status() == LLAMA_MEMORY_STATUS_SUCCESS && state->apply());
             state->graph_compute_finish(GGML_STATUS_SUCCESS);
         }
-        auto recurrent = std::make_unique<llama_memory_recurrent>(model, GGML_TYPE_F32, GGML_TYPE_F32,
+        auto recurrent = std::make_unique<llama_memory_recurrent>(model, false, GGML_TYPE_F32, GGML_TYPE_F32,
                 false, 2, 2, 0, [](int32_t il) { return il == 1; });
         copy_fault_hybrid hybrid(model, std::move(attention), std::move(recurrent), 256);
         const auto owner = attn->mixed_state_owner_id(1);
@@ -1067,7 +1067,7 @@ static void test_native_row_snapshot_lifecycle() {
         return p;
     };
     const auto make_recurrent = [&]() {
-        return std::make_unique<llama_memory_recurrent>(model, GGML_TYPE_F32, GGML_TYPE_F32,
+        return std::make_unique<llama_memory_recurrent>(model, false, GGML_TYPE_F32, GGML_TYPE_F32,
                 false, 1, 1, 0, [](int32_t il) { return il == 1; });
     };
     const auto append = [](llama_kv_cache_kvarn * a, llama_pos pos, uint32_t n) {
@@ -1218,7 +1218,7 @@ static void test_native_resident_prefix_state() {
         assert(!attn->supports_resident_prefix_restore());
         assert(attn->get_seq_rm_capability().suffix_rollback_tokens == 0);
         bool prefix_resident = true;
-        auto recurrent = std::make_unique<llama_memory_recurrent>(model, GGML_TYPE_F32, GGML_TYPE_F32,
+        auto recurrent = std::make_unique<llama_memory_recurrent>(model, false, GGML_TYPE_F32, GGML_TYPE_F32,
                 false, 1, 1, 0, [](int32_t il) { return il == 1; });
         llama_memory_hybrid hybrid(model, std::move(attention), std::move(recurrent), 256);
         attn->set_mixed_state_identity(123, 456);
@@ -1321,7 +1321,7 @@ static void test_native_resident_prefix_state() {
                     GGML_TYPE_Q4_0, false, cpu, 256, true);
             dest_attn->set_mixed_state_identity(123, 456);
             auto * dest_cache = dest_attn.get();
-            auto dest_recr = std::make_unique<llama_memory_recurrent>(model, GGML_TYPE_F32, GGML_TYPE_F32,
+            auto dest_recr = std::make_unique<llama_memory_recurrent>(model, false, GGML_TYPE_F32, GGML_TYPE_F32,
                     false, 1, 1, 0, [](int32_t il) { return il == 1; });
             llama_memory_hybrid dest(model, std::move(dest_attn), std::move(dest_recr), 256);
             int hybrid_clears = 0, cache_clears = 0;
@@ -1545,7 +1545,7 @@ static void test_native_companion_full_body_and_reset() {
     auto state = hybrid_cache->init_kv_batch({batch(0, 1)});
     assert(state && state->get_status() == LLAMA_MEMORY_STATUS_SUCCESS && state->apply());
     state->graph_compute_finish(GGML_STATUS_SUCCESS);
-    auto recurrent = std::make_unique<llama_memory_recurrent>(model, GGML_TYPE_F32, GGML_TYPE_F32,
+    auto recurrent = std::make_unique<llama_memory_recurrent>(model, false, GGML_TYPE_F32, GGML_TYPE_F32,
             false, 1, 1, 0, [](int32_t il) { return il == 1; });
     llama_memory_hybrid hybrid(model, std::move(hybrid_attention), std::move(recurrent), 256);
     hybrid_cache->set_native_companion_reset([]() { return false; });
@@ -1589,7 +1589,7 @@ int main() {
             GGML_TYPE_Q4_0, false, cpu, 256, true);
     attention->set_mixed_state_identity(123, 456);
     auto * attn = attention.get();
-    auto recurrent = std::make_unique<llama_memory_recurrent>(model, GGML_TYPE_F32, GGML_TYPE_F32,
+    auto recurrent = std::make_unique<llama_memory_recurrent>(model, false, GGML_TYPE_F32, GGML_TYPE_F32,
             false, 1, 1, 0, [](int32_t il) { return il == 1; });
     auto * rs = recurrent.get();
     llama_memory_hybrid hybrid(model, std::move(attention), std::move(recurrent), 256);
