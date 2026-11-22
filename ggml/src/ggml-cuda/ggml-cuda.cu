@@ -2548,6 +2548,25 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
     return true;
 }
 
+// Both projections keep their ordinary MMQ dispatch and tile geometry.
+static bool ggml_cuda_mmq_id_pair(const ggml_tensor * first, const ggml_tensor * second, int cc) {
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || first->op != GGML_OP_MUL_MAT_ID || second->op != GGML_OP_MUL_MAT_ID ||
+            !(second->flags & GGML_TENSOR_FLAG_COMPUTE) || first->src[1] != second->src[1] || first->src[2] != second->src[2]) {
+        return false;
+    }
+
+    const ggml_tensor * weight = first->src[0];
+    const ggml_tensor * rhs = first->src[1];
+    const ggml_type type = weight->type;
+    if ((type != GGML_TYPE_Q2_0 && type != GGML_TYPE_IQ3_S) || rhs->type != GGML_TYPE_F32 ||
+            rhs->ne[1] != 1 || rhs->ne[2] <= MMVQ_MAX_BATCH_SIZE || first->type != GGML_TYPE_F32 ||
+            !ggml_are_same_layout(weight, second->src[0]) || !ggml_are_same_layout(first, second) ||
+            memcmp(first->op_params, second->op_params, sizeof(first->op_params)) != 0) {
+        return false;
+    }
+    return ggml_cuda_should_use_mmq(type, cc, rhs->ne[2], weight->ne[2]);
+}
+
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -6102,6 +6121,11 @@ static bool ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         return !env || std::atoi(env) != 0;
     }();
 
+    static const bool mmq_gate_up_shared_q8 = [] {
+        const char * env = getenv("LLAMA_MMQ_GATE_UP_SHARED_Q8");
+        return env && strcmp(env, "1") == 0;
+    }();
+
     // Only the DGX Spark (GB10) path reads the consumer counts; building the
     // map on every other device is pure host work per graph execution.
     const bool gb10_shared_q8_device = shared_q8_enabled &&
@@ -6374,6 +6398,17 @@ static bool ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             ggml_op_name(cgraph->nodes[last_fused]->op), cgraph->nodes[last_fused]->name);
 #endif
                     i += nodes_to_skip;
+                    continue;
+                }
+
+                if (mmq_gate_up_shared_q8 && !is_concurrent_event_active && i + 1 < cgraph->n_nodes &&
+                        ggml_cuda_mmq_id_pair(node, cgraph->nodes[i + 1], ggml_cuda_info().devices[cuda_ctx->device].cc) &&
+                        stream_ctx.concurrent_events.count(node) == 0) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+                    ggml_cuda_trace_counter("cuda_mmq_gate_up_shared_q8", cgraph);
+#endif
+                    ggml_cuda_mul_mat_id_q_pair(*cuda_ctx, node, cgraph->nodes[i + 1]);
+                    ++i;
                     continue;
                 }
 

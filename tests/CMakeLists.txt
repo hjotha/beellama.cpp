@@ -1424,6 +1424,7 @@ endif()
 
 # Bee backend coverage uses the canonical cache-type registry from common/arg.cpp.
 llama_build(test-backend-ops.cpp LINK llama-common)
+llama_build(test-mmq-gate-up.cpp LINK ggml)
 llama_build_and_test(test-turboquant-nc.cpp LINK ggml)
 target_include_directories(test-turboquant-nc PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 if (TARGET ggml-cpu)
