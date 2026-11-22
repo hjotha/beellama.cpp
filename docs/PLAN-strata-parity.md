@@ -1,6 +1,7 @@
 # Plano: paridade Strata ↔ beellama (offload de experts)
 
-Status: **P0/P1 implementados nesta branch** (`feat/strata-parity-moe-autocache`).
+Para as receitas vigentes e as decisões de integração, consulte o [status de 22/11](agent-reports/strata-parity-status-20261122.md) e a última seção deste plano.
+O plano inicial foi escrito em `feat/strata-parity-moe-autocache`, com P0/P1 implementados.
 Referência lida: `github.com/Niko1221/Strata` (MIT) — `docs/HOW_IT_WORKS.md`,
 `docs/DETAILS.md` (Memory modes, Expert cache budget, Draft layer), `engine/src/core/*`,
 mais o GGUF `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF` (2 shards; só o shard 1 precisa
@@ -409,8 +410,9 @@ assintótico)**. Em `-ub 1024` o custo fixo responde por 5,1 s dos 18,1 s do pp2
 `-ub 2048` rende +16% e o teto com ubatch maior é ~2,0-2,2k t/s. A Strata (4.629 t/s em 28k) está
 ~2,1× acima desse teto: a diferença restante é compute por token, não agendamento.
 
-`-ub 4096` carrega mas devolve `500 Compute error` em todo request (não é OOM; pico 38.456 MiB) —
-limite de geometria/kernel a investigar só se o teto de ubatch importar.
+Na rodada com cache, `-ub 4096` carregou e devolveu `500 Compute error` ao reservar
+2.175 MiB de buffer CUDA para o grafo. A exceção registrada foi `cudaMalloc failed`.
+[Varredura de ubatch](agent-reports/strata-prefill-ub-20261122.md)
 
 A leitura anterior de "96,7% host" fica corrigida: `device_host_us` inclui sincronizações internas
 do nó e, principalmente, **back-pressure da fila CUDA** (o host bloqueia no launch quando a GPU está
@@ -429,3 +431,74 @@ Fechando as alternativas de recipe: `--n-cpu-moe 0` não muda nada (pp28k 1.577,
 é fator. A sugestão de reusar gate/up no MMQ não tem pré-condição: o modelo tem gate/up separados,
 mas `ggml_cuda_mmq_fusion_supported` (`mmq.cuh:537`) só aceita Q4_K/Q5_K/Q6_K/Q8_0/IQ4_XS, então
 Q2_0 exigiria um caminho fundido novo para os tiles, com ganho esperado pequeno diante do GEMM.
+
+## Receitas finais e critério de integração
+
+Os [comandos da A100-40G](agent-reports/strata-parity-status-20261122.md#3-recipes-a100-40g)
+usam Qwen3.8-Flash-Next Q2_0 no contexto de 32.768 tokens e KV Q8_0/Q8_0.
+Para prefill, `-ub 2048`, `LLAMA_MMQ_GATE_UP_GLU=1` e
+`LLAMA_MMQ_GATE_UP_SHARED_Q8=1` entregaram **1.946,6 t/s** em pp28k (+5,3% sobre
+SHARED_Q8 sozinho), saída bit a bit idêntica. Fusão integrada em `3fd591f0b`.
+Para decode, DFlash2 Q8_0 com `-ub 1024 --spec-draft-n-max 8` entregou **95,4 t/s** pós-4k e
+**87,3 t/s** pós-28k. O braço que solicitou `--spec-dm-controller profit` mediu
+96,6 e 88,0 t/s. O seletor DFlash2 inibe o controlador adaptativo no código atual.
+
+O reuso do roteamento no down (`48a6c549a`, `parity14`) passou no fixture CUDA
+com NMSE 0 e hashes idênticos no GGUF real. A mediana de três execuções subiu
+de **1.948,68 para 1.962,36 t/s** em pp28k (+0,70%), com pico de 38.906 MiB
+em ambos os braços. A flag `LLAMA_MMQ_MOE_REUSE_MAP` permanece default-off em
+código arquivado na tag local `archive/strata-expert-major-20261122`. O ganho ficou abaixo do piso de 3% para integração.
+
+### Fallback CPU keyed no IQ3_S
+
+O protótipo `38e525698` passou no fixture CPU (63/63, NMSE 0) e na
+regressão `deepseek2` na 4070. Na A100-40G, o A/B real com `-ncmoe 36`,
+cache 20.000 MiB e `-ub 2048` registrou pp28k **1.070,27 → 1.057,99 t/s**
+(−1,15%) e decode **26,80 → 11,24 t/s** (−58,06%). Os hashes ficaram estáveis
+dentro de cada braço e divergiram entre eles. A branch experimental
+`feat/cpufb-verify` guarda o protótipo. [Medição completa](agent-reports/strata-parity-closeout-20261122.md#fallback-cpu-keyed)
+
+### Desenho e A/B do item 4c de QSA
+
+Hoje `build_qsa_sel` em `src/models/qwen4exp.cpp` entrega a máscara de seleção.
+A FA CUDA monta a união de células da tile a partir dela. Começar pela rota
+esparsa Q8_0 local da CUDA Ampere+, D=256, nas mesmas geometrias e limiares do
+despacho atual (`ggml/src/ggml-cuda/fattn.cu`). Confirmar o placement CUDA
+antes de suprimir `TOP_K_MASK`. Manter a máscara na rota de fallback para tails
+de precisão, KVarN, outras geometrias e outros backends.
+
+Consumir os top-k já selecionados, os scores, o mapa pool→célula e os IDs da
+cauda incompleta. Aplicar o mesmo filtro de visibilidade de `TOP_K_MASK` e
+preservar as coordenadas físicas locais de cada stream. Por tile, enumerar em
+ordem ascendente a união das células visíveis e emitir um byte de pertinência
+por célula para as até oito queries. Essa ordem mantém a sequência de redução
+da FA. O limite da união é `min(n_kv, queries_na_tile × células_máximas_por_query)`.
+A FA esparsa atual usa valores de máscara binários; condicionar o caminho a
+essa propriedade. Usar uma entrada explícita para os IDs, respeitando os
+slots reservados para exact-tail em `FLASH_ATTN_EXT`.
+
+Validar igualdade dos conjuntos de células por query, saídas finitas e
+NMSE ≤1e-6. Cobrir IDs duplicados, scores −∞, sentinelas, cauda incompleta
+com 1–3 células e dois streams com padrão de slots distinto. Para o limite de
+2.051 células do modelo, usar KV/nq 4.096/1 (estreito), 16.384/5 (fallback),
+16.640/13 e 32.768/13 ou 512 (largo). Rodar com CUDA Graphs ligado e desligado
+e verificar o despacho em cada caso.
+
+Na A100, manter a recipe de prefill (`-b 2048 -ub 2048`) nos dois braços.
+Usar o mesmo binário, três pares alternados, dois warmups por braço,
+pp4k+dec e pp28k+dec. Registrar hashes, faixa de throughput e pico de VRAM.
+Medir top-k até FA por eventos CUDA em rodada diagnóstica. O evento de host
+`strata_fa_sparse_mask` contabiliza bytes lógicos; medir tráfego DRAM exige
+contadores do dispositivo.
+
+### Fusão completa gate/up/GLU/down
+
+A prova separa a fusão GLU já integrada, o mapa compartilhável e a barreira
+numérica antes do down. O down quantiza a saída do GLU em blocos Q8_1 próprios.
+Uma fusão completa precisa reproduzir os valores F32 que entram nesses blocos,
+seu máximo, escala, arredondamento e soma, e depois manter a ordem de redução
+do down. Comparar primeiro os bytes dos blocos Q8_1 e o resultado por expert
+em um fixture de duas sequências e rota enviesada (640 canais, 2.048 tokens,
+512 experts, top-10), incluindo empates de arredondamento e a cauda. Medir NMSE
+e hashes na mesma geometria antes de validar throughput. O teste da fusão
+completa permanece pendente.
