@@ -1384,6 +1384,25 @@ struct ggml_tensor_extra_gpu {
 #define USE_CUDA_GRAPH
 #endif
 
+struct ggml_cuda_op_gpu_events {
+    std::vector<std::array<cudaEvent_t, 2>> pairs;
+
+    void reserve(size_t count) {
+        while (pairs.size() < count) {
+            auto & pair = pairs.emplace_back();
+            CUDA_CHECK(cudaEventCreateWithFlags(&pair[0], cudaEventDefault));
+            CUDA_CHECK(cudaEventCreateWithFlags(&pair[1], cudaEventDefault));
+        }
+    }
+
+    ~ggml_cuda_op_gpu_events() {
+        for (const auto & pair : pairs) {
+            CUDA_CHECK(cudaEventDestroy(pair[0]));
+            CUDA_CHECK(cudaEventDestroy(pair[1]));
+        }
+    }
+};
+
 struct ggml_cuda_graph {
 #ifdef USE_CUDA_GRAPH
     ~ggml_cuda_graph() {
@@ -1394,6 +1413,7 @@ struct ggml_cuda_graph {
         }
     }
     std::vector<cudaGraphExec_t> instances;
+    std::vector<ggml_op> op_gpu_profile_ops;
     size_t num_nodes = 0;
     std::vector<cudaGraphNode_t> nodes;
     bool disable_due_to_gpu_arch = false;
@@ -1597,6 +1617,9 @@ struct ggml_backend_cuda_context {
     size_t cublas_workspace_sizes[GGML_CUDA_MAX_DEVICES] = {};
 
     int curr_stream_no = 0;
+
+    // The cached graph executables below must be destroyed before their event handles.
+    ggml_cuda_op_gpu_events op_gpu_events;
 
 #ifdef USE_CUDA_GRAPH
     ggml_cuda_graph_policy::config graph_policy;
