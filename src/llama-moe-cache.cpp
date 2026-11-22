@@ -40,6 +40,9 @@ struct moe_cache_slru {
     // number of slots that hold an expert of each layer, kept in sync by plan and plan_partial
     std::vector<int32_t> n_cached;
 
+    // slots guaranteed to each layer by the partial prefill admission; 0 for uncached layers
+    std::vector<int32_t> quota;
+
     // slots that still hold no expert; each filled slot leaves it for good
     std::vector<int32_t> free_slots;
     std::vector<int32_t> free_pos;
@@ -60,6 +63,7 @@ struct moe_cache_slru {
         is_protected.assign(n_slots, false);
         seen.assign(n_expert, 0);
         n_cached.assign(n_layer, 0);
+        quota.assign(n_layer, 0);
         free_slots.resize(n_slots);
         free_pos.assign(n_slots, -1);
         for (int32_t s = 0; s < n_slots; ++s) {
@@ -265,7 +269,8 @@ struct moe_cache_slru {
             key_of[s] = il*n_expert + e;
             slots[e] = s;
             n_cached[il]++;
-            n_res++;
+            // a replacement inside the layer leaves n_cached[il] unchanged
+            n_res = n_cached[il];
             move(s, false);
             fills.push_back({ e, s });
         }
@@ -291,10 +296,19 @@ struct moe_cache_slru {
     // while a layer is below its quota the cache may still be full because another layer
     // holds more than its share, e.g. after small batches used the whole group
     int32_t victim_of_other_layer(int32_t il) const {
-        for (int segment = 0; segment < 2; ++segment) {
-            for (int32_t s = head[segment]; s >= 0; s = next[s]) {
-                const int32_t key = key_of[s];
-                if (key >= 0 && key / n_expert != il) {
+        // First pass: a layer that holds more than its guaranteed quota is hoarding slots.
+        // Second pass: any other layer, for the case where every layer is at its share.
+        for (int pass = 0; pass < 2; ++pass) {
+            for (int segment = 0; segment < 2; ++segment) {
+                for (int32_t s = head[segment]; s >= 0; s = next[s]) {
+                    const int32_t key = key_of[s];
+                    if (key < 0 || key / n_expert == il) {
+                        continue;
+                    }
+                    const int32_t other = key / n_expert;
+                    if (pass == 0 && (other >= (int32_t) quota.size() || n_cached[other] <= quota[other])) {
+                        continue;
+                    }
                     return s;
                 }
             }
@@ -594,6 +608,9 @@ struct llama_moe_cache::impl {
                 devices[g.id].buf_size += map_bytes;
             } else {
                 g.slru.init(model.layers.size(), n_expert, g.n_slots);
+                for (size_t li = 0; li < g.layers.size(); ++li) {
+                    g.slru.quota[g.layers[li]] = layers[g.layers[li]].quota;
+                }
                 n_tensors_host += g.layers.size();
             }
             n_tensors[g.id] += g.ref.size()*(1 + g.layers.size());
