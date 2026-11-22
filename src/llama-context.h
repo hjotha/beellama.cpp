@@ -329,6 +329,9 @@ struct llama_context {
     // initialise a backend of its own.
     ggml_backend_t backend_supporting_buft(ggml_backend_buffer_type_t bt) const;
 
+    // internal diagnostics: expert cache counters, nullptr when the cache is disabled
+    const llama_moe_cache * moe_cache_debug() const { return moe_cache.get(); }
+
 private:
     //
     // output
@@ -515,11 +518,13 @@ private:
     struct copy_experts_info {
         const ggml_tensor *  ids = nullptr;
         std::vector<int32_t> ids_data;
+        std::vector<int32_t> ids_flat; // ids_data without the tensor strides, for the MoE cache
         std::vector<bool>    used;
 
         void reset() {
             ids = nullptr;
             ids_data.clear();
+            ids_flat.clear();
             used.clear();
         }
     };
