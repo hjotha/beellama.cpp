@@ -5,6 +5,7 @@
 #include "llama-model.h"
 
 #include "ggml-cpp.h"
+#include "ggml-remote-attn-trace.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -657,8 +658,17 @@ struct llama_moe_cache::impl {
         GGML_ASSERT(ggml_is_contiguous(sel));
 
         ids.resize(ggml_nelements(sel));
-        ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
-        ggml_backend_synchronize(backend);
+        {
+            ggml_remote_attn_trace_scope route("strata_moe_route", sel);
+            route.enabled &= llama_prefill_profile_enabled();
+            if (route.enabled) {
+                route.event.nq = sel->ne[1];
+                route.event.bytes = ggml_nbytes(sel);
+                route.event.flags = 1; // bank fill
+            }
+            ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
+            ggml_backend_synchronize(backend);
+        }
 
         size_t n_hit = 0;
         if (!g.slru.plan(il, ids.data(), ids.size(), fills, n_hit)) {
@@ -736,6 +746,12 @@ llama_moe_upload::~llama_moe_upload() {
 }
 
 void llama_moe_upload::set(ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    ggml_remote_attn_trace_scope timing("strata_moe_upload", tensor);
+    timing.enabled &= llama_prefill_profile_enabled();
+    if (timing.enabled) {
+        timing.event.bytes = size;
+        timing.event.flags = (upload ? 1u : 0u) | (ggml_backend_buffer_is_host(tensor->buffer) ? 2u : 0u);
+    }
     if (upload) {
         upload(backend, tensor, data, offset, size, !pending);
         pending = true;

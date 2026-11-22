@@ -57,6 +57,12 @@ assert off_inputs and all(e["flags"] == 0 for e in off_inputs)
 assert any(e["flags"] == 1 for e in on_inputs)
 assert all(e["bytes"] == 8 * e["nq"] for e in on_inputs if e["flags"] == 1)
 
+for events in (off, on):
+    geometry = phase(events, "strata_qsa_mask_geometry")
+    assert len(geometry) == len(phase(events, "strata_qsa_pool_input"))
+    assert all(e["nq"] > 0 and e["value"] > 0 and e["bytes"] >= 4*e["nq"] and
+               e["bytes"] % (4*e["nq"]) == 0 for e in geometry)
+
 ple = phase(on, "strata_ple_prefetch")
 assert ple and all(e["flags"] == 0 and e["bytes"] == 0 and e["value"] >= e["nq"] for e in ple)
 assert all(e.get("dropped", 0) == 0 for e in off + on)

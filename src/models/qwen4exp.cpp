@@ -842,6 +842,14 @@ public:
             timing.event.bytes = ggml_nbytes(pool_mask);
             timing.event.nq = ubatch->n_tokens;
             timing.event.flags = pool_mask->type == GGML_TYPE_I32 ? 1u : 0u;
+
+            // Compare the maximum cell-ID payload with the downstream FA mask scan.
+            auto geometry = ggml_remote_attn_trace_identity("strata_qsa_mask_geometry", tail_idxs);
+            geometry.begin_us = geometry.end_us = timing.event.begin_us;
+            geometry.nq = ubatch->n_tokens;
+            geometry.bytes = uint64_t(n_sel)*ubatch->n_tokens*sizeof(int32_t);
+            geometry.value = n_kv;
+            ggml_remote_attn_trace_record(&geometry);
         }
         mctx->set_input_kpool(pool_cells, pool_idxs, pool_mask, tail_idxs, nullptr, new_pool_idxs, new_pool_rep,
                               ubatch, new_pool_pos);
@@ -1433,6 +1441,61 @@ public:
     std::vector<llama_token> prev;
 };
 
+static void qwen4exp_ple_rows(const llama_hparams & hp, llama_token token,
+        const llama_token * prev, int32_t * rows) {
+    uint64_t mixed = (uint64_t) token * hp.ple_layer_multipliers[0];
+    const auto eos = (llama_token) hp.ple_eos_token_id;
+    bool cut = false;
+    for (uint32_t j = 1; j < hp.ple_ngram_size; ++j) {
+        // Predecessors are oldest first. An EOS resets itself and earlier positions.
+        const llama_token t = prev[hp.ple_ngram_size - 1 - j];
+        cut = cut || t < 0 || t == eos;
+        mixed ^= (uint64_t) (cut ? eos : t) * hp.ple_layer_multipliers[j];
+        const uint32_t head = (j - 1)*hp.ple_heads_per_ngram;
+        for (uint32_t h = head; h < head + hp.ple_heads_per_ngram; ++h) {
+            rows[h] = (int32_t) (mixed % hp.ple_head_vocab_sizes[h] + hp.ple_head_offsets[h]);
+        }
+    }
+}
+
+void llama_qwen4exp_prefetch_next_ple(const llama_model & model, const llama_ubatch & ub) {
+    const auto & hp = model.hparams;
+    const auto * table = model.per_layer_tok_embd;
+    if (!hp.ple_n_heads || !model.can_prefetch.count(table) || !ub.token || ub.embd || ub.type ||
+            ub.n_seqs_unq != 1 || !ub.pos || !ub.n_seq_id || !ub.seq_id) {
+        return;
+    }
+
+    const uint32_t n_prev = hp.ple_ngram_size - 1;
+    if (ub.n_tokens <= n_prev) {
+        return;
+    }
+    for (uint32_t i = 0; i < ub.n_tokens; ++i) {
+        if (ub.n_seq_id[i] != 1 || int64_t(ub.pos[i]) != int64_t(ub.pos[0]) + i) {
+            return;
+        }
+    }
+
+    // Avoid predicting KV state at the boundary. The regular input path always resolves every row.
+    std::vector<int32_t> rows(size_t(ub.n_tokens - n_prev)*hp.ple_n_heads);
+    for (uint32_t i = n_prev; i < ub.n_tokens; ++i) {
+        qwen4exp_ple_rows(hp, ub.token[i], ub.token + i - n_prev, rows.data() + size_t(i - n_prev)*hp.ple_n_heads);
+    }
+    static const bool trace = [] {
+        const char * env = std::getenv("LLAMA_PLE_PREFETCH_TRACE");
+        return env && std::strcmp(env, "1") == 0;
+    }();
+    ggml_remote_attn_trace_scope timing("strata_ple_lookahead", table);
+    timing.enabled &= trace;
+    if (timing.enabled) {
+        timing.event.nq = ub.n_tokens;
+        timing.event.value = rows.size();
+        timing.event.bytes = rows.size()*table->nb[1];
+        timing.event.first_pos = ub.pos[0];
+    }
+    llama_prefetch_rows(table, rows.data(), rows.size());
+}
+
 void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
     const auto & hparams = model.hparams;
 
@@ -1448,50 +1511,21 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
     };
 
     const int64_t n_tokens = ubatch->n_tokens;
-    const int64_t n_gram   = hparams.ple_ngram_size;
-    const int64_t n_heads  = hparams.ple_n_heads;
-    const int64_t per_gram = hparams.ple_heads_per_ngram;
-    const int64_t eos      = hparams.ple_eos_token_id;
-    const int64_t n_prev   = n_gram - 1;
+    const int64_t n_heads = hparams.ple_n_heads;
+    const uint32_t n_prev = hparams.ple_ngram_size - 1;
 
     std::vector<int32_t> idx(n_heads * n_tokens);
 
     GGML_ASSERT(mctx != nullptr);
 
     for (int64_t i = 0; i < n_tokens; ++i) {
-        // the preceding tokens would be ambiguous, see get_prev_tokens()
         GGML_ASSERT(ubatch->n_seq_id[i] == 1 && "PLE n-gram embeddings do not support tokens shared by multiple sequences");
     }
 
-    // predecessors come from the KV cells (ext.tok); apply_ubatch() already stored this ubatch, so its own tokens count too
+    // apply_ubatch() already stored this ubatch, so its tokens count too.
     mctx->get_prev_tokens(*ubatch, n_prev, prev);
-
     for (int64_t i = 0; i < n_tokens; ++i) {
-        // an EOS in the window resets everything at or before it
-        // a missing predecessor (before the sequence start, or no cached cell) reads as EOS
-        // the EOS of the token itself does not cut its own context, as in the reference
-        std::vector<int64_t> ctx(n_gram);
-        ctx[0] = tok_of(i);
-        bool cut = false;
-        for (int64_t s = 1; s < n_gram; ++s) {
-            // predecessor s positions back; prev[] is oldest-first, missing entries are LLAMA_TOKEN_NULL
-            const llama_token t = cut ? LLAMA_TOKEN_NULL : prev[i*n_prev + (n_prev - s)];
-            cut = cut || t < 0 || t == eos;
-            ctx[s] = cut ? eos : t;
-        }
-
-        for (int64_t n = 2; n <= n_gram; ++n) {
-            uint64_t mixed = (uint64_t) ctx[0] * hparams.ple_layer_multipliers[0];
-            for (int64_t j = 1; j < n; ++j) {
-                mixed ^= (uint64_t) ctx[j] * hparams.ple_layer_multipliers[j];
-            }
-            const int64_t base = (n - 2) * per_gram;
-            for (int64_t g = 0; g < per_gram; ++g) {
-                const int64_t h_i = base + g;
-                idx[i * n_heads + h_i] =
-                    (int32_t) (mixed % hparams.ple_head_vocab_sizes[h_i] + hparams.ple_head_offsets[h_i]);
-            }
-        }
+        qwen4exp_ple_rows(hparams, tok_of(i), prev.data() + i*n_prev, idx.data() + i*n_heads);
     }
 
     {

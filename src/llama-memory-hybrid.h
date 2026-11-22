@@ -251,6 +251,10 @@ public:
     // llama_memory_hybrid_context
     //
 
+    const llama_ubatch * peek_next_ubatch() const {
+        return i_next + 1 < ubatches.size() ? &ubatches[i_next + 1] : nullptr;
+    }
+
     const llama_kv_cache_context * get_attn() const;
     const llama_memory_context_i * get_attn_memory_context() const;
     const llama_kv_cache_context * get_attn_kv_context() const;

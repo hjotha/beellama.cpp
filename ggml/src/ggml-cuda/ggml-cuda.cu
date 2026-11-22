@@ -3536,7 +3536,14 @@ static void ggml_backend_cuda_moe_upload(ggml_backend_t backend, ggml_tensor * t
     auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
     ggml_cuda_set_device(ctx->device);
 
+    static const bool profile = [] {
+        const char * env = std::getenv("LLAMA_PREFILL_PROFILE");
+        return env && strcmp(env, "1") == 0;
+    }();
+
     if (!tensor) {
+        ggml_remote_attn_trace_scope timing("strata_moe_stream_join");
+        timing.enabled &= profile;
         // The callback runs before graph capture/replay. The split may consume the bank after this wait.
         CUDA_CHECK(cudaEventRecord(ctx->moe_upload_ready, ctx->moe_upload_stream));
         CUDA_CHECK(cudaStreamWaitEvent(ctx->stream(), ctx->moe_upload_ready, 0));
@@ -3550,6 +3557,12 @@ static void ggml_backend_cuda_moe_upload(ggml_backend_t backend, ggml_tensor * t
         CUDA_CHECK(cudaStreamCreateWithFlags(&ctx->moe_upload_stream, cudaStreamNonBlocking));
         CUDA_CHECK(cudaEventCreateWithFlags(&ctx->moe_upload_reuse, cudaEventDisableTiming));
         CUDA_CHECK(cudaEventCreateWithFlags(&ctx->moe_upload_ready, cudaEventDisableTiming));
+    }
+    ggml_remote_attn_trace_scope timing("strata_moe_cuda_upload", tensor);
+    timing.enabled &= profile;
+    if (timing.enabled) {
+        timing.event.bytes = size;
+        timing.event.flags = first ? 1u : 0u;
     }
     if (first) {
         // A bank slot or scheduler copy may still be read by an earlier split.
@@ -3582,6 +3595,7 @@ static void ggml_backend_cuda_moe_upload(ggml_backend_t backend, ggml_tensor * t
             CUDA_CHECK(status);
         }
         if (status != cudaSuccess || attrs.type != cudaMemoryTypeHost) {
+            if (timing.enabled) timing.event.flags |= 2u; // pageable source via staging
             const char * src = (const char *) data;
             for (size_t sent = 0; sent < size;) {
                 const size_t n = ctx->moe_ring.chunk(size - sent);
@@ -3590,6 +3604,8 @@ static void ggml_backend_cuda_moe_upload(ggml_backend_t backend, ggml_tensor * t
                 status = cudaEventQuery(done);
                 if (status == cudaErrorNotReady) {
                     ++ctx->moe_stage_waits;
+                    ggml_remote_attn_trace_scope wait("strata_moe_ring_wait");
+                    wait.enabled &= timing.enabled;
                     CUDA_CHECK(cudaEventSynchronize(done));
                 } else {
                     CUDA_CHECK(status);
@@ -3598,6 +3614,7 @@ static void ggml_backend_cuda_moe_upload(ggml_backend_t backend, ggml_tensor * t
                 memcpy(staged, src + sent, n);
                 CUDA_CHECK(cudaMemcpyAsync(dst + sent, staged, n, cudaMemcpyHostToDevice, ctx->moe_upload_stream));
                 CUDA_CHECK(cudaEventRecord(done, ctx->moe_upload_stream));
+                if (timing.enabled) ++timing.event.value;
                 ++ctx->moe_stage_chunks;
                 ctx->moe_stage_bytes_sent += n;
                 sent += n;
@@ -3605,6 +3622,7 @@ static void ggml_backend_cuda_moe_upload(ggml_backend_t backend, ggml_tensor * t
             return;
         }
     }
+    if (timing.enabled) timing.event.flags |= ctx->moe_stage ? 4u : 8u; // pinned confirmed or unchecked
     CUDA_CHECK(cudaMemcpyAsync(dst, data, size, cudaMemcpyHostToDevice, ctx->moe_upload_stream));
 }
 #endif
