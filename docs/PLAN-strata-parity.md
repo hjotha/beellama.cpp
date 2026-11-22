@@ -347,6 +347,21 @@ sobe de 12,7 para 26,0 s) deu +0,07% (1.550,44 → 1.551,49 t/s), dentro da disp
 plano de grafo entre ubatches de mesma forma (2,6 s de `prep`), e só então otimizar kernels por
 classe com trace.
 
+## Fusão gate/up/GLU Q2_0 no MMQ (A100, 2026-11-22, `feat/mmq-glu`)
+
+`LLAMA_MMQ_GATE_UP_GLU=1` funde gate, up e o GLU de cada par num único lançamento para pesos
+Q2_0, reutilizando o layout de tiles intercalados. A/B no mesmo binário (`parity13`), 3 execuções:
+
+| config | pp4k | pp28k | decode 28k |
+|---|---:|---:|---:|
+| off (com `LLAMA_MMQ_GATE_UP_SHARED_Q8=1`) | 1.786,1 | 1.848,2 | 45,52 |
+| **on** | **1.883,5 (+5,5%)** | **1.946,6 (+5,3%)** | 45,61 |
+
+Saída **bit-idêntica** (`09f5c164` / `39d5087f`) e dispersão de ~1 t/s nos dois braços. Corretude:
+fixture `test-mmq-gate-up` 9/9 bit-exact em CUDA (inclui m=640, 2.048 tokens, 512 experts, top-10),
+trace com 10 eventos `cuda_mmq_gate_up_glu` ligado e 0 desligado, `deepseek2` 3/3 off/on/graphs-off,
+`MUL_MAT_ID`/`MUL_MAT` 2/2. Recipe de prefill passa a habilitar a flag.
+
 ## Integração 2026-11-22 (parity12): cache parcial, MMQ gate/up e atribuição por op
 
 Branch de integração `feat/strata-merge` = `main` + `feat/moe-partial` + `feat/op-gpu` + `feat/mmq-gate-up`

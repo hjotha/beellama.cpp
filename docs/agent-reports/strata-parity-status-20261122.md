@@ -10,6 +10,7 @@ Branch `main` = `6cefde1a5`. Release da integração: `collabosm-a100-parity12-2
 | braço | prefill 4k | prefill 28k | decode curto | decode pós-4k | decode pós-28k |
 |---|---:|---:|---:|---:|---:|
 | **Bee Q2_0**, `-ub 2048`, `-ncmoe 2`, cache 2048 | 1.771 | **1.829** | 49,9 | 46,3 | 45,96 |
+| **Bee Q2_0** + fusão GLU Q2_0 (`LLAMA_MMQ_GATE_UP_GLU=1`) | 1.884 | **1.947** | — | 46,2 | 45,61 |
 | Bee Q2_0 + `LLAMA_MMQ_GATE_UP_SHARED_Q8=1` | 1.783 | **1.850** | — | 46,2 | 46,0 |
 | Bee Q2_0 + DFlash2 n-max 7 | 1.344 | 1.388 | 58,4 | 83,3 | 81,6 (instável) |
 | Bee Q2_0 + DFlash2 **n-max 8** | 1.342 | 1.384 | 74,0 | **95,4** | **87,3** |
@@ -113,7 +114,7 @@ A lacuna é **prefill**: 2,5× no Q2_0 e 5,1× no IQ3_S.
 
 | ordem | ação | ganho esperado | esforço | aceite |
 |---|---|---|---|---|
-| 1 | Validar e medir a fusão GLU Q2_0 (`feat/mmq-glu`) | 1-4% prefill | S (build+teste) | bit-exact na 4070, pp28k ≥3% acima do `parity12`, decode ≥97% |
+| 1 | ~~Validar e medir a fusão GLU Q2_0~~ **feito: +5,3%, bit-exact, no `main` (`3fd591f0b`)** | +5,3% prefill | — | cumprido |
 | 2 | Recipe: DFlash2 `n-max 8` ou profit | +7% decode pós-28k | S | docs/recipe + hash idêntico |
 | 3 | Protocolo de miss do fallback CPU | até ~2× no IQ3_S | L (6-9 semanas) | NMSE ≤1e-6, ids sem colisão, aceitação ±1 p.p. |
 | 4 | Expert-major no `MUL_MAT_ID` | desconhecido (2-5%?) | M-L | decomposição numérica provada |
