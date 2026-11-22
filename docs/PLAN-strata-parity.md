@@ -303,3 +303,46 @@ A lacuna de prefill para a Strata (4.629 vs 1.567) **não** é explicada pelo H2
 host nem por essas flags. O próximo passo é atribuição por nsys/scheduler
 (`GGML_SCHED_SPLIT_TIMING`, `LLAMA_GRAPH_PREP_PROFILE`), não mais flags default-off. Recipes usam
 o zip `parity5`; a base com `LLAMA_MOE_CACHE_PREFILL=1` e a MTP com `LLAMA_MTP_RESERVE_WEIGHTS=1`.
+
+## DFlash2, perfil de prefill e PLE (A100, 2026-11-22)
+
+Engine `parity6` (`feat/strata-opt` @ `9f59e300f`), Q2_0, Q8_0/Q8_0, b2048/ub1024,
+`-ncmoe 2`, cache 2048 MiB (host-side, não muda VRAM), **`--parallel 1`**, 2 runs por config.
+Detalhes e comandos em [strata-a100-dflash2-20261122.md](agent-reports/strata-a100-dflash2-20261122.md).
+
+| config | short tg | pp4k | pp4k+dec tg | pp28k | pp28k+dec tg | VRAM pico |
+|---|---:|---:|---:|---:|---:|---:|
+| m1-np1 (sem spec) | 60,15 | 1.559,4 | 46,93 | 1.575,1 | 45,09 | 37.838 |
+| DFlash2 Q8_0, n-max 7 | 66,83 | 1.341,3 | **89,91** | 1.393,0 | **84,17** | 39.624 |
+| DFlash2 Q8_0, n-max 4 | 59,28 | 1.353,5 | 90,33 | 1.399,1 | 79,31 | 39.286 |
+
+**Veredito**
+- DFlash2 Q8_0 é a melhor estratégia de decode medida no alvo real: **+91,5%** em 4k e **+86,7%**
+  em 28k sobre o alvo sem spec, contra +38%/+33% do MTP sidecar (64,8/58,5 t/s medidos em rodada
+  separada, mesmo alvo e GPU). Aceitação implícita ≥1,87 token/passo em n-max 7.
+- Custo: prefill **-14,0%** em 4k e **-11,6%** em 28k (o draft também processa o prompt), e +1,7 GiB
+  de VRAM. Fica em trilha separada do MTP, como já previsto.
+- `--parallel 1` é requisito: com 4 slots o estado recorrente GDN do alvo cresce de 112,6 para
+  3.602,3 MiB e o drafter não cabe.
+- `--moe-cache-mib` 6144/2048 dão o mesmo VRAM (cache é host-side); a diferença entre 6144 e 2048
+  não aparece no throughput medido.
+- **Critério de corretude:** "texto idêntico ao sem spec" não vale neste alvo. Só trocar
+  `-ub 1024` → `-ub 512` no `m1` sem spec já muda o greedy no 5º token; o greedy não é invariante à
+  geometria do batch com Q2_0 + KV q8_0. O aceite correto é top-1 no mesmo batch, NMSE do verify
+  contra single-token e aceitação/throughput, como no MTP. Os taps são bit-exatos no alvo (teste
+  CPU) e um erro neles reduziria aceitação, não mudaria o argmax do alvo.
+
+**Atribuição do prefill.** `LLAMA_PREFILL_PROFILE=1` só emite com `llama-server -lv 4`; em `-lv 3`
+o filtro do server descarta as linhas `LLAMA_LOG_INFO`. Com `-lv 4`, 37 ubatches / 33.177 tokens:
+parede do scheduler 15,669 s, dos quais **15,159 s (96,7%) são submissão host** (`CLASS/mixed`),
+2,614 s de preparação de grafo e 2,714 s de espera de sync; cópias 0,181 s e 1,595 GB de H2D.
+Todos os 74 splits caem em `mixed`, então a separação GDN/QSA/MoE por tempo exige trace de kernels.
+O perfil não muda o throughput (pp4k 1.543,8; pp28k 1.574,2).
+
+**PLE.** `LLAMA_PLE_PREFETCH=1` fica default-off: no A/B frio válido
+(`posix_fadvise(DONTNEED)`; `/proc/sys/vm/drop_caches` é read-only no container do Colab, carga
+sobe de 12,7 para 26,0 s) deu +0,07% (1.550,44 → 1.551,49 t/s), dentro da dispersão de 3,2 t/s.
+
+**Próximo alvo de prefill**, na ordem: reduzir submissões host por token (splits/ubatch), reusar o
+plano de grafo entre ubatches de mesma forma (2,6 s de `prep`), e só então otimizar kernels por
+classe com trace.
