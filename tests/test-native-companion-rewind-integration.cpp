@@ -61,7 +61,7 @@ int main() {
     attn->set_native_companion_reset([backend]() {
         return ggml_backend_remote_attn_reset(backend, 0);
     });
-    auto recurrent = std::make_unique<llama_memory_recurrent>(model, GGML_TYPE_F32, GGML_TYPE_F32,
+    auto recurrent = std::make_unique<llama_memory_recurrent>(model, false, GGML_TYPE_F32, GGML_TYPE_F32,
             false, 1, 1, 0, [](int32_t il) { return il == 1; });
     llama_memory_hybrid hybrid(model, std::move(attention), std::move(recurrent), 256);
     for (const auto & span : {std::pair<llama_pos, uint32_t>{0, 256}, {256, 2}}) {
