@@ -379,3 +379,8 @@ só em DGX Spark) deram **empate técnico** no A/B `parity6` × `parity7` (`-ub 
 1.830,2 vs 1.830,5 t/s no pp28k; 1.766,2 vs 1.768,4 no pp4k) com saída bit-idêntica; ficam como
 remoção de trabalho impossível, não como ganho. Detalhes em
 [strata-prefill-ub-20261122.md](agent-reports/strata-prefill-ub-20261122.md).
+Fechando as alternativas de recipe: `--n-cpu-moe 0` não muda nada (pp28k 1.577,8 vs 1.575,7 em
+`-ub 1024`; 1.835,5 vs 1.826,2 em `-ub 2048`) e o VRAM pronto fica idêntico — o H2D de experts não
+é fator. A sugestão de reusar gate/up no MMQ não tem pré-condição: o modelo tem gate/up separados,
+mas `ggml_cuda_mmq_fusion_supported` (`mmq.cuh:537`) só aceita Q4_K/Q5_K/Q6_K/Q8_0/IQ4_XS, então
+Q2_0 exigiria um caminho fundido novo para os tiles, com ganho esperado pequeno diante do GEMM.
