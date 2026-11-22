@@ -535,7 +535,7 @@ static __host__ int ggml_cuda_mmq_get_nbytes_shared_x(const ggml_cuda_mmq_config
 
 // Weight types with a fused gate/up/GLU path (see ggml_cuda_mmq_get_util_funcs).
 static constexpr __host__ __device__ bool ggml_cuda_mmq_fusion_supported(const ggml_type type) {
-    return type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_XS;
+    return type == GGML_TYPE_Q2_0 || type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_XS;
 }
 
 // Fused gate/up/GLU: the weight tile alternates chunks of this many up and gate rows, so rows r and r + 8 of an MMA tile (same thread) pair up.
@@ -688,7 +688,7 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
             case GGML_TYPE_Q2_0:
                 return ggml_cuda_mmq_util_funcs(
                     VDR_Q2_0_Q8_1_MMQ,
-                    ggml_cuda_mmq_load_tiles_q2_0<type, J, fallback>,
+                    ggml_cuda_mmq_load_tiles_q2_0<type, J, fallback, false>,
                     ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a<type, J, fallback>,
                     ggml_cuda_mmq_write_back_dp4a<type, J, fallback, prec_src1>);
             case GGML_TYPE_PQ2_0:
@@ -912,9 +912,9 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
         case GGML_TYPE_Q2_0:
             return ggml_cuda_mmq_util_funcs(
                 -1,
-                ggml_cuda_mmq_load_tiles_q2_0<type, J, fallback>,
+                ggml_cuda_mmq_load_tiles_q2_0<type, J, fallback, has_fusion>,
                 ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>,
-                ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1, false>);
+                ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1, has_fusion>);
         case GGML_TYPE_PQ2_0:
             return ggml_cuda_mmq_util_funcs(
                 -1,
@@ -1330,6 +1330,23 @@ static __global__ void mul_mat_q(
             }
             zt = block_expert[m_block];
             jt = m_block - block_start[zt];
+            wt = 0;
+        } else if (has_fusion && expert_bounds) {
+            // floor(bound/J) + expert gives each expert enough tile slots using the existing
+            // bounds. At most one slot per expert is empty, including experts with no tokens.
+            const int tile = blockIdx.x;
+            int lo = 0;
+            int hi = nchannels_y.z;
+            while (lo + 1 < hi) {
+                const int mid = (lo + hi) / 2;
+                if (expert_bounds[mid]/J + mid <= tile) {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            zt = lo;
+            jt = tile - (expert_bounds[zt]/J + zt);
             wt = 0;
         } else {
             const uint2 tmp2 = fast_div_modulo(blockIdx.z, nchannels_y);
@@ -1849,6 +1866,9 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
         const int32_t * block_start_ptr  = nullptr;
         int n_experts = 0;
         dim3 block_nums = block_nums_xy_tiling;
+        if (has_fusion && args.expert_bounds) {
+            block_nums = dim3(args.ncols_dst/J + args.nchannels_y, nty, 1);
+        }
 
         ggml_cuda_pool & pool = ctx.pool(id);
         ggml_cuda_pool_alloc<int32_t> block_start(pool);
@@ -2063,5 +2083,3 @@ void ggml_cuda_mul_mat_q_fused_two(
         const ggml_tensor * norm_weight, const float * norm_scale);
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
-
-bool ggml_cuda_mmq_fusion_is_efficient(ggml_type type, int64_t nrows_x, int64_t ncols, int64_t nchannels, int device);

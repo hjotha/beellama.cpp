@@ -11,16 +11,14 @@
 #include <random>
 #include <vector>
 
-static bool check_pair(ggml_backend_t backend, ggml_type type, int tokens_per_seq) {
+static bool check_pair(ggml_backend_t backend, ggml_type type, int tokens_per_seq,
+        int m = 128, int experts = 16, int used = 4, bool glu = false, bool mixed_prec = false) {
     constexpr int k = 512;
-    constexpr int m = 128;
-    constexpr int experts = 16;
-    constexpr int used = 4;
     constexpr int graph_size = 16;
     const int tokens = 2 * tokens_per_seq;
 
     ggml_context * ctx = ggml_init({
-        /*.mem_size   =*/ 16*ggml_tensor_overhead() + 3*ggml_graph_overhead_custom(graph_size, false),
+        /*.mem_size   =*/ 16*ggml_tensor_overhead() + 4*ggml_graph_overhead_custom(graph_size, false),
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     });
@@ -40,13 +38,34 @@ static bool check_pair(ggml_backend_t backend, ggml_type type, int tokens_per_se
         reference[proj] = ggml_mul_mat_id(ctx, weights[proj], input, ids);
         reference_graphs[proj] = ggml_new_graph_custom(ctx, graph_size, false);
         reference_graphs[proj]->uid = ggml_graph_next_uid();
-        ggml_build_forward_expand(pair_graph, paired[proj]);
+        if (mixed_prec && proj == 1) {
+            ggml_prec_set_acc(paired[proj], GGML_PREC_F32);
+            ggml_prec_set_acc(reference[proj], GGML_PREC_F32);
+        }
+        if (!glu || experts > 16) {
+            ggml_build_forward_expand(pair_graph, paired[proj]);
+        }
         ggml_build_forward_expand(reference_graphs[proj], reference[proj]);
     }
-    ggml_set_name(paired[0], "mmq_gate_up_pair");
-    GGML_ASSERT(ggml_graph_n_nodes(pair_graph) == 2);
-    GGML_ASSERT(ggml_graph_node(pair_graph, 0) == paired[0]);
-    GGML_ASSERT(ggml_graph_node(pair_graph, 1) == paired[1]);
+    ggml_tensor * paired_glu = nullptr;
+    ggml_tensor * reference_glu = nullptr;
+    ggml_cgraph * reference_glu_graph = nullptr;
+    if (glu) {
+        // The 512-expert case was expanded up first. GLU always takes gate first.
+        paired_glu = ggml_swiglu_split(ctx, paired[1], paired[0]);
+        reference_glu = ggml_swiglu_split(ctx, reference[1], reference[0]);
+        ggml_build_forward_expand(pair_graph, paired_glu);
+        reference_glu_graph = ggml_new_graph_custom(ctx, graph_size, false);
+        reference_glu_graph->uid = ggml_graph_next_uid();
+        reference_glu->flags |= GGML_TENSOR_FLAG_COMPUTE;
+        ggml_graph_add_node(reference_glu_graph, reference_glu);
+    }
+    const int first = glu && experts <= 16 ? 1 : 0;
+    GGML_ASSERT(ggml_graph_n_nodes(pair_graph) == (glu ? 3 : 2));
+    GGML_ASSERT(ggml_graph_node(pair_graph, 0) == paired[first]);
+    GGML_ASSERT(ggml_graph_node(pair_graph, 1) == paired[1 - first]);
+    ggml_format_name(paired[first], "mmq_gate_up_%s_%s_m%d%s",
+            glu ? "glu" : "pair", ggml_type_name(type), m, mixed_prec ? "_mixed" : "");
 
     ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
     GGML_ASSERT(buffer);
@@ -67,10 +86,37 @@ static bool check_pair(ggml_backend_t backend, ggml_type type, int tokens_per_se
     std::vector<int32_t> routing(used*tokens);
     double max_nmse = 0.0;
     bool bit_exact = true;
+    const auto compare = [&](ggml_tensor * result, ggml_tensor * expected) {
+        const size_t bytes = ggml_nbytes(expected);
+        ggml_backend_tensor_get(result, got.data(), 0, bytes);
+        ggml_backend_tensor_get(expected, want.data(), 0, bytes);
+        bit_exact &= std::memcmp(got.data(), want.data(), bytes) == 0;
+
+        double error = 0.0;
+        double signal = 0.0;
+        for (size_t i = 0; i < got.size(); ++i) {
+            const double diff = double(got[i]) - want[i];
+            error += diff*diff;
+            signal += double(want[i])*want[i];
+        }
+        const double nmse = error / signal;
+        max_nmse = std::isfinite(nmse) ? std::max(max_nmse, nmse) : INFINITY;
+    };
+
     // Reuse the same graphs with fresh inputs to cover capture and replay.
     for (int repeat = 0; repeat < 6; ++repeat) {
         std::generate(activation.begin(), activation.end(), random_value);
         for (int token = 0; token < tokens; ++token) {
+            if (experts > 16) {
+                // Use odd steps over a power of two to keep token slots distinct.
+                // Even repeats leave most experts empty, odd repeats cover all experts.
+                const int active = repeat % 2 == 0 ? 64 : experts;
+                const int base = (token + 19*repeat + int(rng() % active)) % active;
+                for (int slot = 0; slot < used; ++slot) {
+                    routing[token*used + slot] = (base + slot*37) % active;
+                }
+                continue;
+            }
             const int seq = token / tokens_per_seq;
             const int hot = (seq + repeat) % 4;
             routing[token*used + 0] = hot;
@@ -84,25 +130,20 @@ static bool check_pair(ggml_backend_t backend, ggml_type type, int tokens_per_se
         GGML_ASSERT(ggml_backend_graph_compute(backend, pair_graph) == GGML_STATUS_SUCCESS);
         for (int proj = 0; proj < 2; ++proj) {
             GGML_ASSERT(ggml_backend_graph_compute(backend, reference_graphs[proj]) == GGML_STATUS_SUCCESS);
-            const size_t bytes = ggml_nbytes(reference[proj]);
-            ggml_backend_tensor_get(paired[proj], got.data(), 0, bytes);
-            ggml_backend_tensor_get(reference[proj], want.data(), 0, bytes);
-            bit_exact &= std::memcmp(got.data(), want.data(), bytes) == 0;
-
-            double error = 0.0;
-            double signal = 0.0;
-            for (size_t i = 0; i < got.size(); ++i) {
-                const double diff = double(got[i]) - want[i];
-                error += diff*diff;
-                signal += double(want[i])*want[i];
+            if (!glu) {
+                compare(paired[proj], reference[proj]);
             }
-            const double nmse = error / signal;
-            max_nmse = std::isfinite(nmse) ? std::max(max_nmse, nmse) : INFINITY;
+        }
+        if (glu) {
+            GGML_ASSERT(ggml_backend_graph_compute(backend, reference_glu_graph) == GGML_STATUS_SUCCESS);
+            compare(paired_glu, reference_glu);
         }
     }
 
-    std::printf("%s %s tokens=%d seq=2: max NMSE %.9g, bit-exact %s\n",
-            ggml_backend_name(backend), ggml_type_name(type), tokens, max_nmse, bit_exact ? "yes" : "no");
+    std::printf("%s %s %s m=%d tokens=%d experts=%d top=%d: %smax NMSE %.9g, bit-exact %s\n",
+            ggml_backend_name(backend), ggml_type_name(type), glu ? "SwiGLU" : "pair", m, tokens, experts, used,
+            mixed_prec ? "mixed precision: " : "",
+            max_nmse, bit_exact ? "yes" : "no");
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
     return max_nmse <= 1e-6;
@@ -123,6 +164,11 @@ int main(int argc, char ** argv) {
             ok &= check_pair(backend, type, tokens_per_seq);
         }
     }
+    ok &= check_pair(backend, GGML_TYPE_Q2_0, 512, 128, 16, 4, true);
+    ok &= check_pair(backend, GGML_TYPE_Q2_0, 1024, 640, 512, 10, true);
+    ok &= check_pair(backend, GGML_TYPE_Q2_0, 512, 129, 16, 4, true);
+    ok &= check_pair(backend, GGML_TYPE_IQ3_S, 512, 128, 16, 4, true);
+    ok &= check_pair(backend, GGML_TYPE_Q2_0, 512, 128, 16, 4, true, true);
     ggml_backend_free(backend);
     return ok ? 0 : 1;
 }

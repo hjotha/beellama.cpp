@@ -219,9 +219,6 @@ static void ggml_cuda_mul_mat_q_impl(
         const ggml_tensor * gate,
         const ggml_tensor * norm_weight, const ggml_tensor * norm_scale,
         void * external_q8, bool quantize_external, const float * external_norm_scale, ggml_tensor * paired_dst) {
-    // Upstream's fused gate/up/GLU MMQ is handled by ggml_cuda_should_fuse_mul_mat_q;
-    // this fork keeps its own GLU-in-quantization path below.
-    GGML_UNUSED(fusion);
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
@@ -230,6 +227,18 @@ static void ggml_cuda_mul_mat_q_impl(
     GGML_ASSERT((norm_weight == nullptr) == (norm_scale == nullptr && external_norm_scale == nullptr));
     GGML_ASSERT(!norm_weight || (!ids && !gate && norm_weight->type == GGML_TYPE_F32 &&
                 ((norm_scale && norm_scale->type == GGML_TYPE_F32) || external_norm_scale)));
+
+    const ggml_tensor * gate_weight = fusion ? fusion->gate : nullptr;
+    ggml_cuda_mm_fusion_args_device fusion_device = {};
+    if (fusion) {
+        GGML_ASSERT(gate_weight && !fusion->x_bias && !fusion->gate_bias && !fusion->x_scale && !fusion->gate_scale);
+        GGML_ASSERT(!fusion->gate_input_scale && !fusion->shared_up && !fusion->shared_gate && !fusion->shared_dst);
+        GGML_ASSERT(!paired_dst && !gate && !input_scale && !norm_weight && !external_q8);
+        GGML_ASSERT(ggml_are_same_layout(gate_weight, src0));
+        fusion_device.gate = gate_weight->data;
+        fusion_device.glu_op = fusion->glu_op;
+        fusion_device.glu_limit = fusion->glu_limit;
+    }
 
     GGML_TENSOR_BINARY_OP_LOCALS;
 
@@ -253,6 +262,9 @@ static void ggml_cuda_mul_mat_q_impl(
     float       *  dst_d = (float       *)  dst->data;
 
     ggml_cuda_mmq_clear_padding(src0, stream);
+    if (gate_weight) {
+        ggml_cuda_mmq_clear_padding(gate_weight, stream);
+    }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
 
@@ -265,7 +277,8 @@ static void ggml_cuda_mul_mat_q_impl(
 
     const bool fallback = ggml_cuda_mmq_needs_fallback(ne01);
 
-    const ggml_prec prec_src1 = ggml_cuda_mmq_get_prec_src1(src0, dst, cc);
+    // The GLU destination has no matmul precision metadata.
+    const ggml_prec prec_src1 = gate_weight ? GGML_PREC_Q8 : ggml_cuda_mmq_get_prec_src1(src0, dst, cc);
 
     const bool use_native_fp4 = prec_src1 == GGML_PREC_Q4;
     const size_t y_block_size       = use_native_fp4 ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq);
@@ -297,26 +310,7 @@ static void ggml_cuda_mul_mat_q_impl(
             }
         }
 
-        int ntiles_J_best = INT_MAX;
-
-        for (int J = 8; J <= J_max && ntiles_J_best > 1; J += 8) {
-            const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(src0->type, J, fallback, cc, prec_src1);
-            if (config.type == GGML_TYPE_COUNT) {
-                continue;
-            }
-
-            if (mmq_get_nbytes_shared(config, cc) > smpbo) {
-                continue;
-            }
-
-            const int ntiles_x = (ncols_opt + config.J - 1) / config.J;
-
-            if (ntiles_x < ntiles_J_best) {
-                J_best = J;
-                nthreads_best = config.nthreads;
-                ntiles_J_best = ntiles_x;
-            }
-        }
+        J_best = ggml_cuda_mmq_get_J_best(src0->type, ncols_opt, fallback, cc, smpbo, prec_src1, &nthreads_best);
     }
     GGML_ASSERT(J_best > 0);
 
@@ -390,7 +384,7 @@ static void ggml_cuda_mul_mat_q_impl(
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
-            ne1, J_best, ggml_cuda_prefill_reference_origin(dst)};
+            ne1, J_best, ggml_cuda_prefill_reference_origin(dst), fusion_device};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
         return;
     }
@@ -469,7 +463,7 @@ static void ggml_cuda_mul_mat_q_impl(
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
-        ne12, J_best, ggml_cuda_prefill_reference_origin(dst)};
+        ne12, J_best, ggml_cuda_prefill_reference_origin(dst), fusion_device};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
     if (paired_dst) {
@@ -752,21 +746,4 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
     }
 
     return (!GGML_CUDA_CC_IS_CDNA(cc)) || ne11 < MMQ_DP4A_MAX_BATCH_SIZE;
-}
-
-bool ggml_cuda_mmq_fusion_is_efficient(const ggml_type type, const int64_t nrows_x, const int64_t ncols, const int64_t nchannels, const int device) {
-    const int    cc    = ggml_cuda_info().devices[device].cc;
-    const int    nsm   = ggml_cuda_info().devices[device].nsm;
-    const size_t smpbo = ggml_cuda_info().devices[device].smpbo;
-
-    const bool fallback = false;
-    const int  J_best   = ggml_cuda_mmq_get_J_best(type, ncols, fallback, cc, smpbo, GGML_PREC_Q8);
-    if (J_best == 0) {
-        return false;
-    }
-    const int64_t nrows_tile = ggml_cuda_mmq_get_config(type, J_best, fallback, cc, GGML_PREC_Q8).I / 2;
-    const int64_t ntiles     = (ncols + J_best - 1)/J_best * ((nrows_x + nrows_tile - 1)/nrows_tile) * nchannels;
-    const int64_t tiles_nwaves             = (ntiles + nsm - 1) / nsm;
-    const int64_t tiles_efficiency_percent = 100 * ntiles / (nsm*tiles_nwaves);
-    return tiles_efficiency_percent >= 90;
 }
