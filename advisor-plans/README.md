@@ -21,3 +21,9 @@ Escopo independente do plano 001. Ordem interna: profile e A/B controlado, regre
 | Plano | Prioridade | Estado | Dependências |
 |---|---|---|---|
 | [003 — Flash-Next EXL3 com MTP](003-flash-next-decode-a100.md) | P1 | Auditoria concluída, patches propostos | Trace pareado de decode e fixtures de paridade |
+
+## Prefill do Flash-Next na A100
+
+| Plano | Prioridade | Estado | Dependências |
+|---|---|---|---|
+| [004 — Baseline Strata e otimizações de prefill](004-strata-prefill-baseline.md) | P1 | Grade compacta do down Q2_0 com +9,23% em pp28k e hashes iguais na A100-80G | Build CUDA completo e confirmação na A100-40G |

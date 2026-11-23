@@ -77,6 +77,7 @@ A dense inventory for agents and users. Exact option names live in [common/arg.c
 - Static placement: `--n-cpu-moe`/`--cpu-moe`, `--cpu-moe-draft`, `--moe-host-pinned`/`--no-moe-host-pinned`.
 - **Expert cache in VRAM** (`--moe-cache-mib N`, `-1` = auto-sized from free device memory) with an SLRU, complete-group admission for large prefill batches, an optional immutable device map, upload overlap and a pinned ring. Tuning via environment: `LLAMA_MOE_CACHE_PREFILL`, `LLAMA_MOE_MAP_DEVICE`, `LLAMA_MOE_UPLOAD_OVERLAP`, `LLAMA_MOE_PINNED_RING`, `LLAMA_MOE_CACHE_PARTIAL_PREFILL` (partial-group admission for prefill; default off).
 - **Fused expert GEMM**: `LLAMA_MMQ_GATE_UP_SHARED_Q8=1` shares expert routing and the Q8_1 activation between adjacent gate/up MMQ pairs (Q2_0/IQ3_S; bit-exact, default off). `LLAMA_MMQ_GATE_UP_GLU=1` fuses gate, up and GLU for supported Q2_0 shapes (default off). The [A100 recipes](docs/agent-reports/strata-parity-status-20261122.md#3-recipes-a100-40g) document the measured prefill and DFlash2 settings.
+- **Compact expert down grid**: `GGML_CUDA_MMQ_SM80_Q2_DOWN_COMPACT=1` enables the experimental Flash-Next Q2_0 routed down projection on SM80 (default off). The [A100-80G results](advisor-plans/004-strata-prefill-baseline.md#variante-sm80-com-grade-compacta) record a 9.23% prefill gain on 28,547 tokens with identical output hashes.
 
 ### Loading, memory and long context
 
