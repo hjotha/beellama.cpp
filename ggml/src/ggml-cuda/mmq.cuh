@@ -1265,7 +1265,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
 // The mul_mat_q kernel implements "stream-k" work partitioning as described in https://arxiv.org/abs/2301.03598
 
-template <ggml_type type, int J, bool fallback, ggml_prec prec_src1, bool has_fusion>
+template <ggml_type type, int J, bool fallback, ggml_prec prec_src1, bool has_fusion, bool compact_down = false>
 __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback, prec_src1), ggml_cuda_mmq_get_occupancy(type, J, fallback, prec_src1))
 static __global__ void mul_mat_q(
         const char * __restrict__ x, const char * __restrict__ x_gate, const int * __restrict__ y, const int32_t * __restrict__ ids_dst,
@@ -1315,7 +1315,7 @@ static __global__ void mul_mat_q(
     __syncthreads();
 
     // The fused kernel needs the whole K range of a tile in one block, so it always uses tiling.
-    if constexpr (has_fusion || !ggml_cuda_mmq_get_stream_k(type, J, fallback, prec_src1)) {
+    if constexpr (has_fusion || !ggml_cuda_mmq_get_stream_k(type, J, fallback, prec_src1) || compact_down) {
         // The fused kernel writes the GLU of I/2 up rows and I/2 gate rows per tile.
         constexpr int I_dst = has_fusion ? I/2 : I;
 
@@ -1331,7 +1331,7 @@ static __global__ void mul_mat_q(
             zt = block_expert[m_block];
             jt = m_block - block_start[zt];
             wt = 0;
-        } else if (has_fusion && expert_bounds) {
+        } else if ((has_fusion || compact_down) && expert_bounds) {
             // floor(bound/J) + expert gives each expert enough tile slots using the existing
             // bounds. At most one slot per expert is empty, including experts with no tokens.
             const int tile = blockIdx.x;
@@ -1858,6 +1858,31 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const uint3 nsamples_y_fd      = init_fastdiv_values(args.nsamples_y);
     const uint3 channel_ratio_fd   = init_fastdiv_values(channel_ratio);
     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
+
+    if constexpr (type == GGML_TYPE_Q2_0 && J == 128 && !fallback && !has_fusion) {
+        static const bool enabled = [] {
+            const char * value = getenv("GGML_CUDA_MMQ_SM80_Q2_DOWN_COMPACT");
+            return value && value[0] == '1' && value[1] == '\0';
+        }();
+        if (enabled && cc == GGML_CUDA_CC_AMPERE && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_AMPERE &&
+                config.stream_k && args.expert_bounds && args.ids_dst && args.nsamples_y == 1 &&
+                args.ncols_x == 640 && args.nrows_x == 2560 && (args.nchannels_y == 512 || args.nchannels_y == 1024)) {
+            // Match the legacy launch only when Stream-K assigns a whole K range to each tile.
+            const int64_t legacy_tiles = int64_t(ntx)*nty*ntzw;
+            const int64_t legacy_waves = (legacy_tiles + nsm - 1)/nsm;
+            if (100*legacy_tiles/(nsm*legacy_waves) >= 90) {
+                const dim3 compact_grid(args.ncols_dst/J + args.nchannels_y, nty, 1);
+                CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, fallback, prec_src1, false, true>), nbytes_shared);
+                mul_mat_q<type, J, fallback, prec_src1, false, true><<<compact_grid, block_dims, nbytes_shared, stream>>>
+                    (args.x, nullptr, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr, args.y_scale, args.fusion.glu_op, args.fusion.glu_limit,
+                     blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+                     channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+                     sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+                     ntx_fd, nullptr, nullptr, 0, ref_origin_tile);
+                return;
+            }
+        }
+    }
 
     if (has_fusion || !config.stream_k) {
         GGML_ASSERT(nty <= MMQ_MAX_GRIDDIM_Y); // gridDim.y limit
