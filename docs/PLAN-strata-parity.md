@@ -1,5 +1,7 @@
 # Plano: paridade Strata ↔ beellama (offload de experts)
 
+Para retomar o trabalho a partir de 24/11/2026, veja o [handover de prefill, com execução e critérios de promoção](HANDOVER-strata-prefill-20261124.md).
+
 Para as receitas vigentes e as decisões de integração, consulte o [status de 22/11](agent-reports/strata-parity-status-20261122.md) e a última seção deste plano.
 O plano inicial foi escrito em `feat/strata-parity-moe-autocache`, com P0/P1 implementados.
 Referência lida: `github.com/Niko1221/Strata` (MIT) — `docs/HOW_IT_WORKS.md`,
