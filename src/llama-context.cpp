@@ -2,7 +2,6 @@
 #include "llama-cuda-graph-policy.h"
 
 #include "ggml.h"
-#include "ggml-alloc.h"
 #include "../ggml/src/ggml-prefill-reference.h"
 #include "llama-arch.h"
 #include "llama-batch.h"
@@ -2621,6 +2620,7 @@ std::vector<ggml_backend_t> layer_backends;
 }
 
 llama_context::~llama_context() {
+    finish_dflash2_prefill_capture();
     for (const auto & entry : wavefront_decisions) {
         LLAMA_LOG_INFO("RKVA wavefront summary: reason=%s parents=%llu\n", entry.first.c_str(),
                 (unsigned long long) entry.second);
@@ -2833,6 +2833,7 @@ void llama_context::sched_reserve() {
         return;
     }
 
+    invalidate_dflash2_prefill_capture();
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
 
     synchronize();
@@ -3471,33 +3472,32 @@ float * llama_context::get_embeddings_layer_inp(uint32_t lid) {
     if (capture.rows && !capture.host_ready[lid]) {
         const auto it = std::find(capture.layers.begin(), capture.layers.end(), int32_t(lid));
         if (it != capture.layers.end()) {
-            const size_t layer_bytes = model.hparams.n_embd*sizeof(float);
-            ggml_backend_tensor_get_2d_async(capture.features.backend, capture.features.tensor,
-                    embd_layer_inp[lid].data, size_t(it - capture.layers.begin())*layer_bytes,
-                    layer_bytes, capture.rows, capture.features.tensor->nb[1], layer_bytes);
-            ggml_backend_synchronize(capture.features.backend);
+            const auto * tap = capture.taps[it - capture.layers.begin()];
+            GGML_ASSERT(ggml_nbytes(tap) <= embd_layer_inp[lid].size*sizeof(float));
+            ggml_backend_tensor_get_async(capture.backend, tap, embd_layer_inp[lid].data, 0, ggml_nbytes(tap));
+            ggml_backend_synchronize(capture.backend);
             capture.host_ready[lid] = true;
         }
     }
     return embd_layer_inp[lid].data;
 }
 
-void llama_context::prepare_dflash2_prefill_capture(const llama_context & draft, const int32_t * layers, size_t n_layers, uint32_t rows) {
+bool llama_context::prepare_dflash2_prefill_capture(const llama_context & draft, const int32_t * layers, size_t n_layers, uint32_t rows) {
     auto & capture = dflash2_prefill_capture;
     capture.requested = 0;
-    const uint32_t capacity = std::min(cparams.n_ubatch, uint32_t(4096));
-    if (!layers || !n_layers || rows < 128 || rows > capacity || model.arch != LLM_ARCH_QWEN4EXP ||
+    if (!layers || !n_layers || rows < 128 || rows > cparams.n_ubatch || model.arch != LLM_ARCH_QWEN4EXP ||
             draft.model.arch != LLM_ARCH_DFLASH || cparams.dflash_split || draft.cparams.dflash_split ||
+            cparams.pipeline_parallel || draft.cparams.pipeline_parallel ||
             cparams.n_seq_max != 1 || draft.cparams.n_seq_max != 1 || model.n_devices() != 1 ||
             draft.model.n_devices() != 1 || backend_remote || draft.backend_remote ||
             n_layers*model.hparams.n_embd != size_t(draft.model.hparams.n_embd_inp_enc()) ||
             size_t(std::count(cparams.embeddings_layer_inp.begin(), cparams.embeddings_layer_inp.end(), true)) != n_layers) {
-        return;
+        return false;
     }
     for (size_t k = 0; k < n_layers; ++k) {
         if (layers[k] < 0 || size_t(layers[k]) >= cparams.embeddings_layer_inp.size() || !cparams.embeddings_layer_inp[layers[k]] ||
                 std::find(layers, layers + k, layers[k]) != layers + k) {
-            return;
+            return false;
         }
     }
     const ggml_backend_dev_t device = llama_model_get_device(&model, 0);
@@ -3505,78 +3505,75 @@ void llama_context::prepare_dflash2_prefill_capture(const llama_context & draft,
             std::none_of(draft.backends.begin(), draft.backends.end(), [&](const auto & backend) {
                 return ggml_backend_get_device(backend.get()) == device;
             })) {
-        return;
+        return false;
     }
-    if (capture.buf) {
-        if (capture.layers.size() == n_layers && std::equal(capture.layers.begin(), capture.layers.end(), layers)) {
-            capture.draft = &draft;
-            capture.requested = rows;
+    if (capture.backend) {
+        if (capture.draft != &draft || capture.layers.size() != n_layers ||
+                !std::equal(capture.layers.begin(), capture.layers.end(), layers)) {
+            return false;
         }
-        return;
+        capture.requested = rows;
+        return true;
     }
     const auto reg = ggml_backend_dev_backend_reg(device);
     if (!reg || std::strcmp(ggml_backend_reg_name(reg), "CUDA") != 0) {
-        return;
+        return false;
     }
     const auto backend = std::find_if(backends.begin(), backends.end(), [&](const auto & value) {
         return ggml_backend_get_device(value.get()) == device;
     });
     const auto copy_tap = reinterpret_cast<decltype(capture.copy_tap)>(
-            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_copy_dflash_tap_v1"));
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_copy_dflash_tap_v2"));
     if (backend == backends.end() || !copy_tap) {
-        return;
+        return false;
     }
-    ggml_context_ptr ctx(ggml_init({ggml_tensor_overhead(), nullptr, true}));
-    if (!ctx) {
-        return;
-    }
-    auto * tensor = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n_layers*model.hparams.n_embd, capacity);
-    const auto buft = ggml_backend_get_default_buffer_type(backend->get());
-    const size_t slab_bytes = ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
-    size_t free_bytes = 0;
-    size_t total_bytes = 0;
-    ggml_backend_dev_memory(device, &free_bytes, &total_bytes);
-    // Keep room for CUDA scratch growth after the prompt graph's initial reserve.
-    constexpr size_t prefill_reserve = size_t(512)*1024*1024;
-    if (!slab_bytes || free_bytes < prefill_reserve || slab_bytes > free_bytes - prefill_reserve) {
-        LLAMA_LOG_DEBUG("DFlash2 prefill device taps skipped: free=%zu slab=%zu reserve=%zu\n",
-                free_bytes, slab_bytes, prefill_reserve);
-        return;
-    }
-    ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
     ggml_backend_event_ptr ready(ggml_backend_event_new(device)), copied(ggml_backend_event_new(device));
-    if (!buf || !ready || !copied) {
-        return;
+    if (!ready || !copied) {
+        return false;
     }
-    capture.features = { backend->get(), tensor, ready.get(), copied.get() };
-    capture.ctx = std::move(ctx);
-    capture.buf = std::move(buf);
+    capture.backend = backend->get();
     capture.ready = std::move(ready);
     capture.copied = std::move(copied);
     capture.copy_tap = copy_tap;
     capture.draft = &draft;
     capture.layers.assign(layers, layers + n_layers);
     capture.host_ready.resize(cparams.embeddings_layer_inp.size());
+    capture.taps.reserve(n_layers);
     capture.requested = rows;
+    return true;
+}
+
+void llama_context::finish_dflash2_prefill_capture() {
+    auto & capture = dflash2_prefill_capture;
+    if (capture.copy_pending) {
+        // The draft stream may still be reading target graph storage.
+        ggml_backend_event_synchronize(capture.copied.get());
+        capture.copy_pending = false;
+    }
+    capture.requested = 0;
+    capture.leased = false;
+}
+
+void llama_context::invalidate_dflash2_prefill_capture() {
+    finish_dflash2_prefill_capture();
+    auto & capture = dflash2_prefill_capture;
+    capture.rows = 0;
+    capture.taps.clear();
 }
 
 bool llama_context::decode_dflash2_prefill_capture(
         llama_context & target, const llama_batch & batch, uint32_t first_row, int32_t & ret) {
     auto & capture = target.dflash2_prefill_capture;
-    if (capture.draft != this || first_row != capture.next_row || first_row >= capture.rows ||
+    if (!capture.leased || capture.draft != this || first_row != capture.next_row || first_row >= capture.rows ||
             batch.n_tokens <= 0 || uint32_t(batch.n_tokens) > capture.rows - first_row ||
             uint32_t(batch.n_tokens) > cparams.n_ubatch ||
-            batch.token || !batch.pos || model.arch != LLM_ARCH_DFLASH || cparams.dflash_split ||
-            capture.features.tensor->ne[0] != model.hparams.n_embd_inp_enc()) {
+            batch.token || !batch.pos || model.arch != LLM_ARCH_DFLASH || cparams.dflash_split) {
         return false;
     }
     llama_batch_ext input(this);
-    capture.features.first_row = first_row;
-    input.device_embd = &capture.features;
+    input.device_embd = { &target, first_row };
     llama_batch_compat::init(input, batch, model.hparams.n_embd_inp_enc());
     capture.next_row += uint32_t(batch.n_tokens);
-    LLAMA_LOG_DEBUG("DFlash2 prefill device taps: first_row=%u rows=%d bytes=%zu\n",
-            first_row, batch.n_tokens, size_t(batch.n_tokens)*capture.features.tensor->nb[1]);
     ret = decode(input);
     return true;
 }
@@ -4643,6 +4640,9 @@ static bool llama_prefill_reference_attention_supported(const ggml_tensor * t, u
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    if (dflash2_prefill_capture.rows) {
+        invalidate_dflash2_prefill_capture();
+    }
     static const bool legacy_profile_prep = [] {
         const char * value = std::getenv("LLAMA_GRAPH_PREP_PROFILE");
         return value && std::strcmp(value, "0") != 0;
@@ -4765,30 +4765,49 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         if (ubatch.device_embd) {
-            const auto & source = *ubatch.device_embd;
+            const auto & source = ubatch.device_embd;
+            auto & capture = source.target->dflash2_prefill_capture;
             const auto & idxs = ubatch.data->batch_idxs;
             GGML_ASSERT(!idxs.empty() && idxs.size() == ubatch.n_tokens);
             GGML_ASSERT(std::adjacent_find(idxs.begin(), idxs.end(), [](int a, int b) { return b != a + 1; }) == idxs.end());
+            GGML_ASSERT(idxs.front() >= 0 && source.first_row + idxs.back() < capture.rows);
+
             auto * dst = res->t_inp_dflash_features;
-            GGML_ASSERT(dst && dst->ne[0] == source.tensor->ne[0] && dst->ne[1] == ubatch.n_tokens);
-            GGML_ASSERT(idxs.front() >= 0 && source.first_row + idxs.back() < source.tensor->ne[1]);
-            auto src = *dst;
-            src.data = static_cast<char *>(source.tensor->data) + size_t(source.first_row + idxs.front())*source.tensor->nb[1];
-            src.buffer = source.tensor->buffer;
-            src.view_src = nullptr;
+            const size_t row_floats = source.target->model.hparams.n_embd;
+            const size_t layer_bytes = row_floats*sizeof(float);
+            GGML_ASSERT(dst && dst->type == GGML_TYPE_F32 && dst->buffer &&
+                    dst->ne[0] == int64_t(row_floats*capture.taps.size()) && dst->ne[1] == ubatch.n_tokens);
             const auto dst_backend = ggml_backend_sched_get_tensor_backend(sched.get(), dst);
-            GGML_ASSERT(dst_backend && ggml_backend_get_device(dst_backend) == ggml_backend_get_device(source.backend));
-            ggml_backend_event_record(source.ready, source.backend);
-            ggml_backend_event_wait(dst_backend, source.ready);
-            // The draft stream orders the copy after the previous graph's read of dst.
-            ggml_backend_tensor_copy_async(dst_backend, dst_backend, &src, dst);
-            ggml_backend_event_record(source.copied, dst_backend);
-            // A cross-backend graph input can be read by a synchronous copy on another stream.
-            if (ggml_backend_sched_get_n_splits(sched.get()) != 1 ||
-                    ggml_backend_sched_get_tensor_backend(sched.get(), res->get_embd()) != dst_backend) {
-                ggml_backend_event_synchronize(source.copied);
+            const auto first_row = source.first_row + idxs.front();
+
+            if (dst_backend && ggml_backend_get_device(dst_backend) == ggml_backend_get_device(capture.backend) &&
+                    ggml_is_contiguous(dst) && ggml_backend_buffer_get_type(dst->buffer) ==
+                    ggml_backend_get_default_buffer_type(capture.backend)) {
+                ggml_backend_event_wait(dst_backend, capture.ready.get());
+                for (size_t k = 0; k < capture.taps.size(); ++k) {
+                    capture.copy_tap(dst_backend, capture.taps[k], dst, first_row, k*layer_bytes);
+                }
+                ggml_backend_event_record(capture.copied.get(), dst_backend);
+                capture.copy_pending = true;
+                // A cross-backend graph input can be read by a synchronous copy on another stream.
+                if (ggml_backend_sched_get_n_splits(sched.get()) != 1 ||
+                        ggml_backend_sched_get_tensor_backend(sched.get(), res->get_embd()) != dst_backend) {
+                    ggml_backend_event_synchronize(capture.copied.get());
+                    capture.copy_pending = false;
+                }
+                LLAMA_LOG_DEBUG("DFlash2 prefill device taps: first_row=%u rows=%u bytes=%zu\n",
+                        first_row, ubatch.n_tokens, ggml_nbytes(dst));
             } else {
-                ggml_backend_event_wait(source.backend, source.copied);
+                // Preserve injection if the draft scheduler cannot place the input on the selected device.
+                std::vector<float> packed(size_t(dst->ne[0])*ubatch.n_tokens);
+                for (size_t k = 0; k < capture.layers.size(); ++k) {
+                    const float * layer = source.target->get_embeddings_layer_inp(capture.layers[k]);
+                    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                        std::memcpy(packed.data() + i*dst->ne[0] + k*row_floats,
+                                layer + (first_row + i)*row_floats, layer_bytes);
+                    }
+                }
+                ggml_backend_tensor_set(dst, packed.data(), 0, ggml_nbytes(dst));
             }
         }
         res->set_inputs(&ubatch);
@@ -4942,6 +4961,7 @@ static bool dflash2_split_block_fits(const llama_batch_ext & batch, uint32_t n_s
 }
 
 int llama_context::encode(const llama_batch_ext & batch_inp) {
+    invalidate_dflash2_prefill_capture();
     nextn_decode_id = 0;
     if (batch_inp.tokens.empty()) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
@@ -5232,8 +5252,7 @@ bool llama_remote_attn_backend_failed(const llama_context * ctx) {
 int llama_context::decode(const llama_batch_ext & batch_inp) {
     auto & capture = dflash2_prefill_capture;
     capture.active = capture.requested == batch_inp.tokens.size() ? capture.requested : 0;
-    capture.requested = 0;
-    capture.rows = 0;
+    invalidate_dflash2_prefill_capture();
     capture.next_row = 0;
     if (wavefront_poisoned) {
         LLAMA_LOG_ERROR("RKVA wavefront: refusing reuse of a failed tiled context\n");
@@ -6013,22 +6032,25 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 bool llama_context::extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens) {
     auto & capture = dflash2_prefill_capture;
     if (capture.active && capture.active == n_tokens && token_offset == 0) {
-        size_t layer = 0;
-        const size_t row_bytes = model.hparams.n_embd*sizeof(float);
+        const auto buft = ggml_backend_get_default_buffer_type(capture.backend);
         for (int32_t il : capture.layers) {
             auto * tap = res->get_layer_inp(il);
-            if (!tap || ggml_nbytes(tap) != n_tokens*row_bytes ||
-                    ggml_backend_sched_get_tensor_backend(sched.get(), tap) != capture.features.backend ||
-                    !capture.copy_tap(capture.features.backend, tap, capture.features.tensor, layer*row_bytes)) {
+            if (!tap || !(tap->flags & GGML_TENSOR_FLAG_OUTPUT) || tap->type != GGML_TYPE_F32 || !ggml_is_contiguous(tap) ||
+                    tap->ne[0] != model.hparams.n_embd || tap->ne[1] != int64_t(n_tokens) || tap->ne[2] != 1 || tap->ne[3] != 1 ||
+                    !tap->buffer || ggml_backend_buffer_get_type(tap->buffer) != buft ||
+                    ggml_backend_sched_get_tensor_backend(sched.get(), tap) != capture.backend) {
                 break;
             }
-            ++layer;
+            capture.taps.push_back(tap);
         }
-        if (layer == capture.layers.size()) {
+        if (capture.taps.size() == capture.layers.size()) {
+            ggml_backend_event_record(capture.ready.get(), capture.backend);
             capture.rows = n_tokens;
+            capture.leased = true;
             std::fill(capture.host_ready.begin(), capture.host_ready.end(), false);
             return true;
         }
+        capture.taps.clear();
     }
     bool extracted = false;
     for (uint32_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
@@ -6295,6 +6317,9 @@ static void ubatch_prepare_reserve(
 
 ggml_cgraph * llama_context::graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
+    if (dflash2_prefill_capture.rows) {
+        invalidate_dflash2_prefill_capture();
+    }
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
     GGML_ASSERT(n_outputs >= 1);
 
@@ -6589,7 +6614,7 @@ llm_graph_cb llama_context::graph_get_cb() const {
 
         // The scheduler otherwise places graph inputs on CPU.
         if (ubatch.device_embd && strcmp(name, "inp_target_features") == 0) {
-            const auto device = ggml_backend_get_device(ubatch.device_embd->backend);
+            const auto device = ggml_backend_get_device(ubatch.device_embd.target->dflash2_prefill_capture.backend);
             for (const auto & backend : backends) {
                 if (ggml_backend_get_device(backend.get()) == device) {
                     ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
@@ -9843,9 +9868,13 @@ float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
     return ctx->get_embeddings_layer_inp(lid);
 }
 
-void llama_prepare_dflash2_prefill_capture(
+bool llama_prepare_dflash2_prefill_capture(
         llama_context * target, const llama_context * draft, const int32_t * layers, size_t n_layers, uint32_t rows) {
-    target->prepare_dflash2_prefill_capture(*draft, layers, n_layers, rows);
+    return target->prepare_dflash2_prefill_capture(*draft, layers, n_layers, rows);
+}
+
+void llama_finish_dflash2_prefill_capture(llama_context * target) {
+    target->finish_dflash2_prefill_capture();
 }
 
 bool llama_decode_dflash2_prefill_capture(

@@ -539,3 +539,9 @@ A receita combinada em ub3072 chegou a **2.487,18 t/s** em pp28k
 com D2D, down K-outer e radix de um tile. As duas flags de kernel
 juntas deram +6,20% sobre D2D sozinho, com o mesmo hash e pico de
 40.022 MiB. [Protocolo e flags](../advisor-plans/004-strata-prefill-baseline.md#receita-combinada-de-prefill-em-3072)
+
+A versão D2D que lê os taps do grafo alvo permitiu `-b 4096 -ub 4096`
+com o pico de 40.368 MiB. Com D2D, K-outer e radix ativos, o prefill
+28k ficou em **2.597,40 t/s**. A comparação no lote fixo manteve o
+mesmo hash nos braços host, D2D e D2D com as duas flags de kernel.
+[Validação em ub4096](../advisor-plans/004-strata-prefill-baseline.md#d2d-com-taps-do-grafo-alvo-em-ub4096)

@@ -160,7 +160,9 @@ struct llama_context {
 
 
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
-    void prepare_dflash2_prefill_capture(const llama_context & draft, const int32_t * layers, size_t n_layers, uint32_t rows);
+    bool prepare_dflash2_prefill_capture(const llama_context & draft, const int32_t * layers, size_t n_layers, uint32_t rows);
+    void finish_dflash2_prefill_capture();
+    void invalidate_dflash2_prefill_capture();
     bool decode_dflash2_prefill_capture(llama_context & target, const llama_batch & batch, uint32_t first_row, int32_t & ret);
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
@@ -465,15 +467,15 @@ private:
     std::vector<buffer_view<float>> embd_layer_inp;
     std::vector<int32_t> embd_batch_idxs; // extracted index -> original batch index
 
-    // This out-of-graph slab survives target scheduler resets and has a bounded row count.
+    // Taps belong to the target graph and remain available until it is overwritten.
     struct {
-        using copy_tap_fn = bool (*)(ggml_backend_t, const ggml_tensor *, ggml_tensor *, size_t);
+        using copy_tap_fn = void (*)(ggml_backend_t, const ggml_tensor *, ggml_tensor *, size_t, size_t);
         copy_tap_fn copy_tap = nullptr;
-        ggml_context_ptr ctx;
-        ggml_backend_buffer_ptr buf;
+        ggml_backend_t backend = nullptr;
         ggml_backend_event_ptr ready;
         ggml_backend_event_ptr copied;
-        llama_batch_device_embd features;
+        bool copy_pending = false;
+        std::vector<ggml_tensor *> taps;
         const llama_context * draft = nullptr;
         std::vector<int32_t> layers;
         std::vector<bool> host_ready;
@@ -481,6 +483,7 @@ private:
         uint32_t active = 0;
         uint32_t rows = 0;
         uint32_t next_row = 0;
+        bool leased = false;
     } dflash2_prefill_capture;
 
     // concatenated multi-layer hidden states (2-dimensional array:

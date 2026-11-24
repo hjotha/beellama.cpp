@@ -109,7 +109,7 @@ int main(int argc, char ** argv) {
 
     llama_memory_clear(llama_get_memory(ctx_tgt), true);
     llama_memory_clear(llama_get_memory(ctx_dft), true);
-    llama_prepare_dflash2_prefill_capture(ctx_tgt, ctx_dft, layers, n_layers, rows);
+    GGML_ASSERT(llama_prepare_dflash2_prefill_capture(ctx_tgt, ctx_dft, layers, n_layers, rows));
     GGML_ASSERT(llama_decode(ctx_tgt, tb) == 0);
     // A successful device injection must ignore host placeholder bytes.
     std::fill_n(db.embd, draft_rows*width, 0.0f);
@@ -121,6 +121,7 @@ int main(int argc, char ** argv) {
         GGML_ASSERT(llama_decode_dflash2_prefill_capture(ctx_dft, ctx_tgt, db, start, &rc) && rc == 0);
     }
     GGML_ASSERT(!llama_decode_dflash2_prefill_capture(ctx_dft, ctx_tgt, db, 0, &rc));
+    llama_finish_dflash2_prefill_capture(ctx_tgt);
     for (int k = 0; k < n_layers; ++k) {
         const float * tap = llama_get_embeddings_layer_inp(ctx_tgt, layers[k]);
         GGML_ASSERT(tap);

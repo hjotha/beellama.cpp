@@ -1120,3 +1120,35 @@ prompt de entrada. A igualdade de hashes acima refere-se aos
 dois braços do BeeLlama.
 `/tmp/opencode/strata-prefill-parity/approved-combo-results.tgz`
 contém o JSON e os logs.
+
+### D2D com taps do grafo alvo em ub4096
+
+O DFlash2 agora usa os taps do grafo alvo durante a injeção
+do draft. Os eventos CUDA mantêm a ordem entre produção,
+cópia e reutilização do grafo. A fila do servidor conserva
+os yields. Depois de encerrar a transferência, uma leitura
+host ainda pode materializar os taps do último grafo válido.
+O caminho misto sincroniza a cópia antes de um consumidor
+em outro backend.
+
+Na A100-40G, usamos a receita anterior, com `-b 4096 -ub 4096`
+e draft ub128. Em pp28k, cada braço teve três amostras após dois
+warmups. Os nove hashes coincidiram (`fec827d63cde`) e o pico
+foi **40.368 MiB** nos três braços.
+
+| Braço | Prefill 28k | Faixa de prefill |
+|---|---:|---:|
+| Host | 2.107,68 t/s | 2.105,07–2.116,06 |
+| D2D com taps do grafo | 2.444,94 t/s | 2.443,86–2.445,33 |
+| D2D com K-outer e radix | **2.597,40 t/s** | 2.596,68–2.599,76 |
+
+O ganho isolado do D2D foi **16,00%**. O fixture comparou o
+estado KV do drafter com a rota host em CUDA e no modo CPU/CUDA.
+Ele verifica também a leitura dos dois taps depois do término
+da transferência, com os buffers host antigos preenchidos
+com zeros para detectar dados obsoletos. O trace do modelo
+completo registrou 223 injeções do drafter pelo caminho device.
+O comparativo da Strata na mesma A100 permanece em 4.932,87 t/s.
+A receita mais rápida do BeeLlama chega a 52,7% dessa referência.
+Os dados estão em
+`/tmp/opencode/strata-prefill-parity/d2d-reviewed-results.tgz`.
