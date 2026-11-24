@@ -362,6 +362,20 @@ static __global__ void topk_unmap(const int * cand_idx, const int * order, int *
     }
 }
 
+#if defined(GGML_CUDA_USE_CUB) && !defined(GGML_USE_MUSA)
+static bool top_k_tile_use_radix(int ntiles) {
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (ntiles > 1) {
+        return cc == GGML_CUDA_CC_AMPERE;
+    }
+    static const bool one_tile_enabled = [] {
+        const char * value = getenv("GGML_CUDA_TOP_K_RADIX_ONE_TILE");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    return one_tile_enabled && (cc == GGML_CUDA_CC_AMPERE || cc == GGML_CUDA_CC_ADA_LOVELACE);
+}
+#endif
+
 static bool ggml_cuda_top_k_tiled(ggml_cuda_pool & pool, const float * src, int * dst,
                                   const int ncols, const int nrows, const int k,
                                   cudaStream_t stream) {
@@ -378,8 +392,7 @@ static bool ggml_cuda_top_k_tiled(ggml_cuda_pool & pool, const float * src, int 
     ggml_cuda_pool_alloc<int>   order   (pool, (size_t) nrows * ncand);
 
 #if defined(GGML_CUDA_USE_CUB) && !defined(GGML_USE_MUSA)
-    if (tile == TOPK_TILE && ncols > TOPK_TILE && k == 512 &&
-            ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_AMPERE) {
+    if (tile == TOPK_TILE && k == 512 && top_k_tile_use_radix(ntiles)) {
         topk_tile<TOPK_TILE, TOPK_BLOCK, true><<<nrows * ntiles, TOPK_BLOCK, 0, stream>>>(
                 src, cand_val.get(), cand_idx.get(), ncols, ntiles, k);
     } else
