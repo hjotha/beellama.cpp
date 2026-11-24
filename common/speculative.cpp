@@ -6751,25 +6751,25 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
     }
 }
 
-void common_speculative_prepare_dflash2_prefill(common_speculative * spec, const common_batch & batch) {
+bool common_speculative_prepare_dflash2_prefill(common_speculative * spec, const common_batch & batch) {
     static const bool enabled = [] {
         const char * value = std::getenv("LLAMA_DFLASH2_PREFILL_D2D");
         return value && value[0] == '1' && value[1] == '\0';
     }();
     if (!enabled || !spec || spec->shadow || spec->impls.size() != 1 || batch.size() < 128 ||
             spec->impls[0]->type != COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || !batch.has_token() || batch.has_embd()) {
-        return;
+        return false;
     }
     auto * impl = static_cast<common_speculative_impl_draft_dflash *>(spec->impls[0].get());
     if (!impl->is_dflash2 || impl->local_split || impl->is_lilicorr || impl->remote || impl->n_seq != 1) {
-        return;
+        return false;
     }
     for (const auto & entry : batch.tokens) {
         if (entry.seq_id != 0 || !entry.seq_ids_extra.empty()) {
-            return;
+            return false;
         }
     }
-    llama_prepare_dflash2_prefill_capture(impl->params.ctx_tgt, impl->params.ctx_dft, impl->target_layer_ids,
+    return llama_prepare_dflash2_prefill_capture(impl->params.ctx_tgt, impl->params.ctx_dft, impl->target_layer_ids,
             impl->target_layer_ids_n, batch.size());
 }
 

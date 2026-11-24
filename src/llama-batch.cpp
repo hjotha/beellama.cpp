@@ -841,7 +841,7 @@ void llama_batch_allocr::clear() {
     n_outputs = 0;
 
     batch = {};
-    device_embd = nullptr;
+    device_embd = {};
 
     token_vec   .clear();
     embd_vec    .clear();
@@ -1201,7 +1201,7 @@ void llama_batch_ext::clear() {
     embd  .clear();
     state .clear();
     n_embd = 0;
-    device_embd = nullptr;
+    device_embd = {};
 }
 
 int32_t llama_batch_ext::add_token(llama_seq_id seq_id) {

@@ -13424,14 +13424,28 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
             }
         }
 
-        // yield to the queue, so we can still handle metrics tasks while decoding
-        // note: the sync is done here too, so that the wait is also covered by the yield
+        // The normal decode yields to the queue for metrics while running and synchronizing.
         int ret = 0;
         // timing uses the sync that is already performed right below - no extra sync is added
         const bool    prof_mtp = getenv("GGML_MTP_PROF") != nullptr;
         const int64_t prof_t0  = prof_mtp ? ggml_time_us() : 0;
         const int64_t trace_decode_start = dflash_trace_tick_us();
         maybe_start_rkva_ahead();
+        const bool device_prefill = slots.size() == 1 && !slots[0].bootstrap_pending &&
+                (slots[0].state == SLOT_STATE_PROCESSING_PROMPT || slots[0].state == SLOT_STATE_DONE_PROMPT) &&
+                common_speculative_prepare_dflash2_prefill(spec.get(), batch.view);
+        struct dflash2_capture_guard {
+            llama_context * target;
+            ~dflash2_capture_guard() { finish(); }
+
+            void finish() {
+                if (target) {
+                    llama_finish_dflash2_prefill_capture(target);
+                    target = nullptr;
+                }
+            }
+        } capture_guard { device_prefill ? ctx_tgt : nullptr };
+
         queue_tasks.yield_to_queue([&]() {
             if (ggml_remote_attn_trace_enabled()) {
                 uint64_t request_id = 0;
@@ -13446,10 +13460,6 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
             ggml_remote_attn_trace_scope rkva_decode("server_decode");
             rkva_decode.event.flags = 0x40000000u;
             rkva_decode.event.nq = uint32_t(batch.view.size());
-            if (slots.size() == 1 && !slots[0].bootstrap_pending &&
-                    (slots[0].state == SLOT_STATE_PROCESSING_PROMPT || slots[0].state == SLOT_STATE_DONE_PROMPT)) {
-                common_speculative_prepare_dflash2_prefill(spec.get(), batch.view);
-            }
             const int64_t trace_compute_start = dflash_trace_tick_us();
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
             const int64_t trace_compute_done = dflash_trace_tick_us();
@@ -13627,6 +13637,7 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
             queue_tasks.yield_to_queue([&]() {
                 ok = common_speculative_process(spec.get(), batch.view);
             });
+            capture_guard.finish();
             dflash_trace("sync_process", trace_process_start, dflash_trace_tick_us(), batch.view.size());
             if (getenv("GGML_MTP_PROF")) {
                 fprintf(stderr, "MTPPHASE phase=sync us=%lld n_tokens=%d\n",
