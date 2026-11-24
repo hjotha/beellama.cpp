@@ -26,4 +26,4 @@ Escopo independente do plano 001. Ordem interna: profile e A/B controlado, regre
 
 | Plano | Prioridade | Estado | Dependências |
 |---|---|---|---|
-| [004 — Baseline Strata e otimizações do Flash-Next](004-strata-prefill-baseline.md) | P1 | Top-k radix com +11,87% no decode pós-28k e hashes iguais na A100-40G | Atribuição de custo das projeções densas no verificador |
+| [004 — Baseline Strata e otimizações do Flash-Next](004-strata-prefill-baseline.md) | P1 | Radix de dois tiles validado na A100 e radix de um tile validado em microbenchmark na 4070 | A/B fim a fim de um tile na A100 e atribuição das projeções densas |

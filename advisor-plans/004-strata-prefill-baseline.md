@@ -842,3 +842,28 @@ com hash igual. A diferença de decode caiu para 1,22×. O build
 da rodada recompilou seletivamente as unidades CUDA na .57.
 Medianas e amostras em
 `/tmp/opencode/dflash-paired-24/verify-topk-summary.json`.
+
+### Top-k radix de um tile
+
+`GGML_CUDA_TOP_K_RADIX_ONE_TILE=1` estende o radix CUDA para
+512 índices em linhas de 1.025 a 4.096 scores, com CUB e SM80
+ou SM89. A flag fica desligada por padrão. A seleção radix
+de dois tiles no SM80 continua automática.
+
+Na RTX 4070, as rodadas desligado/ligado/ligado/desligado usaram
+o mesmo binário SM89. Os índices foram idênticos byte a byte
+nas 16 geometrias, incluindo empates, infinitos e padding. Os
+tempos abaixo medem a operação GGML com seis queries e 1.157
+scores por linha, incluindo submissão e sincronização.
+
+| Execução | Desligada | Ligada | Razão |
+|---|---:|---:|---:|
+| Direta | 285,507 µs | 37,861 µs | 7,54× |
+| CUDA Graphs | 289,200 µs | 36,922 µs | 7,83× |
+
+O build SM80 foi compilado na .57. O A/B fim a fim do Flash-Next
+na A100 está pendente. Para medir, usar o mesmo binário com flag
+`0` e `1`, a grade compacta, DFlash2 com cinco propostas,
+`p_min=0` e `-b 2048 -ub 1024`. Registrar 4k e 28k, hashes
+dos tokens, faixas de throughput e pico de VRAM. As amostras da
+4070 estão em `/tmp/opencode/topk-one-4070/shipping-summary.json`.
