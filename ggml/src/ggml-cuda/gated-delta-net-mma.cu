@@ -330,10 +330,14 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
                 }
             }
         }
-        // Snapshot this tile without changing the state used for the final output.
-        if (a.reference_snapshots > 1 && t0 + C >= a.n_tokens) {
+        // The retained positions can straddle the last two tiles.
+        if (a.reference_snapshots > 1 && t0 + valid > a.n_tokens - a.reference_snapshots) {
             for (int back = 1; back < a.reference_snapshots; ++back) {
-                const int snapshot_valid = valid - back;
+                const int64_t snapshot_pos = a.n_tokens - back - t0;
+                if (snapshot_pos <= 0 || snapshot_pos > valid) {
+                    continue;
+                }
+                const int snapshot_valid = int(snapshot_pos);
                 for (int i = tid; i < C * V; i += 256) {
                     const int t = i / V, v = i % V, index = s.scratch.solved.index(t, v);
                     const float x = __bfloat162float(s.scratch.solved.hi[index]) + __bfloat162float(s.scratch.solved.lo[index]);
