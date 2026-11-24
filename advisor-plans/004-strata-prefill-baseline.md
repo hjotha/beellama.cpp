@@ -1278,3 +1278,53 @@ NMSE entre saídas variou de 7,87e-6 a 8,24e-6. O teste mantém os
 pesos residentes e exclui carregamento e geração de tokens.
 `/tmp/opencode/strata-native-vs-bee4070/fused-combine-0.log` contém
 a geometria e os tempos alternados dos dois engines.
+
+### Fusão dos quatro operadores MoE com os pesos Q2_0 do GGUF
+
+Na RTX 4070, o protótipo leu diretamente os três tensores da camada 0
+e aplicou o arredondamento das ativações e a ordem de acumulação do
+BeeLlama. Com 4.096 tokens, dez experts por token, lotes residentes de
+128 experts e as mesmas ativações sintéticas e rotas reais do ensaio
+acima, foram sete chamadas alternadas por rota. Os tempos incluem a
+redução ponderada até um vetor FP32 de 2.560 elementos por token.
+
+| Rota capturada | BeeLlama, mediana (ms) | Kernel com os três tensores originais (ms) |
+|---|---:|---:|
+| 1 | 17,20 | 9,13 |
+| 2 | 16,14 | 8,76 |
+| 6 | 16,17 | 9,07 |
+
+Cada rota produziu zero diferenças de bits entre os engines nos
+104.857.600 valores intermediários por par e nos 10.485.760 valores
+após a redução. O benchmark usa os pesos reais, incluindo 707.788.800
+bytes de experts. A variante com três ponteiros elimina a necessidade
+de duplicar esses pesos em um buffer intercalado. Os logs são
+`/tmp/opencode/strata-native-beemath4070/gpu-result.log` e
+`gpu-combine-result.log` no mesmo diretório.
+
+O teste no servidor usa as quatro camadas, o prompt e a configuração
+PLE combinada da seção anterior. Ambos os braços usam
+`GGML_CUDA_DISABLE_GRAPHS=1`; a única troca é
+`GGML_CUDA_STRATA_RAW_Q2=0/1`. O kernel escreve na posição original
+de cada par token/expert para que o grafo execute a redução existente.
+O log confirma ativação nas duas instâncias do candidato. Todos os
+pedidos retornaram 56553. O comparador teacher-forced obteve o
+mesmo SHA-256 dos 64 vetores finais com o kernel ligado e desligado,
+`c2e6ba6657291dc03742d010bade68b5da51904498683726852f18c2d77c49d3`.
+A primeira rodada teve controles entre 1.201 e 12.954 t/s com mmap
+em disco USB. Essa dispersão impede usar sua mediana para atribuir ganho.
+Os tempos individuais e os logs estão em
+`/tmp/opencode/strata-prefill-parity/slice4-native/1795529480/`.
+
+O segundo A/B manteve em RAM as 1.204 páginas da PLE e as 65 páginas
+dos embeddings acessadas pelo prompt. A ordem foi controle, candidato,
+candidato, controle, com dois warmups e três pedidos medidos por
+processo. Os seis resultados do candidato ficaram entre 13.818 e
+13.844 t/s; os controles variaram de 1.916 a 12.584 t/s. Mesmo o menor
+resultado do candidato superou o maior controle nas duas rodadas,
+mas a dispersão do controle persiste. Comparando o candidato à
+referência local Strata de 29.278,97 t/s, o BeeLlama atinge cerca
+de 47% do prefill nesse recorte. A A100 ainda precisa qualificar
+a integração no modelo inteiro, incluindo o custo de desativar os
+CUDA Graphs. A segunda rodada está em
+`/tmp/opencode/strata-prefill-parity/slice4-native/1795529754/`.
