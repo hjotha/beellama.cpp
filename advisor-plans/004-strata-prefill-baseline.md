@@ -976,3 +976,36 @@ de corretude, e a fusão no grafo e a medição com o caminho compacto
 no SM80 continuam pendentes. Fonte e resultado em
 `/tmp/opencode/mmq-glu-down-mma/` e
 `/tmp/opencode/qwen4exp-no-output-4070/window-mma.log`.
+
+### Receita DFlash2 n-max 5 depois da redução de workspace
+
+Na mesma A100-40G, com o patch de saída e a receita acima, alteramos
+a profundidade para cinco. Cada braço teve dois warmups de um token
+e três amostras por caso. O radix de um tile e o protótipo HC 16
+linhas foram medidos separadamente em ub1024, com o mesmo binário.
+
+| Braço | Prefill 28k | Decode pós-4k | Decode pós-28k | Pico de VRAM |
+|---|---:|---:|---:|---:|
+| ub1024, flags de kernel desligadas | 1.653,36 t/s | 92,74 t/s | 91,84 t/s | 38.882 MiB |
+| ub1024, radix de um tile | 1.693,21 t/s | 106,48 t/s | 92,77 t/s | 38.882 MiB |
+| ub1024, HC 16 linhas | 1.646,91 t/s | 95,28 t/s | 93,86 t/s | 38.882 MiB |
+| ub2048, flags de kernel desligadas | 1.970,72 t/s | 98,38 t/s | 86,61 t/s | 39.378 MiB |
+
+No teste exclusivo de decode pós-4k, dois warmups completos de 64
+tokens antecederam as três amostras de cada braço. O radix deu
+**114,83 t/s** (114,12–115,29) contra **99,48 t/s** (98,61–99,54),
+ganho de **15,43%**, com pico idêntico de 38.912 MiB e hash
+`aa09c78f0e31`. Para decode, a receita medida usa `-ub 1024`,
+DFlash2 n-max 5 e `GGML_CUDA_TOP_K_RADIX_ONE_TILE=1`. A flag
+continua opt-in. O HC 16 linhas ganhou 2,74% no pós-4k e 2,20%
+no pós-28k. Ficou abaixo do piso de 3% e foi arquivado fora do main.
+
+Para prefill com DFlash2, ub2048 e n-max 5 entregaram 1.947,02–1.971,44
+t/s em 28k. O hash em 28k foi estável nesse lote (`de4e4381cd19`).
+Em ub1024, todos os braços preservaram o hash da Strata em 4k e
+28k. A Strata pareada anterior mediu 4.943,72 / 109,70 t/s em 28k
+(prefill/decode). Isso corresponde a 2,51× o prefill da receita
+ub2048 do BeeLlama e 1,18× o decode da receita radix ub1024. No
+prefill com hash igual ao da Strata, a diferença foi 2,92×.
+As medições de kernel estão em
+`/tmp/opencode/qwen4exp-no-output-sm80/kernel-results.tgz`.

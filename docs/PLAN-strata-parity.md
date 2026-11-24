@@ -513,3 +513,11 @@ completou ub2048 em **1.967,15 t/s** no pp28k e pico de
 Para priorizar o decode com o drafter pareado, a configuração
 ub1024 manteve uma mediana maior (87,12 contra 79,09 t/s pós-28k).
 [Protocolo e validação](../advisor-plans/004-strata-prefill-baseline.md#projeção-de-saída-em-microlotes-de-prefill-sem-logits)
+
+Com o drafter pareado, n-max 5 foi a melhor profundidade desta
+rodada. Para prefill com DFlash2, ub2048 deu **1.970,72 t/s** em 28k.
+Para priorizar decode e preservar o hash da Strata, use ub1024 e
+`GGML_CUDA_TOP_K_RADIX_ONE_TILE=1`. Na A100-40G, essa combinação
+mediu **114,83 t/s** pós-4k com decode aquecido e **92,77 t/s**
+pós-28k na rodada longa.
+[Comparação das receitas](../advisor-plans/004-strata-prefill-baseline.md#receita-dflash2-n-max-5-depois-da-redução-de-workspace)
