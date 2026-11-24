@@ -1521,3 +1521,35 @@ Nenhuma das variantes atingiu o critério de 3%.
 Amostras em `slice4-native/hc-1795533315/` e
 `slice4-native/qsa16-1795533718/` sob
 `/tmp/opencode/strata-prefill-parity/`.
+
+#### Conjuntos QSA e diagnóstico de precisão das projeções densas
+
+Capturamos a máscara efetiva das sete chamadas de atenção do BeeLlama
+e os índices usados pela última chamada de prefill da Strata. No Bee,
+a última chamada tem 3.971 queries, com média de 2.049,5 células
+selecionadas por query. A união de oito queries consecutivas contém
+5.946,0 células em média. Na Strata, o prefill exclui o último token,
+processado por decode. Suas 3.970 queries conservaram 2.051 células
+cada e a união de oito teve média de 5.941,9. A similaridade de
+Jaccard entre queries adjacentes foi aproximadamente 0,520 nos dois.
+As medidas são independentes por engine: a máscara causal e o espaço
+dos índices diferem. No Bee, nenhuma união excedeu sua capacidade.
+
+O caminho esparso atual usa grupos de oito queries. Nas últimas
+três chamadas, 38,3%, 36,2% e 34,4% das posições query×célula
+modeladas continham uma contribuição válida. O custo de uma nova
+geometria exige medida de kernel: área preenchida por máscara não
+equivale a tempo de execução. O dump diagnóstico reproduziu o hash
+teacher-forced do controle. [Código e protocolo do estudo](#cobertura-da-fusão-roteada-e-seleção-em-dois-tiles-na-rtx-4070)
+
+Na mesma janela verificamos a troca experimental de MMQ por cuBLAS
+FP16 nas projeções densas elegíveis. Ativaram-se 25 tensores de pesos.
+Em 64 posições e todo o vocabulário (248.320 logits por posição), o
+controle repetido coincidiu byte a byte. Com FP16, o argmax coincidiu
+em **57/64** posições, a NLL média do alvo subiu de 13,05386 para
+13,06170 e a KL média do controle para o candidato foi 0,00036118.
+O ensaio local confirma a mudança numérica da rota que ganhou cerca
+de 6% na A100; o recorte de quatro camadas não qualifica a qualidade
+do modelo completo. A rota segue experimental. Dados brutos e os
+arquivos por braço em `slice4-native/selection-1795534159/` sob
+`/tmp/opencode/strata-prefill-parity/`.
