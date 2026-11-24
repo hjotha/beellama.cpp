@@ -1316,8 +1316,12 @@ em disco USB. Essa dispersão impede usar sua mediana para atribuir ganho.
 Os tempos individuais e os logs estão em
 `/tmp/opencode/strata-prefill-parity/slice4-native/1795529480/`.
 
-O segundo A/B manteve em RAM as 1.204 páginas da PLE e as 65 páginas
-dos embeddings acessadas pelo prompt. A ordem foi controle, candidato,
+O segundo A/B fez uma leitura antecipada das 1.204 páginas da PLE e
+das 65 páginas dos embeddings acessadas pelo prompt. O auxiliar usou
+um mapeamento privado gravável para `mlock`. Uma inspeção posterior
+de `/proc/<pid>/smaps` confirmou que as páginas bloqueadas eram
+cópias anônimas. A retenção das páginas compartilhadas pelo servidor
+durante essa rodada não foi demonstrada. A ordem foi controle, candidato,
 candidato, controle, com dois warmups e três pedidos medidos por
 processo. Os seis resultados do candidato ficaram entre 13.818 e
 13.844 t/s; os controles variaram de 1.916 a 12.584 t/s. Mesmo o menor
