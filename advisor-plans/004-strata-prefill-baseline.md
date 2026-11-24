@@ -1231,3 +1231,50 @@ das colunas MMA arredondadas na camada 0. O lote final expôs apenas
 uma linha do roteador porque essa é a última camada do recorte.
 A validação fim a fim no SM80 continua pendente. Amostras e traces
 em `/tmp/opencode/strata-prefill-parity/ragged-4070/`.
+
+### Flash-Next com quatro camadas na RTX 4070
+
+O recorte preserva as camadas 0–3 do GGUF Q2_0, incluindo a primeira
+PLE, a primeira QSA e os 2.048 experts. Ambos os engines carregaram os
+mesmos dois shards e a tabela PLE de 26,82 GiB por mmap. A Strata foi
+compilada para essa geometria a partir de `a34979fc9`, sem converter
+os pesos. O manifesto, as formas e os hashes dos tensores estão em
+`/media/hjotha/GAMES/flash-next-q2-layers0-3-20261124/manifest.json`.
+
+Foram 28.547 IDs de entrada, contexto 32.768, uma sequência, um token
+greedy de saída, sem draft ou reuso de prefixo. Os dois motores usaram
+a RTX 4070, KV de 8 bits, chunks de 4.096 e dois warmups de prompt
+inteiro por processo. A Strata manteve todos os experts na GPU e
+reportou zero transferências de experts durante as amostras. Todos
+os braços produziram o token 56553.
+
+| Engine e variante | Prefill pp28k, mediana (t/s) |
+|---|---:|
+| BeeLlama, controle | 11.884,45 |
+| BeeLlama, upload das linhas IQ4_NL e dequantização CUDA | 12.717,67 |
+| BeeLlama, uma transposição da convolução PLE | 12.176,43 |
+| BeeLlama, as duas variantes PLE | 13.026,38 |
+| Strata, expert cache residente | 29.278,97 |
+
+A amostra do controle reúne três repetições antes e três depois dos
+candidatos. Cada outro braço tem três repetições. O ganho combinado
+foi 9,61% no recorte. Além do token greedy, os 64 vetores de logits
+completos no final do mesmo prompt foram idênticos entre controle e
+PLE combinado (SHA-256 do arquivo `c2e6ba6657291dc03742d010bade68b5da51904498683726852f18c2d77c49d3`).
+Uma das quatro camadas usa PLE; no modelo completo é uma entre 48.
+A relação local de 2,25× entre Strata e o melhor braço BeeLlama
+serve para diagnóstico. A qualificação de throughput requer o modelo
+completo na A100. Scripts, comandos e amostras em
+`/tmp/opencode/strata-prefill-parity/slice4/`.
+
+No microbenchmark MoE independente, os engines receberam os mesmos
+pesos da camada 0, os IDs top-10 capturados no pp28k e ativações e
+pesos de roteamento sintéticos fixos. O escopo inclui agrupar as
+rotas, gate/up, SwiGLU, down e combinar o resultado em FP32 por
+token. Nas três rotas de 4.096 tokens, as medianas de nove chamadas
+foram **17,24 / 16,19 / 16,23 ms** no BeeLlama com GLU e SHARED_Q8 e
+**9,05 / 8,66 / 8,96 ms** nas entradas nativas da Strata. O
+NMSE entre saídas variou de 7,87e-6 a 8,24e-6. O teste mantém os
+pesos residentes e exclui carregamento e geração de tokens.
+`/tmp/opencode/strata-native-vs-bee4070/fused-combine-0.log` contém
+a geometria e os tempos alternados dos dois engines.
