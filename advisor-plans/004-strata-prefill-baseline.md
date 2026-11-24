@@ -1093,3 +1093,30 @@ e o drafter pareado. O prefill do BeeLlama a ub3072 com D2D
 atingiu 47,5% desse throughput. O ganho do D2D usa hashes iguais
 entre seus próprios braços. Dados brutos e capturas em
 `/tmp/opencode/strata-prefill-parity/`.
+
+### Receita combinada de prefill em 3.072
+
+Com o D2D ligado em ambos os braços, adicionar
+`GGML_CUDA_MMQ_SM80_Q2_DOWN_K_OUTER=1` e
+`GGML_CUDA_TOP_K_RADIX_ONE_TILE=1` levou o pp28k de **2.341,91
+para 2.487,18 t/s (+6,20%)**. As faixas de três amostras foram
+2.341,63–2.348,17 e 2.485,82–2.492,36 t/s. Os seis hashes coincidiram
+com `aa09c78f0e31`, e os dois braços tiveram pico de **40.022 MiB**.
+A mediana de decode pós-28k da receita combinada foi 89,45 t/s.
+
+A receita usa a A100-SXM4-40GB, pesos Flash-Next Q2_0 e o drafter
+pareado, `-b 3072 -ub 3072 -c 32768 -ncmoe 2 --moe-cache-mib 2048
+--parallel 1 --fit off -fa on -ctk q8_0 -ctv q8_0 --load-mode mmap
+--lazy-mode on --no-warmup --spec-type draft-dflash --spec-draft-n-max 5
+--spec-draft-ubatch-size 128 --spec-draft-p-min 0 --spec-dm-controller off`.
+Nos dois braços, mapa CUDA, cache de prefill, GLU, SHARED_Q8,
+compactação do down e D2D estavam ligados. A amostra usa 28.547
+tokens de entrada, 64 de saída, seed 42, temperatura zero e cache
+de prompt desligado, com dois warmups curtos antes das três amostras.
+
+Com 2.487,18 t/s, o BeeLlama chegou a 50,4% dos 4.932,87 t/s
+medidos na Strata na mesma A100. Essa comparação usa o mesmo
+prompt de entrada. A igualdade de hashes acima refere-se aos
+dois braços do BeeLlama.
+`/tmp/opencode/strata-prefill-parity/approved-combo-results.tgz`
+contém o JSON e os logs.
