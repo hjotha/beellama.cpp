@@ -26,4 +26,4 @@ Escopo independente do plano 001. Ordem interna: profile e A/B controlado, regre
 
 | Plano | Prioridade | Estado | Dependências |
 |---|---|---|---|
-| [004 — Baseline Strata e otimizações de prefill](004-strata-prefill-baseline.md) | P1 | Grade compacta do down Q2_0 com +9,23% em pp28k e hashes iguais na A100-80G | Build CUDA completo e confirmação na A100-40G |
+| [004 — Baseline Strata e otimizações do Flash-Next](004-strata-prefill-baseline.md) | P1 | Top-k radix com +11,87% no decode pós-28k e hashes iguais na A100-40G | Atribuição de custo das projeções densas no verificador |
