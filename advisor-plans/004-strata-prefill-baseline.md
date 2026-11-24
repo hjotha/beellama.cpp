@@ -1328,3 +1328,81 @@ de 47% do prefill nesse recorte. A A100 ainda precisa qualificar
 a integração no modelo inteiro, incluindo o custo de desativar os
 CUDA Graphs. A segunda rodada está em
 `/tmp/opencode/strata-prefill-parity/slice4-native/1795529754/`.
+
+#### Prefill com a política normal de CUDA Graphs
+
+O protótipo local `d519f6a26` contém a receita para compilar o shim
+SM80/SM89 a partir de `a34979fc9` da Strata. Repeti o teste dos
+64 vetores com esse build na 4070. O log confirmou a fusão no
+braço ligado e os dois arquivos de logits tiveram o mesmo SHA-256
+registrado acima. Artefatos em
+`/tmp/opencode/strata-prefill-parity/slice4-native/1795530032/`.
+
+A revisão experimental `e4c15331b` também permite a fusão quando o
+backend escolhe execução direta por conta própria. Com a variável
+`GGML_CUDA_DISABLE_GRAPHS` ausente nos dois braços e o restante da
+configuração mantido, os tempos do recorte foram:
+
+| Braço | Mediana de seis prefill pp28k (t/s) | Mínimo–máximo (t/s) |
+|---|---:|---:|
+| Controle | 13.162,95 | 13.117,18–13.207,49 |
+| Fusão durante execução direta | 13.780,54 | 13.656,46–13.817,10 |
+
+O ganho foi de 4,69%. Os dois braços geraram o token 56553. Os eventos
+por requisição confirmam a execução do kernel durante os lotes de
+prefill. O caso tem uma saída e não mede a velocidade de decode.
+Os dados e eventos de CUDA Graphs ficam em
+`/tmp/opencode/strata-prefill-parity/slice4-native/1795530451/`.
+
+#### Transferência dos embeddings de entrada
+
+Com `GGML_SCHED_DEBUG=1 -lv 5`, o split CPU→CUDA identificou três
+entradas de 40 MiB por ubatch cheio: `inp_mixed_embd`, o resultado
+de GET_ROWS do ramo misto e `model.input_embed (reshaped)`. O prompt
+contém apenas tokens de texto. O trace Nsight do Bee registrou 18
+cópias de 41.943.040 bytes nos seis lotes de 4.096 e três de
+40.663.040 bytes no lote final de 3.971. Juntas ocuparam 337,32 ms.
+O tamanho do mask F16 de QSA cresce com o pool de contexto; os sete
+uploads correspondentes somaram mais 90,69 ms. Os valores são da
+4070 local e dependem da ligação PCIe com o host.
+
+O protótipo `LLAMA_QWEN4EXP_TOKEN_ROWS=1` reúne as linhas Q3_K
+originais na CPU e faz GET_ROWS na GPU. Os logs de atribuição mostram
+um split CUDA e uma entrada de 4.505.600 bytes por ubatch cheio no
+lugar dos três tensores, além de um índice de quatro bytes.
+Mantivemos o kernel MoE, a PLE combinada e radix one-tile ligados
+nos dois braços. O hash dos logits teacher-forced permaneceu idêntico.
+O A/B com seis amostras por braço mediu 14.006,17 t/s no controle
+(faixa 9.517,94–14.031,54) e 14.998,40 no candidato
+(9.574,17–17.227,29). As faixas se sobrepõem. O teste confirma a
+redução de tráfego e a corretude no recorte; a dispersão impede
+promover com base nessa diferença de medianas.
+Resultados em `/tmp/opencode/strata-prefill-parity/slice4-native/flat-1795530677/`.
+
+#### Trace pareado após reduzir os uploads
+
+A captura Nsight incluiu o segundo warmup. Um marcador interno
+delimitou exclusivamente o terceiro pedido. Os dois traces cobrem sete
+chunks QSA e 21 execuções GDN; o primeiro trace da Strata chegou a
+apenas seis chunks e foi descartado para essa comparação. Os motores
+devolveram 56553. Bee usou as linhas Q3_K compactas, radix one-tile,
+PLE combinada e a fusão MoE do build `d519f6a26`.
+Os números representam um pedido com profiler em cada engine.
+
+| Recorte de quatro camadas, RTX 4070 | BeeLlama | Strata |
+|---|---:|---:|
+| Prefill informado pelo engine, ms | 1.666,45 | 972,40 |
+| Intervalo total do pedido, ms | 1.675,81 | 975,55 |
+| GPU com trabalho registrado (união dos intervalos), ms | 1.574,87 | 972,17 |
+| Intervalos sem trabalho registrado na GPU, ms | 100,93 | 3,38 |
+| Cópias CUDA e memset, soma em ms | 126,81 | 29,50 |
+| Kernels identificados como FA/QSA, soma em ms | 261,01 | 78,40 |
+| Kernels identificados como GDN, soma em ms | 104,11 | 77,49 |
+
+O prefill equivale a 17.130 contra 29.357 t/s nesse pedido. A diferença
+de tempo dos kernels FA/QSA foi 182,61 ms, seguida de cerca de 98 ms
+de diferença nos intervalos sem trabalho na GPU e 97 ms nas cópias.
+Os nomes genéricos dos kernels não permitem atribuir todo o tempo a
+camadas. O experimento não estabelece o ganho no modelo de 48 camadas.
+Os nomes, contagens, configurações, hashes e traces SQLite estão em
+`/tmp/opencode/strata-prefill-parity/slice4-nsys/live-1795530891/`.
