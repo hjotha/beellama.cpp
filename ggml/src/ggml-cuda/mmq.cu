@@ -307,6 +307,17 @@ static void ggml_cuda_mul_mat_q_impl(
                     ncols_per_expert < J_max && ncols_per_expert < ncols_max) {
                     ncols_opt = ncols_per_expert;
                 }
+                const bool low_bit_iq = src0->type == GGML_TYPE_IQ2_XXS || src0->type == GGML_TYPE_IQ2_S ||
+                        src0->type == GGML_TYPE_IQ3_XXS || src0->type == GGML_TYPE_IQ4_XS;
+                if (cc == GGML_CUDA_CC_ADA_LOVELACE && ne12 >= 128 && low_bit_iq) {
+                    static const bool ada_typical_moe = [] {
+                        const char * value = getenv("GGML_CUDA_MMQ_ADA_IQ_TYPICAL_MOE");
+                        return value && value[0] == '1' && value[1] == '\0';
+                    }();
+                    if (ada_typical_moe) {
+                        ncols_opt = std::min(2*ncols_per_expert, ncols_max);
+                    }
+                }
             }
         }
 

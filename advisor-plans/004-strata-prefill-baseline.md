@@ -867,3 +867,40 @@ na A100 está pendente. Para medir, usar o mesmo binário com flag
 `p_min=0` e `-b 2048 -ub 1024`. Registrar 4k e 28k, hashes
 dos tokens, faixas de throughput e pico de VRAM. As amostras da
 4070 estão em `/tmp/opencode/topk-one-4070/shipping-summary.json`.
+
+### Qwen3.6 na RTX 4070 com o main atual
+
+BeeLlama `47b5c51bf` com recompilação seletiva no chroot da .57
+e Strata v0.2.20/0.1.66 (`a34979fc9`). Mesmo Qwen3.6-35B-A3B
+UD-IQ2_XXS, SHA-256
+`627e2b05f83088448e27861ec392d56efc2b178783cae5adfa4ad2d988441203`.
+Os dois engines usaram SM89, KV F16/F16, contexto 4.096, uma sequência,
+os mesmos IDs de prompt, greedy, 64 tokens de saída, sem drafts e
+sem reaproveitamento de prompt. O controle Bee reuniu duas rodadas
+de três amostras por caso. Os demais braços tiveram três amostras.
+
+| Braço | Prefill 3.584 | Prefill 3.584 (código) | Decode pós-3.584 | Pico (MiB) |
+|---|---:|---:|---:|---:|
+| BeeLlama, ubatch 512 | 3.368,93 | 3.036,89 | 121,40 | 11.551 |
+| BeeLlama, ubatch 512, largura Ada IQ | 3.595,99 | 3.446,18 | 119,68 | 11.551 |
+| BeeLlama, batch/ubatch 768, largura Ada IQ | 3.551,73 | 3.401,78 | 120,12 | 11.809 |
+| Strata, chunk 512 e cache automático | 537,94 | 505,56 | 112,86 | 11.265 |
+
+Valores em t/s. A Strata manteve 206 de 256 experts por camada na
+GPU. O braço de 224 slots parou na verificação de espaço para os
+buffers na inicialização, antes de gerar amostras. Em 3.584 tokens,
+o prompt repetitivo teve hash igual nos dois engines. A saída do
+prompt de código divergiu entre engines.
+
+A flag `GGML_CUDA_MMQ_ADA_IQ_TYPICAL_MOE=1` seleciona a largura
+usando duas vezes a média de linhas por expert em SM89, para
+IQ2_XXS, IQ2_S, IQ3_XXS e IQ4_XS e ubatches de pelo menos
+128 tokens. Em ubatch 512, ganhou **6,74%** no prompt repetitivo
+e **13,48%** no de código, com hashes iguais ao controle nos
+quatro casos. As faixas de pp3.584 foram 3.239,43–3.436,00
+e 3.547,88–3.635,67 t/s. A flag é opt-in. O lote 768 mudou o
+hash do prompt de código e ficou abaixo do 512 no prefill longo.
+
+O Qwen3.6 exercita GDN e MoE. O Flash-Next usa QSA e outra
+geometria de experts. As amostras e comandos desta rodada
+estão em `/tmp/opencode/strata-ada-current/`.
