@@ -4783,7 +4783,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             // The draft stream orders the copy after the previous graph's read of dst.
             ggml_backend_tensor_copy_async(dst_backend, dst_backend, &src, dst);
             ggml_backend_event_record(source.copied, dst_backend);
-            ggml_backend_event_wait(source.backend, source.copied);
+            // A cross-backend graph input can be read by a synchronous copy on another stream.
+            if (ggml_backend_sched_get_n_splits(sched.get()) != 1 ||
+                    ggml_backend_sched_get_tensor_backend(sched.get(), res->get_embd()) != dst_backend) {
+                ggml_backend_event_synchronize(source.copied);
+            } else {
+                ggml_backend_event_wait(source.backend, source.copied);
+            }
         }
         res->set_inputs(&ubatch);
 

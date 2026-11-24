@@ -9,8 +9,9 @@
 #include <vector>
 
 int main(int argc, char ** argv) {
-    if (argc != 3) {
-        std::fprintf(stderr, "usage: %s target.gguf drafter.gguf\n", argv[0]);
+    const bool cpu_fc = argc == 4 && std::strcmp(argv[3], "--cpu-fc") == 0;
+    if (argc != 3 && !cpu_fc) {
+        std::fprintf(stderr, "usage: %s target.gguf drafter.gguf [--cpu-fc]\n", argv[0]);
         return 2;
     }
     llama_backend_init();
@@ -25,6 +26,15 @@ int main(int argc, char ** argv) {
     mparams.devices = devices;
     mparams.n_gpu_layers = 999;
     auto * target = llama_model_load_from_file(argv[1], mparams);
+    const llama_model_tensor_buft_override overrides[] = {
+        {"^fc[.]weight$", ggml_backend_cpu_buffer_type()},
+        {nullptr, nullptr},
+    };
+    if (cpu_fc) {
+        mparams.no_host = true;
+        mparams.use_extra_bufts = false;
+        mparams.tensor_buft_overrides = overrides;
+    }
     auto * draft = llama_model_load_from_file(argv[2], mparams);
     GGML_ASSERT(target && draft);
     constexpr int rows = 128;
@@ -38,6 +48,9 @@ int main(int argc, char ** argv) {
     constexpr int draft_rows = 48;
     cparams.n_ubatch = draft_rows;
     cparams.ctx_other = ctx_tgt;
+    if (cpu_fc) {
+        cparams.op_offload = false;
+    }
     auto * ctx_dft = llama_init_from_model(draft, cparams);
     GGML_ASSERT(ctx_tgt && ctx_dft);
     const int n_embd = llama_model_n_embd(target);
