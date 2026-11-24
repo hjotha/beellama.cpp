@@ -1422,3 +1422,54 @@ de logits teacher-forced foi idêntico nos dois braços. O ganho local
 ainda precisa de confirmação sem a amostra lenta e de medição com a
 receita atual no modelo completo. Dados em
 `/tmp/opencode/strata-prefill-parity/slice4-native/bounds-1795531092/`.
+
+#### Cobertura da fusão roteada e seleção em dois tiles na RTX 4070
+
+Na revisão experimental `5ca5d9e8e`, o kernel roteado também aceita a
+ordem de grafo que coloca gate, up e SwiGLU do expert compartilhado
+antes do down roteado. O down escreve na posição original do grafo.
+O diagnóstico confirmou 13 fusões adicionais por pedido nas camadas
+1 e 3. A camada final só calcula FFN para um token no último lote. Em
+paralelo, `5efa09ba3` habilita radix CUDA para top-k de 512 com dois
+tiles de 4.096 na Ada. Os 6.144 índices do fixture de empates,
+zeros com sinal e infinitos foram idênticos entre os braços.
+
+Mesmo recorte de quatro camadas e 28.547 IDs, 8-bit KV, sem draft ou
+reuso, com o pack PLE, as linhas Q3_K e o mask por limites ativos.
+A repetição corrigiu o aquecimento do cache do disco usando
+`mlock` em arquivo mapeado somente para leitura. A sequência foi
+controle, radix, combinado, combinado, controle. Cada processo teve
+dois aquecimentos completos e três pedidos medidos.
+
+| Braço | Amostras | Mediana (t/s) | Mínimo–máximo (t/s) |
+|---|---:|---:|---:|
+| Controle, fusão nas camadas 0 e 2 | 6 | 18.262,55 | 18.201,85–18.292,52 |
+| + radix de dois tiles | 3 | 19.393,20 | 19.336,16–19.402,04 |
+| + fusão nas camadas 1 e 3 | 6 | 20.666,67 | 20.611,09–20.742,42 |
+
+O combinado ganhou **13,16%** sobre o controle. Todos os pedidos
+retornaram 56553 e os 64 vetores de logits teacher-forced foram
+idênticos entre o controle e o combinado. Um teste CUDA separado
+validou o transporte Q3_K em 12 transições entre texto, embeddings,
+entradas mistas e LoRA. O hash dos arquivos com os 12 vetores foi
+`2765fd0a7affe4c99cc72f09ff69e239f8652f27ec49916414e048a3f00f6667`
+com a opção ligada e desligada.
+
+A captura Nsight pareada do combinado e da Strata cobriu os sete
+chunks QSA e as 21 chamadas GDN de cada engine. O prefill foi de
+**1.381,30 ms contra 977,60 ms**. Os kernels identificados como
+MoE somaram 258,03 contra 251,14 ms, as cópias e memset, 35,84
+contra 27,55 ms, e FA/QSA, 170,56 contra 78,97 ms. O intervalo
+total sem atividade CUDA registrada foi de 90,66 contra 4,54 ms;
+a métrica inclui trabalho do host. Esses tempos são de um pedido
+instrumentado por engine, isolados das medianas acima. O núcleo
+denso e os kernels genéricos ainda requerem atribuição por operação.
+
+O A/B, os logits e os logs de cobertura estão em
+`/tmp/opencode/strata-prefill-parity/slice4-native/combo-1795532659/`;
+os traces e a tabela de atividades estão em
+`/tmp/opencode/strata-prefill-parity/slice4-nsys/live-1795532843/`.
+O teste de transições usou o código experimental `eacaac410` e
+está em `slice4-native/bounds-1795531092/transition-{0,1}.{log,bin}`
+sob a mesma raiz. A comparação das 48 camadas com DFlash2 na A100
+continua necessária antes de promover a fusão roteada.
