@@ -744,3 +744,101 @@ A medição usou reconstrução seletiva das bibliotecas CUDA e llama
 no chroot da .57. Dados em
 `/tmp/opencode/dflash-paired-24/gdn-default-summary.json` e
 `gdn-default-results.tgz`.
+
+### Ciclo DFlash2 após a integração
+
+Base `de15cf4fe`, A100-SXM4-40GB, mesmos shards, drafter e IDs da
+rodada pareada. O controle usa `-b 2048 -ub 1024`, a grade
+compacta, seis propostas, `p_min=0` e sem reuso. Cada ajuste foi
+medido separadamente, com três amostras por caso e hashes comparados
+ao controle greedy sem draft.
+
+No segundo pedido de 64 tokens após 28k, instrumentado fora do A/B,
+a execução do alvo somou **690,0 ms** dos aproximadamente 837 ms
+de geração (82,4%). A decomposição do alvo foi 205,4 ms de submissão e
+483,1 ms até a sincronização. As outras fases mais caras foram
+drafter (69,1 ms), amostragem e aceitação (46,0 ms) e atualização
+do drafter com os taps (17,5 ms). A espera do alvo inclui a execução
+pendente na GPU. Com `GGML_CUDA_GRAPH_MIN_STABLE_CALLS=1`, os eventos
+de launch passaram de 33 para 42 e os grafos diretos de 14 para
+5, dentro da janela após o primeiro token. O alvo caiu para
+674,1 ms. Os eventos de grafo incluem alvo e draft.
+
+| Braço | Decode pós-4k | Decode pós-28k | Resultado |
+|---|---:|---:|---|
+| Controle | 78,49 | 75,66 | Hash de referência |
+| Captura com limiar 1 | 79,96 | 77,12 | +1,93% em 28k e hashes iguais |
+| `--spec-draft-p-min 0.35` | 75,18 | 77,95 | +3,03% em 28k, com hash divergente |
+| `--backend-sampling` | — | — | OOM ao reservar 2.058,12 MiB para o grafo de 4k |
+| Cópia direta dos taps | 78,53 | 75,90 | +0,32% em decode de 28k e hashes iguais |
+
+Valores em t/s, mediana. O limiar de confiança reduziu as propostas
+de 90 para 72 por amostra pós-28k. A saída mudou nos três ensaios,
+e o braço foi rejeitado.
+
+A cópia direta preencheu `batch_inject.embd` durante o gather de
+taps, eliminando o vetor intermediário. O fixture de CPU do Qwen4Exp
+passou com captura, rollback, duas sequências e handoff DFlash2.
+No modelo completo, o prefill de 28k subiu de 1.527,33 para
+1.560,74 t/s (+2,19%), com pico de 39.624 MiB e hashes iguais.
+O ganho ficou abaixo do piso de 3%. O patch da cópia está arquivado
+em `/tmp/opencode/dflash-paired-24/tap-copy.patch`.
+
+Em uma captura separada com `LLAMA_OP_PROFILE_GPU=1`, 17 grafos
+do alvo na janela de decode registraram 820,8 ms por eventos
+CUDA. `MUL_MAT` somou 329,8 ms (40,2%), `TOP_K` 104,0 ms,
+`MUL_MAT_ID` 95,6 ms e `FLASH_ATTN_EXT` 44,4 ms. São totais
+instrumentados por operação. O profiler altera a sincronização,
+e suas durações ficam fora das medianas e da contabilidade de
+parede acima. O próximo recorte deve atribuir `MUL_MAT` do alvo
+a tensor, dtype e geometria, usando os kernels e as projeções
+efetivamente despachadas nos lotes de verificação. O evento
+`TOP_K` agrega usos distintos. A medição ainda precisa separar
+indexação QSA e roteamento MoE antes de escolher um patch de top-k.
+
+Dados brutos e agregados em `/tmp/opencode/dflash-paired-24/`,
+incluindo `gdn-cycle.json` e `gdn-cycle-summary.json`.
+
+### Top-k do verificador e profundidade do draft
+
+Na A100-40G, o trace Nsight do DFlash2 com seis propostas mostrou
+aproximadamente 98 ms de `topk_tile` na janela final de decode
+pós-28k. A especialização de 4.096 elementos dominou esse tempo.
+O QSA do Flash-Next seleciona 512 pools nessa geometria e o
+caminho CUDA anterior usava 512 reduções de máximo por tile.
+
+Usar cinco propostas preservou o hash nos três prompts, com
+**90,98 t/s em decode pós-4k** e **80,21 t/s pós-28k**, contra
+78,49 e 75,66 t/s com seis. A VRAM caiu de 39.624 para 39.512 MiB.
+Quatro propostas deram 82,16 e 76,80 t/s, também com hashes iguais.
+A receita de cinco refere-se ao drafter pareado da rodada acima,
+com `p_min=0`.
+
+O candidato troca só a seleção dentro de cada tile por
+`cub::BlockRadixSort` quando o CUDA executa em SM80, a largura
+excede 4.096 elementos, o tile é de 4.096 e `k=512`. Usa as
+mesmas chaves de 64 bits, com score ordenável e índice como
+desempate, e conserva os estágios de ordenação e remapeamento
+entre tiles. O fixture comparou os índices byte a byte em 12
+geometrias, incluindo empates, infinito, uma cauda de uma coluna
+e execução com CUDA Graphs. Os dois novos casos TOP_K passaram
+no `test-backend-ops` da A100.
+
+O A/B usou o mesmo drafter com cinco propostas, `-b 2048 -ub 1024`
+e grade compacta em ambos os braços. Dois warmups curtos e três
+amostras por caso, sem reuso e com o mesmo limite de saída.
+
+| Métrica | Base | Radix | Delta |
+|---|---:|---:|---:|
+| Prefill 28k | 1.539,83 t/s | 1.581,23 t/s | +2,69% |
+| Decode pós-4k | 91,36 t/s | 90,18 t/s | −1,29% |
+| Decode pós-28k | 80,35 t/s | 89,89 t/s | +11,87% |
+| Pico de VRAM | 39.512 MiB | 39.512 MiB | 0 |
+
+As faixas de decode pós-28k foram 79,10–80,69 e 89,46–90,31 t/s.
+Os hashes dos três prompts coincidiram com o controle sem draft.
+No mesmo comparativo, a Strata registrou 109,70 t/s pós-28k
+com hash igual. A diferença de decode caiu para 1,22×. O build
+da rodada recompilou seletivamente as unidades CUDA na .57.
+Medianas e amostras em
+`/tmp/opencode/dflash-paired-24/verify-topk-summary.json`.

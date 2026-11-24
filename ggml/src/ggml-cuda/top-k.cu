@@ -290,11 +290,9 @@ static void top_k_argsort_cuda(
 #define TOPK_TILE_WIDE 8192
 #define TOPK_TILE      4096
 
-template <int TILE, int BLOCK>
+template <int TILE, int BLOCK, bool RADIX_SORT = false>
 static __global__ void topk_tile(const float * src, float * cand_val, int * cand_idx,
                                  const int ncols, const int ntiles, const int k) {
-    __shared__ uint64_t smem[BLOCK];
-
     const int     row     = blockIdx.x / ntiles;
     const int     tile    = blockIdx.x % ntiles;
     const float * row_ptr = src + (size_t) row * ncols;
@@ -309,33 +307,50 @@ static __global__ void topk_tile(const float * src, float * cand_val, int * cand
     }
 
     const size_t out = ((size_t) row * ntiles + tile) * k;
-    for (int j = 0; j < k; ++j) {
-        uint64_t local = 0;
-#pragma unroll
-        for (int i = 0; i < TILE / BLOCK; ++i) {
-            local = max(local, keys[i]);
-        }
-        smem[threadIdx.x] = local;
-        __syncthreads();
-        for (int s = BLOCK / 2; s > 0; s >>= 1) {
-            if (threadIdx.x < s) {
-                smem[threadIdx.x] = max(smem[threadIdx.x], smem[threadIdx.x + s]);
-            }
-            __syncthreads();
-        }
-        const uint64_t best = smem[0];
-        if (threadIdx.x == 0) {
+#if defined(GGML_CUDA_USE_CUB) && !defined(GGML_USE_MUSA)
+    if constexpr (RADIX_SORT) {
+        // Sort the same score/index keys used by the repeated max reduction.
+        using block_sort = cub::BlockRadixSort<uint64_t, BLOCK, TILE / BLOCK>;
+        __shared__ typename block_sort::TempStorage temp;
+        block_sort(temp).SortDescendingBlockedToStriped(keys);
+        for (int j = threadIdx.x; j < k; j += BLOCK) {
+            const uint64_t best = keys[j / BLOCK];
             const int col = ncols - 1 - (int) (best & 0xFFFFFFFFu);
             cand_val[out + j] = best ? row_ptr[col] : -FLT_MAX;
             cand_idx[out + j] = best ? col : 0;
         }
+    } else
+#endif
+    {
+        __shared__ uint64_t smem[BLOCK];
+        for (int j = 0; j < k; ++j) {
+            uint64_t local = 0;
 #pragma unroll
-        for (int i = 0; i < TILE / BLOCK; ++i) {
-            if (keys[i] == best) {
-                keys[i] = 0;
+            for (int i = 0; i < TILE / BLOCK; ++i) {
+                local = max(local, keys[i]);
             }
+            smem[threadIdx.x] = local;
+            __syncthreads();
+            for (int s = BLOCK / 2; s > 0; s >>= 1) {
+                if (threadIdx.x < s) {
+                    smem[threadIdx.x] = max(smem[threadIdx.x], smem[threadIdx.x + s]);
+                }
+                __syncthreads();
+            }
+            const uint64_t best = smem[0];
+            if (threadIdx.x == 0) {
+                const int col = ncols - 1 - (int) (best & 0xFFFFFFFFu);
+                cand_val[out + j] = best ? row_ptr[col] : -FLT_MAX;
+                cand_idx[out + j] = best ? col : 0;
+            }
+#pragma unroll
+            for (int i = 0; i < TILE / BLOCK; ++i) {
+                if (keys[i] == best) {
+                    keys[i] = 0;
+                }
+            }
+            __syncthreads();
         }
-        __syncthreads();
     }
 }
 
@@ -362,6 +377,13 @@ static bool ggml_cuda_top_k_tiled(ggml_cuda_pool & pool, const float * src, int 
     ggml_cuda_pool_alloc<int>   cand_idx(pool, (size_t) nrows * ncand);
     ggml_cuda_pool_alloc<int>   order   (pool, (size_t) nrows * ncand);
 
+#if defined(GGML_CUDA_USE_CUB) && !defined(GGML_USE_MUSA)
+    if (tile == TOPK_TILE && ncols > TOPK_TILE && k == 512 &&
+            ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_AMPERE) {
+        topk_tile<TOPK_TILE, TOPK_BLOCK, true><<<nrows * ntiles, TOPK_BLOCK, 0, stream>>>(
+                src, cand_val.get(), cand_idx.get(), ncols, ntiles, k);
+    } else
+#endif
     if (tile == TOPK_TILE_WIDE) {
         topk_tile<TOPK_TILE_WIDE, TOPK_BLOCK><<<nrows * ntiles, TOPK_BLOCK, 0, stream>>>(
                 src, cand_val.get(), cand_idx.get(), ncols, ntiles, k);
