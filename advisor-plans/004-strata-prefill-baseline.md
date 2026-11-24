@@ -1553,3 +1553,61 @@ de 6% na A100; o recorte de quatro camadas não qualifica a qualidade
 do modelo completo. A rota segue experimental. Dados brutos e os
 arquivos por braço em `slice4-native/selection-1795534159/` sob
 `/tmp/opencode/strata-prefill-parity/`.
+
+#### Gate isolado do radix de dois tiles na Ada (SM89)
+
+O build limpo baseado em `main` em `/tmp/opencode/beellama-ada-qsa-radix-main`
+(cherry-pick isolado `4bfed157e` de `exp/ada-qsa-two-tile-radix-main` sobre
+`ggml/src/ggml-cuda/top-k.cu`, SM89 `89-real`, `GGML_CUDA_FA=ON`,
+`GGML_CUDA_GRAPHS=ON`, `LLAMA_BUILD_DIRTY=0` e link com
+`-Wl,-rpath-link,/opt/cuda/lib64`) concluiu a vinculação de `llama-server`,
+`test-backend-ops`, `topk-parity` e `teacher-logits`. Na janela reservada da
+RTX 4070 (`live-1795537039`):
+
+- `test-backend-ops test -b CUDA0 -o TOP_K` com `GGML_CUDA_TOP_K_RADIX_ONE_TILE=1`
+  e `GGML_CUDA_TOP_K_RADIX_TWO_TILES_ADA=1` aprovou **539/539** casos.
+- `topk-parity` (`verify/topk-0.ids` e `verify/topk-1.ids`) produziu SHA-256
+  idêntico `6bd6af6303a917c151fa66b8be872646b00716cca8d14f4269115cd233366f39`.
+- `teacher-logits` (`verify/teacher-0.bin` e `verify/teacher-1.bin`) produziu
+  SHA-256 idêntico `c2e6ba6657291dc03742d010bade68b5da51904498683726852f18c2d77c49d3`.
+- No `pp28k` vanilla (28.547 IDs, ordem `0/1/1/0`, dois warmups e três medições
+  por processo, `GGML_CUDA_TOP_K_RADIX_ONE_TILE=1`, token `56553` em todas as
+  execuções):
+  - Controle (`GGML_CUDA_TOP_K_RADIX_TWO_TILES_ADA=0`): mediana **12.817,15 t/s**
+    (faixa **12.787,44–12.872,23 t/s**, 2.227,260 ms).
+  - Candidato (`GGML_CUDA_TOP_K_RADIX_TWO_TILES_ADA=1`): mediana **13.367,27 t/s**
+    (faixa **13.344,22–13.403,66 t/s**, 2.135,590 ms).
+  - Ganho de **+4,29%** fora da dispersão (`13.344,22 > 12.872,23`), aprovado e
+    integrado em `main`.
+
+#### Dump pós-FA do QSA 4×16 na RTX 4070
+
+A janela diagnóstica `/tmp/opencode/strata-prefill-parity/slice4-native/postfa-1795537226/`
+executou o backend `/tmp/opencode/beellama-qsa-fa-output-dump/staged` com
+`GGML_CUDA_DISABLE_GRAPHS=1`, `LLAMA_QSA_FA_Q8_WIDE_16K=0` e troca apenas de
+`LLAMA_QSA_FA_Q8_4X16=0/1` (`teacher0.bin` SHA
+`c2e6ba6657291dc03742d010bade68b5da51904498683726852f18c2d77c49d3` vs
+`teacher1.bin` SHA
+`e3f8ab99818ea5a549be2583e1aff8d3dd588710cf44b5433a6a36b9caa6e61f`).
+
+Em **todos os 7 chunks (0–6)** de `post-fa.json`, `exact_sample_rows.q == 17`,
+`exact_sample_rows.mask == 17` e `finite_cell_symdiff == 0`, confirmando entradas
+`Q` e máscaras idênticas byte a byte:
+
+| Chunk | `q` / `kv` | Rotas (`0` vs `1`) | Saídas exatas (`17`) | `output_nmse` | `output_max_abs` (`worst_q`, `worst_head`) |
+|---:|---|---|---:|---:|---|
+| 0 | 4.096 / 4.096 | `dense-f16` / `dense-f16` | 17 | `0,000000e+00` | `0,000000e+00` |
+| 1 | 4.096 / 8.192 | `dense-f16` / `dense-f16` | 17 | `0,000000e+00` | `0,000000e+00` |
+| 2 | 4.096 / 12.288 | `dense-f16` / `sparse-q8-4x16` | 0 | `4,772412e-06` | `2,640891e-02` (`q=0`, `head=2`) |
+| 3 | 4.096 / 16.384 | `dense-f16` / `sparse-q8-4x16` | 0 | `5,083018e-06` | `2,625978e-02` (`q=4092`, `head=2`) |
+| 4 | 4.096 / 20.480 | `sparse-q8-8x8` / `sparse-q8-4x16` | 0 | `3,638922e-06` | `3,798163e-02` (`q=410`, `head=2`) |
+| 5 | 4.096 / 24.576 | `sparse-q8-8x8` / `sparse-q8-4x16` | 0 | `3,939659e-06` | `1,351452e-02` (`q=821`, `head=2`) |
+| 6 | 3.971 / 28.672 | `sparse-q8-8x8` / `sparse-q8-4x16` | 3 | `3,267325e-06` | `2,186674e-02` (`q=2384`, `head=2`) |
+
+No chunk 6, as únicas 3 linhas idênticas (`output_equal=true`) são exatamente as
+3 queries da cauda `[3968, 3969, 3970]`, em que os grupos `8×8` e `4×16` cobrem
+o mesmo conjunto de 3 queries. Isso confirma que o kernel `4×16` não introduz
+divergência quando o agrupamento coincide e que a diferença vem da mudança nas
+uniões de 4 vs 8 queries (fronteiras de tiles de 32 células e partições
+Stream-K na reescalagem FP16 da softmax online, somada à troca Q8/F16 nos
+chunks 2–3). O protótipo segue experimental fora de `main`.

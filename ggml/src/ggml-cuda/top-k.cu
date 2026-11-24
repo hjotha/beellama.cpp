@@ -366,7 +366,15 @@ static __global__ void topk_unmap(const int * cand_idx, const int * order, int *
 static bool top_k_tile_use_radix(int ntiles) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     if (ntiles > 1) {
-        return cc == GGML_CUDA_CC_AMPERE;
+        if (cc == GGML_CUDA_CC_AMPERE) {
+            return true;
+        }
+        static const bool two_tiles_enabled = [] {
+            const char * value = getenv("GGML_CUDA_TOP_K_RADIX_TWO_TILES_ADA");
+            return value && value[0] == '1' && value[1] == '\0';
+        }();
+        // The tiled caller already requires 4096 columns per tile and k = 512.
+        return two_tiles_enabled && cc == GGML_CUDA_CC_ADA_LOVELACE && ntiles == 2;
     }
     static const bool one_tile_enabled = [] {
         const char * value = getenv("GGML_CUDA_TOP_K_RADIX_ONE_TILE");
