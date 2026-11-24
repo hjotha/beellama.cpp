@@ -534,3 +534,8 @@ em cada A/B. O pico para o braço ub3072 foi **40.022 MiB** e o
 prefill chegou a **2.343,65 t/s**. A checagem de memória manteve
 o caminho host no teste de ub4096, com o mesmo pico do controle.
 [Validação D2D](../advisor-plans/004-strata-prefill-baseline.md#captura-dflash2-no-mesmo-dispositivo-cuda)
+
+A receita combinada em ub3072 chegou a **2.487,18 t/s** em pp28k
+com D2D, down K-outer e radix de um tile. As duas flags de kernel
+juntas deram +6,20% sobre D2D sozinho, com o mesmo hash e pico de
+40.022 MiB. [Protocolo e flags](../advisor-plans/004-strata-prefill-baseline.md#receita-combinada-de-prefill-em-3072)
