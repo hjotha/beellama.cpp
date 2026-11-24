@@ -614,6 +614,11 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     cb(res->t_h_nextn, "h_nextn", -1);
     ggml_build_forward_expand(gf, res->t_h_nextn);
 
+    // Keep recurrent and KV writes, layer taps, and unmasked nextn rows on output-free ubatches.
+    if (n_outputs == 0 && !cparams.embeddings) {
+        return;
+    }
+
     if (crop_after_nextn(inp_out_ids)) {
         res_hc = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc->ne[2]);
         res_hc = ggml_get_rows(ctx0, res_hc, inp_out_ids);
