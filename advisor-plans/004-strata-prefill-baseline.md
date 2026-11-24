@@ -1501,3 +1501,23 @@ histórica como controle e acrescenta uma comparação com
 propostas DFlash2 em ambos (janela seis com âncora na Strata), 28.547
 IDs, dois aquecimentos completos, três pedidos medidos e 64 tokens de
 saída. Cada hardware de 40 ou 80 GB recebe sua própria medição Strata.
+
+#### Testes isolados de conversão BF16 e atenção no limite de 16k
+
+Mantivemos o combinado de 20,7 mil t/s fixo e repetimos cada novo
+experimento como controle, candidato, candidato, controle. Houve dois
+aquecimentos completos e três amostras medidas por processo na RTX 4070.
+O build SM89 separado usava a CPU da máquina durante esses ensaios.
+
+| Variante | Controle (t/s), mediana e faixa | Candidato (t/s), mediana e faixa | Diferença |
+|---|---:|---:|---:|
+| Compartilhar a conversão FP32→BF16 entre as duas projeções HC | 20.074,42 (20.023,88–20.157,66) | 20.405,01 (20.352,92–20.434,39) | +1,65% |
+| Usar o kernel Q8 esparso no quarto chunk, com 16.384 células | 19.998,93 (19.911,15–20.104,37) | 20.206,42 (20.041,93–20.291,95) | +1,04% |
+
+Os dois candidatos reproduziram os 64 vetores de logits do controle
+byte a byte. O log da QSA confirmou a troca apenas no quarto chunk;
+o espaço para a união nessa geometria comporta todas as 16.384 células.
+Nenhuma das variantes atingiu o critério de 3%.
+Amostras em `slice4-native/hc-1795533315/` e
+`slice4-native/qsa16-1795533718/` sob
+`/tmp/opencode/strata-prefill-parity/`.
