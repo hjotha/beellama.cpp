@@ -1152,3 +1152,25 @@ O comparativo da Strata na mesma A100 permanece em 4.932,87 t/s.
 A receita mais rápida do BeeLlama chega a 52,7% dessa referência.
 Os dados estão em
 `/tmp/opencode/strata-prefill-parity/d2d-reviewed-results.tgz`.
+
+### Perfil residual da receita de 2.597 t/s
+
+Para os 28.547 tokens, as medianas sem profiler equivalem a 10,99 s
+no BeeLlama e 5,79 s na Strata. Falta economizar 5,20 s. No Nsight
+da receita combinada do BeeLlama, com um token de saída, o intervalo
+entre o primeiro e o último kernel foi 11,35 s. A união dos intervalos
+de kernels, cópias e memset ocupou 9,92 s e deixou 1,44 s ociosos.
+
+O gate/up Q2_0 somou 1.703 ms, as projeções densas Q3_K 1.231 ms e
+o down compacto Q2_0 869 ms. A atenção esparsa Q8_0 somou 648 ms,
+o kernel GDN 556 ms e as projeções densas IQ4_XS 551 ms. Esses
+valores são tempos instrumentados de famílias de kernels.
+
+No A/B do tile denso, o prefill a ub2048 passou de 1.950,78 a
+1.973,77 t/s (+1,18%). Com a receita combinada a ub4096, usar
+J64/I64 no gate/up e manter o K-outer no down mediu 2.596,95 a
+2.625,66 t/s (+1,11%). Ambos ficaram abaixo do piso de 3%.
+A variante de ub2048 que troca o tile de ambos os kernels atingiu
+2.036,38 t/s frente a 2.006,19 t/s com K-outer, +1,50% sobre a
+opção já integrada. O arquivo de amostras e traces da sessão
+é `/tmp/opencode/strata-prefill-parity/parity-a100-drained.tgz`.
