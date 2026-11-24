@@ -502,3 +502,14 @@ em um fixture de duas sequências e rota enviesada (640 canais, 2.048 tokens,
 512 experts, top-10), incluindo empates de arredondamento e a cauda. Medir NMSE
 e hashes na mesma geometria antes de validar throughput. O teste da fusão
 completa permanece pendente.
+
+### Atualização de prefill DFlash2 em 24/11/2026
+
+Eliminar a projeção Qwen4Exp quando o microlote pede zero logits
+ganhou **4,95%** em pp28k a ub1024, com hash idêntico e 628 MiB a
+menos de pico de VRAM na A100-40G. A receita com DFlash2 n-max 6
+completou ub2048 em **1.967,15 t/s** no pp28k e pico de
+**39.490 MiB**. O controle sofreu OOM nessa mesma geometria.
+Para priorizar o decode com o drafter pareado, a configuração
+ub1024 manteve uma mediana maior (87,12 contra 79,09 t/s pós-28k).
+[Protocolo e validação](../advisor-plans/004-strata-prefill-baseline.md#projeção-de-saída-em-microlotes-de-prefill-sem-logits)

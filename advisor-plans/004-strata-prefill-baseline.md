@@ -904,3 +904,75 @@ hash do prompt de código e ficou abaixo do 512 no prefill longo.
 O Qwen3.6 exercita GDN e MoE. O Flash-Next usa QSA e outra
 geometria de experts. As amostras e comandos desta rodada
 estão em `/tmp/opencode/strata-ada-current/`.
+
+### Projeção de saída em microlotes de prefill sem logits
+
+O grafo Qwen4Exp agora encerra a construção depois de publicar a
+ativação NextN quando o microlote pede zero logits e o contexto está
+em modo de geração. As escritas de KV e GDN e os taps do DFlash2
+continuam no grafo. A projeção F32 descartada tem 248.320 colunas de
+vocabulário e ocupa 970 MiB em ub1024.
+
+Na fixture CPU e na RTX 4070 com alvo e drafter em CUDA, o controle
+projetou nove linhas e o candidato projetou só a linha pedida. Os
+logits do último token do prompt e do token seguinte foram bit a bit
+idênticos em cada backend. O teste cobre os 16 estados dos taps e do
+NextN, além da passagem para o drafter. A matriz Qwen4Exp do CTest passou 5/5.
+
+Na A100-SXM4-40GB, o A/B usou Q2_0 e o drafter DFlash2 pareado,
+ambos verificados por SHA-256. Os dois braços usaram o mesmo
+executável e os mesmos backends SM80, recompilados seletivamente
+na .57, com a biblioteca de modelo como única variável
+(`05ca46964` e `0092e660f`). A receita foi `-b 2048 -ub 1024
+-ncmoe 2 --moe-cache-mib 2048 --parallel 1 --fit off -fa on
+-ctk q8_0 -ctv q8_0`, DFlash2 n-max 6, `p_min=0`, controlador
+desligado, GLU, SHARED_Q8, mapa e cache de prefill, e grade compacta.
+Os prompts foram de 4.627 e 28.547 tokens, com temperatura 0, seed
+42, até 64 tokens de saída, sem cache de prompt, dois warmups e
+três rodadas por braço em ordem alternada.
+
+| Métrica | Controle | Candidato |
+|---|---:|---:|
+| Prefill 4k | 1.539,30 t/s | 1.578,72 t/s |
+| Prefill 28k | 1.578,07 t/s | 1.656,23 t/s |
+| Decode pós-28k | 86,19 t/s | 87,12 t/s |
+| Pico de VRAM | 39.622 MiB | 38.994 MiB |
+
+O prefill 28k ganhou 4,95%. As faixas foram 1.574,87–1.578,10
+e 1.647,58–1.656,23 t/s. O pico caiu 628 MiB. Todos os hashes de
+saída coincidiram por caso, `aa09c78f0e31` em 4k e `1df1a3cd1b19`
+em 28k. Em pós-4k, a primeira rodada de controle teve decode
+atípico (39,31 t/s), com 65,78–65,85 t/s nas duas seguintes.
+Amostras, linha de comando e trace no diretório
+`/tmp/opencode/qwen4exp-no-output-sm80/`.
+
+Com a mesma receita e `-ub 2048`, o controle falhou no primeiro
+microlote com `cudaMalloc failed` ao pedir 2.175,09 MiB para o
+grafo. O candidato completou três rodadas em 39.490 MiB de pico,
+com medianas de **1.967,15 t/s** em prefill 28k
+(1.965,25–1.967,83 t/s) e **79,09 t/s** no decode pós-28k.
+Isso representa +24,66% de prefill comparado ao controle em 1024.
+Ao mudar o tamanho do microlote, o hash de 28k mudou para
+`de4e4381cd19` e foi estável nas três rodadas. O hash de 4k
+coincidiu com o medido em 1024. O teste de paridade do patch
+usa a geometria fixa de 1024.
+
+Frente à Strata pareada da rodada anterior (4.943,72 t/s em
+prefill 28k e 109,70 t/s no decode), a diferença de prefill
+fica em 2,51× com ub2048 no BeeLlama. Para priorizar o decode
+com esse drafter, ub1024 ficou à frente de ub2048.
+
+### Prova CUDA do operando Q8_1 para a projeção down
+
+Na RTX 4070, o empacotamento separado e o caminho que combina
+SWiGLU e quantização produziram os mesmos 23.592.960 bytes por
+layout (D4/Q2_0 e DS4/Q4_0), incluindo o padding. O fixture usou
+2.048 tokens, top-10, 512 experts e 640 canais com padding até
+1.024. Ele valida o roteamento com o helper de CUDA e compara
+as saídas FP32 do `MUL_MAT_ID` down normal com as do kernel
+MMQ alimentado pelo D4 pré-empacotado. Com largura J=32, todos os
+52.428.800 valores foram idênticos (NMSE 0). O fixture é uma prova
+de corretude, e a fusão no grafo e a medição com o caminho compacto
+no SM80 continuam pendentes. Fonte e resultado em
+`/tmp/opencode/mmq-glu-down-mma/` e
+`/tmp/opencode/qwen4exp-no-output-4070/window-mma.log`.

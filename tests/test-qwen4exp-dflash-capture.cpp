@@ -179,6 +179,14 @@ int main(int argc, char ** argv) {
         uparams.n_seq_max = 1;
         // the rollback window (n_rs_seq + 1 = 8) must fit in one ubatch
         uparams.n_ubatch  = 10;
+        int64_t projected_rows = 0;
+        uparams.cb_eval_user_data = &projected_rows;
+        uparams.cb_eval = [](ggml_tensor * t, bool ask, void * data) {
+            if (ask && std::strcmp(t->name, "result_output") == 0) {
+                *static_cast<int64_t *>(data) += t->ne[1];
+            }
+            return false;
+        };
         llama_context * uctx = llama_init_from_model(model_tgt, uparams);
         if (!uctx) fail("cannot create ubatch target context");
         llama_set_embeddings_nextn(uctx, true, false);
@@ -188,7 +196,14 @@ int main(int argc, char ** argv) {
         const std::vector<llama_pos>   pos  = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
         const std::vector<llama_seq_id> seq(toks.size(), 0);
         if (decode_tokens(uctx, toks, pos, seq, true) != 0) fail("ubatch prefill failed");
+        if (projected_rows != (int64_t) toks.size()) fail("ubatch full logits were not computed");
         check_taps_vs_nextn(uctx, "ubatch", (int) toks.size());
+
+        llama_memory_clear(llama_get_memory(uctx), false);
+        projected_rows = 0;
+        if (decode_tokens(uctx, toks, pos, seq, false) != 0) fail("ubatch prefill with last-token logits failed");
+        if (projected_rows != 1) fail("ubatch projected unrequested logits");
+        check_taps_vs_nextn(uctx, "ubatch last-token logits", (int) toks.size());
 
         llama_free(uctx);
     }
