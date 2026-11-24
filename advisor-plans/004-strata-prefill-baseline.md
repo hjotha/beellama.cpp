@@ -1200,3 +1200,34 @@ mede NLL, KL e concordância do token mais provável sobre os mesmos
 tokens de continuação. Essa medição continua pendente. Dados e
 método em `/tmp/opencode/strata-prefill-parity/dense-full-layer0-method.md`
 e `real-layer0-cuda/4070.log` no mesmo diretório.
+
+### Roteamento real da camada 0 em ub4096
+
+Um recorte de 1.508.111.008 bytes preserva os 25 tensores da camada
+0, os cinco tensores globais, o vocabulário completo, a recorrência,
+as hiperconexões e os 512 experts com seleção top-10. As camadas 1–47,
+a tabela PLE e as projeções QSA ficam fora desse modelo. A transferência
+HTTP dos tensores somou 791 MB com os três pesos MoE reaproveitados
+pelos hashes. Manifesto, hashes e smoke CPU em
+`/media/hjotha/GAMES/flash-next-q2-layer0-20261124/`.
+
+Na RTX 4070, um diagnóstico habilitou o kernel compilado para SM80
+no dispositivo SM89. Com J128, a variante interrompe as iterações MMA
+de gate/up de grupos de 16 colunas sem rotas válidas. No isolador com
+pesos reais, ativações sintéticas e 2.048 tokens, o tempo do bloco MoE
+caiu de 14,45 para 12,02 ms com roteamento enviesado e de 13,19 para
+11,24 ms com roteamento uniforme. As saídas comparadas foram idênticas
+em todas as seis combinações de tamanho e roteamento. O Nsight confirmou
+o despacho do kernel experimental no isolador.
+
+No servidor com o recorte da camada 0, pp28k, ub4096, temperatura zero,
+sem reuso de prompt, dois warmups por processo e ordem off/on/on/off,
+as seis amostras por braço deram medianas de 39.941,80 e 39.694,95 t/s
+(−0,62%). Os intervalos se sobrepuseram, e o token de saída coincidiu.
+O recorte fornece um teste do roteador real; o throughput agregado do
+Flash-Next depende das outras 47 camadas. Os seis microlotes completos
+produziram histogramas de top-10 que permitiriam eliminar 19,0–27,8%
+das colunas MMA arredondadas na camada 0. O lote final expôs apenas
+uma linha do roteador porque essa é a última camada do recorte.
+A validação fim a fim no SM80 continua pendente. Amostras e traces
+em `/tmp/opencode/strata-prefill-parity/ragged-4070/`.
