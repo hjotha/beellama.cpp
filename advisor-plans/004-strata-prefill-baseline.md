@@ -1009,3 +1009,38 @@ ub2048 do BeeLlama e 1,18× o decode da receita radix ub1024. No
 prefill com hash igual ao da Strata, a diferença foi 2,92×.
 As medições de kernel estão em
 `/tmp/opencode/qwen4exp-no-output-sm80/kernel-results.tgz`.
+
+### Down compacto com menor pressão de registradores
+
+O trace do main no Flash-Next Q2_0 identificou 1.596 ms no down
+compacto, com 256 threads, 255 registradores por thread e 56,5 KiB
+de memória compartilhada por bloco. Isso limita o kernel a um bloco
+residente por SM pelo orçamento de registradores.
+
+`GGML_CUDA_MMQ_SM80_Q2_DOWN_K_OUTER=1`, junto de
+`GGML_CUDA_MMQ_SM80_Q2_DOWN_COMPACT=1`, limita a vida útil dos
+fragmentos a um subbloco K de cada vez e visa dois blocos residentes
+por SM. A ordem de acumulação de cada elemento permanece a mesma.
+A variante mantém o tile J128 e o K completo para o down Q2_0
+640 → 2560 com 512 ou 1024 slots. O binário SM80 passou de 255
+para 128 registradores e de 48 para 8 bytes de stack por thread.
+O compilado com a nova ordem e o limite anterior de um bloco usou
+167 registradores e ficou abaixo do piso de throughput.
+
+Na A100-40G, com `-b 2048 -ub 2048`, DFlash2 n-max 5 e draft ub128,
+o prefill de 28.547 tokens subiu de **1.947,85 para 2.010,14 t/s
+(+3,20%)**. As faixas de três amostras foram 1.947,27–1.954,85 e
+2.003,87–2.020,49 t/s. Os dois braços usaram o mesmo binário Linux
+SM80 recompilado seletivamente na .57, dois warmups, temperatura
+zero, seed 42, cache de prompt desligado e até 64 tokens de saída.
+Os hashes de saída coincidiram (`de4e4381cd19`) e o pico foi
+39.378 MiB nos dois braços. Os dados foram registrados em
+`/tmp/opencode/strata-prefill-parity/strata-prefill-follow-up.json`.
+
+O fixture com 512/1024 slots e rotas reais passou nos seis casos,
+com os mesmos bytes em lançamento direto e em replay de CUDA
+Graphs. O Nsight confirmou 672 lançamentos da especialização de
+128 registradores, com os mesmos 56,5 KiB de memória compartilhada.
+O tempo somado do kernel caiu de **1.596,02 para 1.138,49 ms**
+(−28,67%). Ambos os traces usaram uma requisição de prefill de
+28.547 tokens e um token de saída, fora dos números de throughput.

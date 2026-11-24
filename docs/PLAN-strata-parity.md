@@ -521,3 +521,9 @@ Para priorizar decode e preservar o hash da Strata, use ub1024 e
 mediu **114,83 t/s** pós-4k com decode aquecido e **92,77 t/s**
 pós-28k na rodada longa.
 [Comparação das receitas](../advisor-plans/004-strata-prefill-baseline.md#receita-dflash2-n-max-5-depois-da-redução-de-workspace)
+
+No SM80, `GGML_CUDA_MMQ_SM80_Q2_DOWN_K_OUTER=1` em conjunto com
+`GGML_CUDA_MMQ_SM80_Q2_DOWN_COMPACT=1` ganhou **3,20%** em pp28k
+com DFlash2 n-max 5 e ub2048, com hash idêntico. O down compacto
+passou de 255 para 128 registradores por thread.
+[Validação e trace](../advisor-plans/004-strata-prefill-baseline.md#down-compacto-com-menor-pressão-de-registradores)

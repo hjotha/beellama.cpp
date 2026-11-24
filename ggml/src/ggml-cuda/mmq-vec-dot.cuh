@@ -138,7 +138,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
-template <ggml_type type, int J, bool fallback, mmq_q8_1_ds_layout ds_layout>
+template <ggml_type type, int J, bool fallback, mmq_q8_1_ds_layout ds_layout, bool k_outer = false>
 static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma(
     const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
 #if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
@@ -214,10 +214,52 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma(
     const float * y_df = (const float *) y;
     const half2 * y_ds = (const half2 *) y;
 
+    const int i0 = (threadIdx.y/ntx)*rows_per_warp;
+
+    if constexpr (k_outer) {
+        static_assert(type == GGML_TYPE_Q2_0 && ds_layout == MMQ_Q8_1_DS_LAYOUT_D4);
+        // Keep one K subblock's fragments live while each output accumulates in the same K order.
+#pragma unroll 1
+        for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_0) {
+            const int k0 = k00 + k01;
+            tile_A A[ntx];
+            float dA[ntx][tile_C::ne/2];
+#pragma unroll
+            for (int n = 0; n < ntx; ++n) {
+                load_ldmatrix(A[n], x_qs + (i0 + n*tile_A::I)*sram_stride + k0, sram_stride);
+#pragma unroll
+                for (int l = 0; l < tile_C::ne/2; ++l) {
+                    const int i = i0 + n*tile_A::I + tile_C::get_i(2*l);
+                    dA[n][l] = x_df[i*sram_stride + k0/QI8_0];
+                }
+            }
+
+#pragma unroll
+            for (int j0 = 0; j0 < J; j0 += ntx*tile_C::J) {
+                tile_B B;
+                float dB[tile_C::ne/2];
+                load_generic(B, y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
+#pragma unroll
+                for (int l = 0; l < tile_C::ne/2; ++l) {
+                    const int j = j0 + tile_C::get_j(l);
+                    dB[l] = y_df[j*MMQ_TILE_Y_K + k01/QI8_1];
+                }
+#pragma unroll
+                for (int n = 0; n < ntx; ++n) {
+                    tile_C C;
+                    mma(C, A[n], B);
+#pragma unroll
+                    for (int l = 0; l < tile_C::ne; ++l) {
+                        sum[(j0/tile_C::J + n)*tile_C::ne + l] += C.x[l]*dA[n][l/2]*dB[l%2];
+                    }
+                }
+            }
+        }
+        return;
+    }
+
     tile_A A[ntx][MMQ_TILE_NE_K/QI8_0];
     float dA[ntx][tile_C::ne/2][MMQ_TILE_NE_K/QI8_0];
-
-    const int i0 = (threadIdx.y/ntx)*rows_per_warp;
 
 #pragma unroll
     for (int n = 0; n < ntx; ++n) {
