@@ -409,6 +409,13 @@ LLAMA_API uint32_t llama_get_n_capture(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_capture(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_capture_ith(struct llama_context * ctx, int32_t i);
 
+// Arm the next plain, single-sequence DFlash2 prompt batch for device capture.
+LLAMA_API void llama_prepare_dflash2_prefill_capture(
+        struct llama_context * target, const struct llama_context * draft,
+        const int32_t * layers, size_t n_layers, uint32_t rows);
+LLAMA_API bool llama_decode_dflash2_prefill_capture(
+        struct llama_context * draft, struct llama_context * target, struct llama_batch batch, uint32_t first_row, int32_t * ret);
+
 //
 // dspark drafter: target-tap context window staging
 //

@@ -94,6 +94,13 @@ bool llama_batch_allocr::init(
 
     const bool has_token = n_tok_only  > 0 || n_both > 0;
     const bool has_embd  = n_embd_only > 0 || n_both > 0;
+    if (batch_inp.device_embd) {
+        if (!has_embd || has_token || has_state || !batch_inp.embd.empty()) {
+            LLAMA_LOG_ERROR("%s: device embeddings need an embedding-only batch\n", __func__);
+            return false;
+        }
+        device_embd = batch_inp.device_embd;
+    }
 
     if (mixed) {
         is_embd_vec.resize(n_tok);
@@ -230,7 +237,7 @@ bool llama_batch_allocr::init(
 
     batch.n_tokens = n_tok;
     batch.token    = has_token ? token_vec.data() : nullptr;
-    batch.embd     = has_embd  ? embd_vec.data()  : nullptr;
+    batch.embd     = has_embd && !device_embd ? embd_vec.data() : nullptr;
     batch.pos      = pos.data();
     batch.n_seq_id = n_seq_id.data();
     batch.seq_id   = seq_id.data();
@@ -834,6 +841,7 @@ void llama_batch_allocr::clear() {
     n_outputs = 0;
 
     batch = {};
+    device_embd = nullptr;
 
     token_vec   .clear();
     embd_vec    .clear();
@@ -977,6 +985,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         /*.type         =*/ mixed ? udata->type.data() : nullptr,
         /*.decision_order =*/ udata->decision_order.empty() ? nullptr : udata->decision_order.data(),
         /*.data         =*/ std::move(udata),
+        /*.device_embd  =*/ device_embd,
     };
 
     if (debug > 0) {
@@ -1192,6 +1201,7 @@ void llama_batch_ext::clear() {
     embd  .clear();
     state .clear();
     n_embd = 0;
+    device_embd = nullptr;
 }
 
 int32_t llama_batch_ext::add_token(llama_seq_id seq_id) {
@@ -1418,7 +1428,7 @@ void llama_batch_compat::init(llama_batch_ext & dst, const llama_batch & batch_i
 
     // a batch can carry both, for example the MTP hook batches
     const bool has_token = batch_inp.token != nullptr;
-    const bool has_embd  = batch_inp.embd  != nullptr;
+    const bool has_embd  = batch_inp.embd != nullptr || batch_ext->device_embd;
 
     static const llama_seq_id default_seq_id    = 0;
     static const int32_t      default_n_seq_id  = 1;
@@ -1470,8 +1480,10 @@ void llama_batch_compat::init(llama_batch_ext & dst, const llama_batch & batch_i
         } else if (has_embd) {
             t.has_embd = true;
             t.embd_off = batch_ext->embd.size();
-            const float * src = batch_inp.embd + (size_t) i * n_embd_row;
-            batch_ext->embd.insert(batch_ext->embd.end(), src, src + n_embd_row);
+            if (!batch_ext->device_embd) {
+                const float * src = batch_inp.embd + (size_t) i * n_embd_row;
+                batch_ext->embd.insert(batch_ext->embd.end(), src, src + n_embd_row);
+            }
             batch_ext->n_embd = n_embd_row;
         }
 

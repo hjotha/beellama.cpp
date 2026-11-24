@@ -1044,3 +1044,52 @@ Graphs. O Nsight confirmou 672 lançamentos da especialização de
 O tempo somado do kernel caiu de **1.596,02 para 1.138,49 ms**
 (−28,67%). Ambos os traces usaram uma requisição de prefill de
 28.547 tokens e um token de saída, fora dos números de throughput.
+
+### Captura DFlash2 no mesmo dispositivo CUDA
+
+O perfil de pp28k a ub2048 registrou 11,636 s nos grafos alvo.
+Os experts e as projeções densas somaram 67,5% do tempo CUDA
+instrumentado. Uma captura Nsight separada registrou 3,214 s
+de lacunas entre atividades da GPU. Cerca de 1,695 s dessas
+lacunas precediam cópias H2D de 6.553.600 bytes, tamanho de um
+microlote de 128 linhas com cinco taps de largura 2.560.
+
+`LLAMA_DFLASH2_PREFILL_D2D=1` mantém os taps no mesmo dispositivo
+CUDA no prefill local Qwen4Exp DFlash2 com um slot. O drafter
+continua usando 128 linhas por microlote. O buffer de captura
+mantém os dados válidos até as cópias e a preparação do próximo
+grafo. O modo opt-in preserva o caminho host quando o lote ou a
+configuração não qualifica, ou quando a alocação de staging
+comprometeria 512 MiB de espaço livre para o scratch CUDA.
+
+Na A100-40G, a comparação usou o mesmo executável e os mesmos
+pesos Q2_0 e DFlash2, n-max 5, `-b` igual a `-ub`,
+`-ncmoe 2 --moe-cache-mib 2048`, KV Q8_0 e um slot. Os 28.547
+IDs de prompt foram fixados, com temperatura zero, seed 42, até
+64 tokens de saída, sem cache de prompt, dois warmups e três
+amostras por braço.
+
+| Microlote alvo | Prefill host | Prefill D2D | Pico de VRAM host → D2D |
+|---|---:|---:|---:|
+| 2.048 | 1.946,33 t/s | 2.237,59 t/s (+14,96%) | 39.378 → 39.478 MiB |
+| 3.072 | 2.032,80 t/s | 2.343,65 t/s (+15,29%) | 39.872 → 40.022 MiB |
+| 4.096 | 2.112,66 t/s | 2.111,00 t/s (fallback host) | 40.368 → 40.368 MiB |
+
+Os hashes de saída coincidiram em cada geometria. A 3.072, as
+faixas de host e D2D foram 2.032,40–2.039,41 e 2.342,30–2.349,68 t/s.
+A primeira versão sem checagem de headroom sofreu OOM no pool
+VMM com staging a ub4096. A versão com checagem passou nas três
+rodadas dessa geometria com o pico do controle.
+
+Em uma passagem de Nsight a ub2048, 222 cópias do tamanho de
+um microlote do drafter passaram de H2D para D2D. O fixture com
+dois taps distintos comparou o estado KV do drafter byte a byte
+e passou na A100 e na 4070. Ele cobre fatias de 48+48+32 linhas,
+leitura host sob demanda e rejeição de offsets inválidos.
+
+A referência nova da Strata na mesma VM foi **4.932,87 t/s**
+(4.932,02–4.933,21 t/s), com os mesmos pesos e IDs de entrada
+e o drafter pareado. O prefill do BeeLlama a ub3072 com D2D
+atingiu 47,5% desse throughput. O ganho do D2D usa hashes iguais
+entre seus próprios braços. Dados brutos e capturas em
+`/tmp/opencode/strata-prefill-parity/`.

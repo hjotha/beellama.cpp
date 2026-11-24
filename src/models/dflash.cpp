@@ -1298,7 +1298,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     };
 
     // KV cache injection
-    if (ubatch.embd && !ubatch.token) {
+    if ((ubatch.embd || ubatch.device_embd) && !ubatch.token) {
         // DFly ships one fused context per draft layer, so the incoming row is n_layer wide
         const bool    is_dfly      = model.dfly_layer_fusion != nullptr;
         const int64_t n_embd_batch = is_dfly ? (int64_t) hparams.n_embd_out() : (int64_t) hparams.n_embd_inp_enc();
@@ -1309,6 +1309,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         ggml_set_input(inp->embd);
 
         ggml_tensor * inp_target = inp->embd;
+        res->t_inp_dflash_features = inp_target;
         cb(inp_target, "inp_target_features", -1);
 
         res->add_input(std::move(inp));

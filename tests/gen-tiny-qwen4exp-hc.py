@@ -17,9 +17,10 @@ synthetic `test` vocab shared with the target. It deliberately has no token
 embeddings or lm head: DFlash borrows both from the target through `ctx_other`.
 
 Usage:
-    python3 tests/gen-tiny-qwen4exp-hc.py <out_dir>
+    python3 tests/gen-tiny-qwen4exp-hc.py <out_dir> [--d2d]
 
 Writes <out_dir>/qwen4exp-hc-target.gguf and <out_dir>/dflash2-draft.gguf.
+With --d2d, also writes a drafter that taps layers [1, 0] for CUDA coverage.
 """
 
 import sys
@@ -211,7 +212,7 @@ def gen_target(path: Path) -> None:
     print(f"wrote {path} (target: n_embd={N_EMBD}, hc={HC}, n_layer={N_LAYER})")
 
 
-def gen_draft(path: Path) -> None:
+def gen_draft(path: Path, target_layers: tuple[int, ...] = (1,)) -> None:
     w = gguf.GGUFWriter(path, "dflash")
     w.add_name("tiny-dflash2-qwen4exp")
     add_vocab(w)
@@ -239,15 +240,15 @@ def gen_draft(path: Path) -> None:
     w.add_conv_group_size(DRAFT_CONV_GROUP)
     w.add_selector_rank(DRAFT_RANK)
     w.add_selector_top_k(DRAFT_TOP_K)
-    # the runtime taps the layer INPUT: HF layer 0's completed output
-    w.add_target_layers([1])
+    # the runtime taps layer inputs, so index 1 captures layer 0's completed output
+    w.add_target_layers(list(target_layers))
 
     rng = np.random.default_rng(20261122)
 
     def t(name: str, shape: tuple[int, ...], scale: float = 0.05) -> None:
         w.add_tensor(name, (scale * rng.standard_normal(shape)).astype(np.float32))
 
-    n_feat = 1
+    n_feat = len(target_layers)
     t("fc.weight", (N_EMBD, n_feat * N_EMBD))
     t("enc.output_norm.weight", (N_EMBD,))
     t("output_norm.weight", (N_EMBD,))
@@ -277,16 +278,18 @@ def gen_draft(path: Path) -> None:
     w.write_tensors_to_file()
     w.close()
     print(f"wrote {path} (draft: n_embd={N_EMBD}, n_layer={DRAFT_N_LAYER}, "
-          f"block={DRAFT_BLOCK}, target_layers=[1])")
+          f"block={DRAFT_BLOCK}, target_layers={list(target_layers)})")
 
 
 def main() -> None:
-    if len(sys.argv) != 2:
-        raise SystemExit(f"usage: {sys.argv[0]} <out_dir>")
+    if len(sys.argv) != 2 and sys.argv[2:] != ["--d2d"]:
+        raise SystemExit(f"usage: {sys.argv[0]} <out_dir> [--d2d]")
     out = Path(sys.argv[1])
     out.mkdir(parents=True, exist_ok=True)
     gen_target(out / "qwen4exp-hc-target.gguf")
     gen_draft(out / "dflash2-draft.gguf")
+    if len(sys.argv) == 3:
+        gen_draft(out / "dflash2-d2d-draft.gguf", (1, 0))
 
 
 if __name__ == "__main__":

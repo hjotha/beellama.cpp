@@ -527,3 +527,10 @@ No SM80, `GGML_CUDA_MMQ_SM80_Q2_DOWN_K_OUTER=1` em conjunto com
 com DFlash2 n-max 5 e ub2048, com hash idêntico. O down compacto
 passou de 255 para 128 registradores por thread.
 [Validação e trace](../advisor-plans/004-strata-prefill-baseline.md#down-compacto-com-menor-pressão-de-registradores)
+
+`LLAMA_DFLASH2_PREFILL_D2D=1` no mesmo dispositivo CUDA ganhou
+**14,96%** em ub2048 e **15,29%** em ub3072, com hashes iguais
+em cada A/B. O pico para o braço ub3072 foi **40.022 MiB** e o
+prefill chegou a **2.343,65 t/s**. A checagem de memória manteve
+o caminho host no teste de ub4096, com o mesmo pico do controle.
+[Validação D2D](../advisor-plans/004-strata-prefill-baseline.md#captura-dflash2-no-mesmo-dispositivo-cuda)

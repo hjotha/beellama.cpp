@@ -3684,6 +3684,25 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+static bool ggml_backend_cuda_copy_dflash_tap(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, size_t offset) {
+    if (!ggml_backend_is_cuda(backend) || src->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(src) || !ggml_is_contiguous(dst) || src->ne[1] > dst->ne[1] ||
+            !ggml_backend_buffer_is_cuda(src->buffer) || !ggml_backend_buffer_is_cuda(dst->buffer)) {
+        return false;
+    }
+    auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+    if (src->buffer->buft != ggml_backend_cuda_buffer_type(cuda_ctx->device) ||
+            dst->buffer->buft != src->buffer->buft || offset + src->nb[1] > dst->nb[1]) {
+        return false;
+    }
+    ggml_cuda_set_device(cuda_ctx->device);
+    CUDA_CHECK(cudaMemcpy2DAsync(static_cast<char *>(dst->data) + offset, dst->nb[1],
+                src->data, src->nb[1], src->nb[1], src->ne[1], cudaMemcpyDeviceToDevice, cuda_ctx->stream()));
+    return true;
+}
+#endif
+
 static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
     ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
     ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
@@ -9024,6 +9043,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
         return (void *) ggml_backend_cuda_set_graph_min_stable_calls;
     }
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (strcmp(name, "ggml_backend_cuda_copy_dflash_tap_v1") == 0) {
+        return (void *)ggml_backend_cuda_copy_dflash_tap;
+    }
     if (strcmp(name, "ggml_backend_cuda_moe_upload") == 0) {
         return (void *) ggml_backend_cuda_moe_upload;
     }

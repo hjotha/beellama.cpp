@@ -3197,6 +3197,30 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
                 const auto capture_start = std::chrono::steady_clock::now();
 
+                batch_inject.n_tokens = n_chunk;
+                for (int32_t i = 0; i < n_chunk; ++i) {
+                    const llama_pos p = batch_in.tokens[i_batch_beg[seq_id] + offset + i].pos[0];
+                    batch_inject.pos[i] = p;
+                    if (is_mrope) {
+                        batch_inject.pos[1 * n_chunk + i] = p;
+                        batch_inject.pos[2 * n_chunk + i] = p;
+                        batch_inject.pos[3 * n_chunk + i] = 0;
+                    }
+                    batch_inject.n_seq_id[i]  = 1;
+                    batch_inject.seq_id[i][0] = seq_id;
+                    batch_inject.logits[i]    = local_split;
+                }
+                if (is_dflash2 && !local_split && !remote && !is_lilicorr && n_rows == n_tokens) {
+                    int32_t rc = 0;
+                    if (llama_decode_dflash2_prefill_capture(ctx_dft, ctx_tgt, batch_inject, uint32_t(offset), &rc)) {
+                        if (rc != 0) {
+                            LOG_ERR("%s: device DFlash2 prefill failed rc=%d\n", __func__, rc);
+                            return false;
+                        }
+                        continue;
+                    }
+                }
+
                 // gather target features per extract layer; the fused decode encodes and
                 // injects them into the K/V cache at the target positions
                 features_buf.resize((size_t) n_chunk * n_embd_enc);
@@ -3211,21 +3235,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
                     }
                 }
-
-                batch_inject.n_tokens = n_chunk;
                 std::memcpy(batch_inject.embd, features_buf.data(), features_buf.size() * sizeof(float));
-                for (int32_t i = 0; i < n_chunk; ++i) {
-                    const llama_pos p = batch_in.tokens[i_batch_beg[seq_id] + offset + i].pos[0];
-                    batch_inject.pos[i] = p;
-                    if (is_mrope) {
-                        batch_inject.pos[1 * n_chunk + i] = p;
-                        batch_inject.pos[2 * n_chunk + i] = p;
-                        batch_inject.pos[3 * n_chunk + i] = 0;
-                    }
-                    batch_inject.n_seq_id[i]  = 1;
-                    batch_inject.seq_id[i][0] = seq_id;
-                    batch_inject.logits[i]    = local_split;
-                }
                 if (local_split) {
                     bool pipeline_active = local_pipeline_active();
                     if (local_prefetch && local_draft_pending && local_next_candidate.score >= 0.05f &&
@@ -6739,6 +6749,28 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
         spec->shadow->begin(seq_id, prompt);
         spec->shadow->n_call_begin++;
     }
+}
+
+void common_speculative_prepare_dflash2_prefill(common_speculative * spec, const common_batch & batch) {
+    static const bool enabled = [] {
+        const char * value = std::getenv("LLAMA_DFLASH2_PREFILL_D2D");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    if (!enabled || !spec || spec->shadow || spec->impls.size() != 1 || batch.size() < 128 ||
+            spec->impls[0]->type != COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || !batch.has_token() || batch.has_embd()) {
+        return;
+    }
+    auto * impl = static_cast<common_speculative_impl_draft_dflash *>(spec->impls[0].get());
+    if (!impl->is_dflash2 || impl->local_split || impl->is_lilicorr || impl->remote || impl->n_seq != 1) {
+        return;
+    }
+    for (const auto & entry : batch.tokens) {
+        if (entry.seq_id != 0 || !entry.seq_ids_extra.empty()) {
+            return;
+        }
+    }
+    llama_prepare_dflash2_prefill_capture(impl->params.ctx_tgt, impl->params.ctx_dft, impl->target_layer_ids,
+            impl->target_layer_ids_n, batch.size());
 }
 
 bool common_speculative_process(common_speculative * spec, const common_batch & batch) {
