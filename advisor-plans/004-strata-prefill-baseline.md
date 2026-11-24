@@ -1473,3 +1473,31 @@ O teste de transições usou o código experimental `eacaac410` e
 está em `slice4-native/bounds-1795531092/transition-{0,1}.{log,bin}`
 sob a mesma raiz. A comparação das 48 camadas com DFlash2 na A100
 continua necessária antes de promover a fusão roteada.
+
+#### Checkpoints na medição histórica da A100
+
+No trace da receita de 2.597,40 t/s, o servidor manteve os checkpoints
+de contexto padrão mesmo com `cache_prompt=false`. O log registra
+cinco snapshots de 152,619 MiB nas posições de prefixo 8.192, 16.384,
+24.451, 24.576 e 28.543. Os intervalos entre decisão e confirmação
+foram 118,27, 118,87, 118,08, 120,66 e 121,16 ms, totalizando
+**597,05 ms** e **763,10 MiB** de estado. Isso é tempo observado em
+uma execução instrumentada do modelo inteiro; o efeito de desativar
+os snapshots sobre a mediana de prefill ainda requer A/B.
+
+Entre o primeiro e o último kernel, o SQLite registra 105,19 ms de
+cópias host→GPU, 106,29 ms GPU→host e 7,79 ms GPU→GPU. Dos 1.435,23 ms
+sem atividade CUDA registrada, 1.323,20 ms já tinham decorrido antes
+da entrada na API CUDA associada à atividade seguinte. Essa conta usa
+o identificador de correlação das chamadas e inclui esperas na CPU.
+Os totais de transferência, espera e snapshot têm sobreposição.
+O início do intervalo exclui o carregamento inicial dos pesos. Fonte:
+`prefill-d2d-reviewed-1-nsys-4096-1.{log,sqlite}` em
+`/tmp/opencode/strata-prefill-parity/`.
+
+O protocolo pareado preparado para a próxima A100 preserva a receita
+histórica como controle e acrescenta uma comparação com
+`--ctx-checkpoints 0` no BeeLlama e `ckpt=0` na Strata. São cinco
+propostas DFlash2 em ambos (janela seis com âncora na Strata), 28.547
+IDs, dois aquecimentos completos, três pedidos medidos e 64 tokens de
+saída. Cada hardware de 40 ou 80 GB recebe sua própria medição Strata.
