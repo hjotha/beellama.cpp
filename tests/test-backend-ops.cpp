@@ -20,6 +20,7 @@
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
 #include "arg.h"
+#include "../ggml/src/ggml-prefill-reference.h"
 
 #include <algorithm>
 #include <atomic>
@@ -5360,19 +5361,21 @@ struct test_gated_delta_net_cache_fusion : public test_case {
     const int64_t K; // snapshot slot count (>1)
     const bool rows_mode;
     const bool raw_gates;
+    const bool full_snapshots;
 
     ggml_tensor * cpy_node = nullptr;
     ggml_tensor * cache_check = nullptr;
 
     std::string vars() override {
-        return VARS_TO_STR8(type, head_count, head_size, n_seq_tokens, n_seqs, K, rows_mode, raw_gates);
+        return VARS_TO_STR8(type, head_count, head_size, n_seq_tokens, n_seqs, K, rows_mode, raw_gates) +
+                (full_snapshots ? ",full_snapshots=1" : "");
     }
 
     test_gated_delta_net_cache_fusion(ggml_type type = GGML_TYPE_F32,
             int64_t head_count = 4, int64_t head_size = 32, int64_t n_seq_tokens = 2, int64_t n_seqs = 1,
-            int64_t K = 2, bool rows_mode = false, bool raw_gates = false)
+            int64_t K = 2, bool rows_mode = false, bool raw_gates = false, bool full_snapshots = false)
         : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), K(K),
-          rows_mode(rows_mode), raw_gates(raw_gates) {}
+          rows_mode(rows_mode), raw_gates(raw_gates), full_snapshots(full_snapshots) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t S_v = head_size;
@@ -5411,6 +5414,9 @@ struct test_gated_delta_net_cache_fusion : public test_case {
             ggml_gated_delta_net_set_raw_gates(gdn_out, dt_bias, a);
         }
         ggml_set_name(gdn_out, "gdn_out");
+        if (full_snapshots) {
+            ggml_prefill_reference_set(gdn_out, GGML_PREFILL_REFERENCE_GDN_FULL_SNAPSHOTS);
+        }
 
         // attn scores view (first part of the gdn output)
         ggml_tensor * attn = ggml_view_4d(ctx, gdn_out,
@@ -14134,6 +14140,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 133, 1, 7));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 134, 1, 7));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 512, 1, 7));
+    // A partial final tile must retain snapshots from the preceding tile.
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 131, 1, 8, false, false, true));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 899, 1, 8, false, false, true));
     // Fused cache: both K > T and K < T, with RAW and rows together.
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 128,   1, 2, 7, true, true));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 128,   8, 1, 7, false, true));

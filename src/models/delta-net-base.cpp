@@ -2,6 +2,7 @@
 
 #include "llama-impl.h"
 #include "llama-memory-recurrent.h"
+#include "../../ggml/src/ggml-prefill-reference.h"
 
 // utility to get one slice from the third dimension
 // input dim:  [x, y, c, b]
@@ -620,6 +621,9 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     }
     if (raw) {
         ggml_gated_delta_net_set_raw_gates(gdn_out, gdn_raw_dt_bias, gdn_raw_a);
+    }
+    if (arch == LLM_ARCH_QWEN4EXP && n_seqs == 1 && n_seq_tokens >= 64) {
+        ggml_prefill_reference_set(gdn_out, GGML_PREFILL_REFERENCE_GDN_FULL_SNAPSHOTS);
     }
     if (n_seq_tokens > 1) {
         res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});

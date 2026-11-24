@@ -477,6 +477,8 @@ static void ggml_cuda_op_gated_delta_net_impl(
         return 2;
     }();
     const int64_t max_prefix = n_tokens - (K - 1);
+    const auto reference_plan = ggml_prefill_reference_get(dst);
+    const bool full_prefill_snapshots = reference_plan == GGML_PREFILL_REFERENCE_GDN_FULL_SNAPSHOTS && K <= 16;
     const int64_t prefix = prefix_mma_mode == 2 ? (max_prefix / 16) * 16 : max_prefix;
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     const bool cc_ok = (cc == GGML_CUDA_CC_ADA_LOVELACE ||
@@ -485,7 +487,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
                         cc == GGML_CUDA_CC_HOPPER ||
                         cc == GGML_CUDA_CC_BLACKWELL);
     if (prefix_mma_mode && !raw && !kda && src_rows == nullptr && n_seqs == 1 &&
-        S_v == 128 && H > 0 && K > 1 && n_tokens >= K && prefix >= 64 &&
+        S_v == 128 && H > 0 && K > 1 && n_tokens >= K && (full_prefill_snapshots || prefix >= 64) &&
         cc_ok &&
         state_slot_stride > 0) {
         const size_t max = std::numeric_limits<size_t>::max();
@@ -510,7 +512,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
             if (ggml_cuda_gdn_prefix_slot_guard(uintptr_t(state_d), stride_bytes, state_bytes,
                     size_t(K), forbidden, sizeof(forbidden)/sizeof(forbidden[0]), boundary)) {
                 // Keep the same scalar/MMA boundaries as the two aligned reference blocks.
-                if (ggml_prefill_reference_get(dst) == GGML_PREFILL_REFERENCE_SHIFTED &&
+                if (reference_plan == GGML_PREFILL_REFERENCE_SHIFTED &&
                         n_tokens == 256 && K <= 16) {
                     const int64_t first_prefix = ((128 - (K - 1))/16)*16;
                     bool slots_safe = first_prefix >= 64;
@@ -553,8 +555,9 @@ static void ggml_cuda_op_gated_delta_net_impl(
                         }
                     }
                 }
-                // Reuse the last MMA tile to write the retained intermediate states.
-                if (ggml_prefill_reference_get(dst) == GGML_PREFILL_REFERENCE_FIRST && n_tokens == 128 && K > 1 && K <= 16) {
+                // Full-window MMA keeps the same outputs as the path without rollback slots.
+                if ((full_prefill_snapshots ||
+                        (reference_plan == GGML_PREFILL_REFERENCE_FIRST && n_tokens == 128)) && K <= 16) {
                     bool slots_safe = true;
                     for (int j = 1; j < K; ++j) {
                         uintptr_t checked = 0;
@@ -567,7 +570,14 @@ static void ggml_cuda_op_gated_delta_net_impl(
                         reference.state_out = state_d;
                         reference.reference_snapshots = K;
                         reference.reference_slot_stride = state_slot_stride;
-                        if (ggml_cuda_gdn_mma_launch(ctx.device, reference, stream)) return;
+                        if (ggml_cuda_gdn_mma_launch(ctx.device, reference, stream)) {
+                            static std::atomic_flag logged = ATOMIC_FLAG_INIT;
+                            if (full_prefill_snapshots && !logged.test_and_set(std::memory_order_relaxed)) {
+                                GGML_LOG_INFO("%s: full prefill MMA with snapshots (tokens=%lld K=%d)\n",
+                                              __func__, (long long) n_tokens, K);
+                            }
+                            return;
+                        }
                     }
                 }
                 const int64_t suffix = n_tokens - prefix;
