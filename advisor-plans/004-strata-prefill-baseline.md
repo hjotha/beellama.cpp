@@ -629,5 +629,118 @@ usaram seus formatos de KV nativos, sem reuso de prompt e sem draft.
 
 Valores em t/s. O pico foi 38.904 MiB no BeeLlama e 37.334 MiB na
 Strata. Os 87,3–88,0 t/s históricos do BeeLlama em decode pós-28k
-usaram DFlash2 na A100-40G. A combinação de grade compacta e DFlash2
-ainda precisa de um A/B com `-ub 1024`.
+usaram DFlash2 na A100-40G. A medição pareada de DFlash2 está abaixo.
+
+## Comparação com DFlash2 na A100 Standard
+
+O alvo foi o Flash-Next Q2_0 dos mesmos dois shards, com SHA-256
+conferidos e contexto de 32.768. O drafter veio de
+`incoai/Qwen3.8-Flash-Next-DFlash2`, revisão
+`a22a1744e85c17364dcc54a6a420af7135d4c7f6`. Os 81 tensores do
+drafter têm bytes idênticos no DF2P da Strata e no GGUF do
+BeeLlama, com matrizes Q8_0, codebooks BF16 e vetores F32.
+
+O limite pareado foi de sete propostas. A Strata usa `--spec 8
+--draft-cap 8` porque a janela inclui o token âncora. O BeeLlama
+usa `--spec-draft-n-max 7`. O braço adicional com `n-max 8`
+mantém a configuração histórica do BeeLlama como referência.
+Os dois engines usam greedy, uma sequência, sem lookup de sufixo,
+MTP ou reuso de prompt. O limite de saída é 16 tokens no prompt
+curto e 64 nos demais. Mantivemos os formatos de KV nativos e as
+geometrias de prefill das respectivas receitas. As amostras brutas
+e os hashes ficam em `/tmp/opencode/dflash-paired-24/`.
+
+BeeLlama `6ee5d6518` com a biblioteca CUDA recompilada seletivamente
+e Strata v0.2.20 rodaram na mesma A100-SXM4-40GB. O Bee usou
+`-b 2048 -ub 1024 -ncmoe 2 --moe-cache-mib 2048`, KV Q8_0/Q8_0,
+GLU e SHARED_Q8. A Strata usou `--prefill auto --expert-cache auto
+--ple-io ram --kv int8`. Houve dois warmups curtos e três execuções
+por caso. Cada amostra longa emitiu 64 tokens.
+
+| Configuração | Prefill 4k | Decode pós-4k | Prefill 28k | Decode pós-28k | Aceitação pós-28k | Pico (MiB) |
+|---|---:|---:|---:|---:|---:|---:|
+| BeeLlama, sem draft | 1.674,70 | 45,48 | 1.641,54 | 44,55 | — | 37.838 |
+| BeeLlama, 7 propostas | 1.435,50 | 89,40 | 1.430,28 | 76,10 | 47,52% | 39.738 |
+| BeeLlama, 7 propostas e grade compacta | 1.511,29 | 89,59 | 1.523,06 | 75,81 | 47,52% | 39.738 |
+| BeeLlama, `n-max 8` e grade compacta | 1.504,47 | 88,03 | 1.517,90 | 75,04 | 47,52% | 39.852 |
+| BeeLlama, 7 propostas, grade compacta e `-b/-ub 1536` | 1.678,46 | 87,56 | 1.643,43 | 67,12 | 41,44% | 40.298 |
+| Strata, sem draft | 3.720,35 | 90,21 | 4.959,87 | 88,96 | — | 37.334 |
+| Strata, 7 propostas | 3.651,93 | 124,41 | 4.943,72 | 109,70 | 35,71% | 38.550 |
+
+Throughput em t/s, mediana. A grade compacta ganhou 6,49% em prefill
+de 28k no BeeLlama com DFlash2, manteve o pico e o hash nos três
+casos e variou −0,38% no decode pós-28k. As faixas de prefill foram
+1.414,02–1.434,24 e 1.502,01–1.523,33 t/s. A Strata fez 3,25× o
+prefill e 1,45× o decode pós-28k frente à grade compacta. As saídas
+entre engines coincidiram no caso curto e em 4k, e divergiram em 28k.
+Em 28k, a Strata aceitou 45 de 126 propostas por amostra e o BeeLlama
+48 de 101. A primeira amostra longa de cada processo apresentou
+decode mais lento que as duas seguintes.
+
+O log do BeeLlama confirma que `n-max 8` foi reduzido para sete
+propostas pelo bloco treinado de oito posições. O processo ainda
+reservou 114 MiB adicionais. A Strata confirmou DFlash2 ativo,
+janelas de até oito posições e MTP ausente.
+
+O BeeLlama com `-b 1536 -ub 1536` ganhou 7,90% de prefill 28k
+sobre a grade compacta com `-ub 1024`, caiu 11,46% no decode e
+mudou o hash em 28k. O orçamento de 40.960 MiB comportou a execução.
+O perfil de referência com DFlash2 mantém `-ub 1024`.
+
+Em 28k, ambos os controles sem draft e a Strata com DFlash2
+produziram o mesmo hash. O BeeLlama com DFlash2 produziu outra
+sequência greedy nessa geometria, com o mesmo hash ao ligar ou
+desligar a grade compacta. Priorizar a localização do primeiro token
+divergente no Bee com 64 tokens, primeiro com a mesma geometria e
+`n-max 7`, preservando os IDs e os top-2 logits do verificador.
+Em uma passagem instrumentada, cronometrar drafter, forward alvo,
+aceitação, rollback e sincronizações por janela. A taxa de aceitação
+observada por si só não explica a vantagem no decode da Strata.
+
+### Correção do prefill GDN com snapshots
+
+Os cinco primeiros IDs de 28k coincidiram. No sexto, o decode
+sem draft usou `421` e o DFlash2 usou `1510`. O contexto DFlash2
+com `p_min=1` reproduziu o segundo hash com zero propostas. Um
+probe CUDA com a mesma entrada e os mesmos cinco tokens iniciais
+isolou a inversão ao passar de zero para sete posições de rollback.
+Ativar os taps do DFlash2 no mesmo contexto preservou os logits do
+probe. No sexto token, o caso serial sem snapshots deu 20,477304
+para `421` e 20,412796 para `1510`. Com snapshots, deu
+20,641193 e 20,648544, respectivamente.
+
+O prefill GDN sem snapshots processava o ubatch inteiro por MMA.
+Com snapshots, um ubatch de 1.024 tokens processava 1.008 por MMA
+e a cauda de 16 pela recorrência escalar. A correção marca o prefill
+elegível do Qwen4Exp, usa MMA em todo o ubatch e grava o estado dos
+últimos tokens dentro dos tiles MMA correspondentes. O caminho
+qualificado exige uma sequência e preserva os guards de spans do
+backend. A gravação cobre a posição em que a cauda cruza dois tiles.
+
+No fixture direto da A100-40G, os tamanhos 128, 131, 137, 899 e 1.024,
+com oito slots, tiveram atenção e estado final byte a byte iguais ao
+MMA sem snapshots. Cada snapshot coincidiu com o estado final da
+execução MMA que termina naquela posição (NMSE zero). O A/B de
+diagnóstico restaurou o hash sem draft nos três prompts, com a grade
+compacta e DFlash2 ativos.
+
+A versão final seleciona o caminho por metadado do grafo Qwen4Exp,
+sem a flag de diagnóstico. As três repetições em cada prompt
+curto, 4k e 28k passaram com seis e sete propostas, com os hashes
+dos controles sem draft. Em 28k, o hash também é o da Strata com
+DFlash2. O `test-backend-ops test -b CUDA0 -o GATED_DELTA_NET_CACHE_FUSION`
+passou 16/16, incluindo as geometrias novas de 131 e 899 tokens.
+
+| BeeLlama corrigido | Prefill 28k | Decode pós-4k | Decode pós-28k | Pico (MiB) |
+|---|---:|---:|---:|---:|
+| Sem draft | 1.644,86 | 45,12 | 44,48 | 37.838 |
+| DFlash2, sete propostas | 1.517,25 | 83,82 | 70,91 | 39.738 |
+| DFlash2, seis propostas | 1.530,72 | 78,39 | 75,31 | 39.624 |
+
+Seis propostas ganharam 6,2% no decode pós-28k e economizaram
+114 MiB frente a sete. Em 4k, sete continuaram mais rápidas. Com
+saída igual em 28k, a Strata ficou 1,46× à frente dos 75,31 t/s.
+A medição usou reconstrução seletiva das bibliotecas CUDA e llama
+no chroot da .57. Dados em
+`/tmp/opencode/dflash-paired-24/gdn-default-summary.json` e
+`gdn-default-results.tgz`.
