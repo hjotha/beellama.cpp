@@ -1406,3 +1406,15 @@ Os nomes genéricos dos kernels não permitem atribuir todo o tempo a
 camadas. O experimento não estabelece o ganho no modelo de 48 camadas.
 Os nomes, contagens, configurações, hashes e traces SQLite estão em
 `/tmp/opencode/strata-prefill-parity/slice4-nsys/live-1795530891/`.
+
+O A/B seguinte manteve as linhas Q3_K compactas nos dois braços e
+variou apenas `LLAMA_QSA_INDEXER_BOUNDS`. O controle transporta a
+máscara densa FP16; o candidato transporta dois limites I32 por token.
+Na 4070, seis amostras por braço deram medianas de **17.280,85** e
+**18.333,19 t/s**. O controle variou de 17.184,11 a 17.296,13 t/s.
+Cinco amostras do candidato ficaram entre 18.286,80 e 18.376,00 t/s,
+e uma caiu para 1.295,97 t/s. Todos os pedidos geraram 56553; o arquivo
+de logits teacher-forced foi idêntico nos dois braços. O ganho local
+ainda precisa de confirmação sem a amostra lenta e de medição com a
+receita atual no modelo completo. Dados em
+`/tmp/opencode/strata-prefill-parity/slice4-native/bounds-1795531092/`.
