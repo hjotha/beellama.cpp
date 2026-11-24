@@ -1174,3 +1174,29 @@ A variante de ub2048 que troca o tile de ambos os kernels atingiu
 2.036,38 t/s frente a 2.006,19 t/s com K-outer, +1,50% sobre a
 opção já integrada. O arquivo de amostras e traces da sessão
 é `/tmp/opencode/strata-prefill-parity/parity-a100-drained.tgz`.
+
+### Precisão da projeção densa na primeira camada
+
+O A/B de cuBLAS já medido na A100 ganhou 6,02% em pp28k e mudou
+a saída greedy. Para localizar a diferença aritmética, usamos a matriz
+IQ4_XS real de QKV da camada 0 (10.240 linhas de largura 2.560) e
+os primeiros 96 IDs do prompt pareado. Os pesos vieram do GGUF fixado.
+As entradas foram reconstruídas pelo grafo CPU de embeddings e
+hiperconexões. A primeira camada com PLE nesse modelo é a camada 1.
+
+Na RTX 4070, repetimos as entradas até completar um lote de 512 e
+comparamos os 983.040 valores das 96 posições originais com o
+produto FP32 dos pesos desquantizados e dessas mesmas entradas.
+Todos os valores foram finitos.
+
+| Cálculo na GPU | Erro RMS relativo | Erro absoluto máximo |
+|---|---:|---:|
+| MMQ de produção, IQ4_XS com ativações Q8_1 | 0,182267% | 0,0369883 |
+| cuBLAS com operandos FP16, saída e acumulação FP32 | 0,011761% | 0,00569344 |
+
+A projeção cuBLAS teve erro RMS relativo 15,5× menor nesse recorte.
+Para avaliar a qualidade do modelo completo, o protocolo preparado
+mede NLL, KL e concordância do token mais provável sobre os mesmos
+tokens de continuação. Essa medição continua pendente. Dados e
+método em `/tmp/opencode/strata-prefill-parity/dense-full-layer0-method.md`
+e `real-layer0-cuda/4070.log` no mesmo diretório.
