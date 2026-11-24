@@ -13,6 +13,14 @@
 #include <unordered_map>
 #include <unordered_set>
 
+struct llama_batch_device_embd {
+    ggml_backend_t backend = nullptr;
+    ggml_tensor * tensor = nullptr;
+    ggml_backend_event_t ready = nullptr;
+    ggml_backend_event_t copied = nullptr;
+    uint32_t first_row = 0;
+};
+
 // keep this struct lightweight
 struct llama_ubatch {
     bool equal_seqs() const {
@@ -80,6 +88,7 @@ struct llama_ubatch {
 
     // the llama_ubatch pointers above point to this data if set. otherwise - point to external non-owning data
     std::shared_ptr<data_t> data;
+    const llama_batch_device_embd * device_embd = nullptr;
 };
 
 // crash if a mixed ubatch reaches code that expects only tokens or only embd
@@ -122,6 +131,7 @@ struct llama_batch_ext {
     std::vector<token> tokens;
     std::vector<float> embd;
     std::vector<float> state;
+    const llama_batch_device_embd * device_embd = nullptr;
 
     llama_batch_ext(llama_context * ctx);
 
@@ -257,6 +267,7 @@ private:
 
     // used[i] indicates if token i has already been used in a previous ubatch
     std::vector<bool> used;
+    const llama_batch_device_embd * device_embd = nullptr;
 
     int debug;
 };

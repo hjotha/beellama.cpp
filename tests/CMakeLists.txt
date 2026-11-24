@@ -522,10 +522,14 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     if (Python3_Interpreter_FOUND)
         set(QWEN4EXP_DFLASH_FIXTURE_DIR "${CMAKE_CURRENT_BINARY_DIR}/qwen4exp-dflash-fixture")
         file(MAKE_DIRECTORY "${QWEN4EXP_DFLASH_FIXTURE_DIR}")
+        set(QWEN4EXP_DFLASH_FIXTURE_ARGS)
+        if (GGML_CUDA)
+            list(APPEND QWEN4EXP_DFLASH_FIXTURE_ARGS --d2d)
+        endif()
         add_test(
             NAME generate-qwen4exp-dflash-fixture
             COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/gen-tiny-qwen4exp-hc.py
-                "${QWEN4EXP_DFLASH_FIXTURE_DIR}")
+                "${QWEN4EXP_DFLASH_FIXTURE_DIR}" ${QWEN4EXP_DFLASH_FIXTURE_ARGS})
         set_tests_properties(generate-qwen4exp-dflash-fixture PROPERTIES
             LABELS "main model"
             ENVIRONMENT "PYTHONPATH=${PROJECT_SOURCE_DIR}/gguf-py"
@@ -536,6 +540,15 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         target_include_directories(test-qwen4exp-dflash-capture PRIVATE ${PROJECT_SOURCE_DIR}/src)
         set_tests_properties(test-qwen4exp-dflash-capture PROPERTIES
             FIXTURES_REQUIRED qwen4exp-dflash-fixture)
+        if (GGML_CUDA)
+            llama_build_and_test(test-dflash2-prefill-d2d.cpp LABEL cuda LINK llama ARGS
+                "${QWEN4EXP_DFLASH_FIXTURE_DIR}/qwen4exp-hc-target.gguf"
+                "${QWEN4EXP_DFLASH_FIXTURE_DIR}/dflash2-d2d-draft.gguf")
+            target_include_directories(test-dflash2-prefill-d2d PRIVATE ${PROJECT_SOURCE_DIR}/src)
+            set_tests_properties(test-dflash2-prefill-d2d PROPERTIES
+                FIXTURES_REQUIRED qwen4exp-dflash-fixture
+                SKIP_RETURN_CODE 77)
+        endif()
     endif()
 
     llama_build_and_test(test-reasoning-budget.cpp  LABEL behavior)

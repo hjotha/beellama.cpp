@@ -13446,6 +13446,10 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
             ggml_remote_attn_trace_scope rkva_decode("server_decode");
             rkva_decode.event.flags = 0x40000000u;
             rkva_decode.event.nq = uint32_t(batch.view.size());
+            if (slots.size() == 1 && !slots[0].bootstrap_pending &&
+                    (slots[0].state == SLOT_STATE_PROCESSING_PROMPT || slots[0].state == SLOT_STATE_DONE_PROMPT)) {
+                common_speculative_prepare_dflash2_prefill(spec.get(), batch.view);
+            }
             const int64_t trace_compute_start = dflash_trace_tick_us();
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
             const int64_t trace_compute_done = dflash_trace_tick_us();

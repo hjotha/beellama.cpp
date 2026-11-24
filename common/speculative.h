@@ -137,6 +137,7 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
 bool common_speculative_process(common_speculative * spec, const llama_batch & batch);
 
 bool common_speculative_process(common_speculative * spec, const common_batch & batch);
+void common_speculative_prepare_dflash2_prefill(common_speculative * spec, const common_batch & batch);
 
 // Managed resident weights, single-sequence, single-head MTP only. Call immediately after decoding this exact
 // token batch on the target with unmasked nextn embeddings enabled, instead of process().
