@@ -545,3 +545,14 @@ com o pico de 40.368 MiB. Com D2D, K-outer e radix ativos, o prefill
 28k ficou em **2.597,40 t/s**. A comparação no lote fixo manteve o
 mesmo hash nos braços host, D2D e D2D com as duas flags de kernel.
 [Validação em ub4096](../advisor-plans/004-strata-prefill-baseline.md#d2d-com-taps-do-grafo-alvo-em-ub4096)
+
+Na RTX 4070, o recorte com quatro camadas localizou três uploads FP32
+de entrada por ubatch, incluindo dois do ramo de entradas mistas em
+pedidos somente de texto. Levar as linhas Q3_K à GPU eliminou os três
+uploads e reproduziu os 64 vetores de logits em pp28k. Após aplicar a
+fusão MoE, PLE compacta e os ajustes de seleção, um trace completo
+registrou **1.666,45 ms** de prefill no BeeLlama e **972,40 ms** na
+Strata para os mesmos 28.547 tokens. FA/QSA e transferências continuam
+entre as diferenças mensuradas. O ponto de referência do modelo
+completo na A100 permanece **2.597,40 contra 4.932,87 t/s**.
+[Tempos, cobertura do trace e amostras locais](../advisor-plans/004-strata-prefill-baseline.md#trace-pareado-após-reduzir-os-uploads)
