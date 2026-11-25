@@ -322,6 +322,13 @@ void llama_model_qwen35::graph_base::build_output(ggml_tensor * cur, ggml_tensor
     cb(cur, "h_nextn", -1);
     res->t_h_nextn = cur;
 
+    // Keep KV/recurrent updates (and unmasked nextn hidden states) in the graph
+    // on output-free ubatches without running the full-ubatch LM head.
+    if (n_outputs == 0 && !cparams.embeddings) {
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
+
     if ((!cparams.embeddings_nextn_masked || cparams.n_capture_layers > 0) && inp_out_ids) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     }
