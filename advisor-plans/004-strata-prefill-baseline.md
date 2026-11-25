@@ -1611,3 +1611,26 @@ divergência quando o agrupamento coincide e que a diferença vem da mudança na
 uniões de 4 vs 8 queries (fronteiras de tiles de 32 células e partições
 Stream-K na reescalagem FP16 da softmax online, somada à troca Q8/F16 nos
 chunks 2–3). O protótipo segue experimental fora de `main`.
+
+#### 25/11/2026 — shim Strata no modelo completo e qualidade em 40 GB
+
+O A/B de quatro braços na A100-40GB (`stock`, `direct`, `stock-nograph`,
+`direct-nograph`) mostrou que o shim Strata, quando finalmente ativado com
+`GGML_CUDA_DISABLE_GRAPHS=1`, fica em **2.631,64 t/s** contra **2.696,85 t/s**
+do caminho nativo `K_OUTER` com os mesmos flags (-2,42%). O ganho isolado de
+9,41 vs 12,22 ms por iteração MoE não se traduz no prefill completo; o shim
+adiciona ~167 ms de sync. Não promovido.
+
+O braço de 2.699 t/s do handover anterior não usava o shim: a asserção do
+harness falhava depois da medição porque `GGML_CUDA_STRATA_RAW_Q2` exige
+`GGML_CUDA_DISABLE_GRAPHS`. O número segue válido para `inputrows + bounds`
+com MoE nativo.
+
+A qualidade do QSA 4×16 em `ub 2048` confirma divergência (max KL 1,48e-3,
+max delta NLL 6,82, argmax 1,0) e ganho de +1,99%, abaixo do piso de 3%.
+Segue experimental.
+
+O probe de qualidade agora roda em A100-40GB com `UB=2048`: o graph cai de
+4.330,99 para 2.166,24 MiB e cabe nos ~3.779 MiB livres. O braço `native`
+ficou bit-exact (`max_abs_delta_nll=0`). Detalhes em
+[`docs/agent-reports/strata-prefill-a100-shim-20261125.md`](../docs/agent-reports/strata-prefill-a100-shim-20261125.md).
