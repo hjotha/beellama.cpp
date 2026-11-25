@@ -1105,6 +1105,8 @@ struct llm_graph_params {
     // Chosen for this parent ubatch, after eligibility; zero is the legacy graph.
     uint32_t wavefront_tile_size = 0;
 
+    bool optimizer = false;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
