@@ -501,6 +501,40 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
     return cur;
 }
 
+class llm_graph_input_qwen4exp_token_rows : public llm_graph_input_i {
+public:
+    explicit llm_graph_input_qwen4exp_token_rows(const ggml_tensor * table) : table(table) {}
+
+    void set_input(const llama_ubatch * ubatch) override {
+        GGML_ASSERT(ubatch->token && !ubatch->embd && !ubatch->is_mixed());
+        GGML_ASSERT(ggml_nbytes(rows) == ubatch->n_tokens * table->nb[1]);
+        GGML_ASSERT(ggml_backend_buffer_is_host(rows->buffer) && ggml_backend_buffer_is_host(ids->buffer));
+
+        auto * dst = static_cast<char *>(rows->data);
+        const size_t row_size = table->nb[1];
+        const auto * src = static_cast<const char *>(table->data);
+        for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+            const llama_token token = ubatch->token[i];
+            GGML_ASSERT(token >= 0 && token < table->ne[1]);
+            std::memcpy(dst + i*row_size, src + token*row_size, row_size);
+        }
+        const int32_t first_row = 0;
+        ggml_backend_tensor_set(ids, &first_row, 0, sizeof(first_row));
+        LLAMA_LOG_DEBUG("Qwen4Exp packed token rows: tokens=%u bytes=%zu\n", ubatch->n_tokens, ggml_nbytes(rows));
+    }
+
+    bool can_reuse(const llm_graph_params & params) override {
+        return !params.optimizer && params.ubatch.token && !params.ubatch.embd &&
+                !params.ubatch.is_mixed() && ggml_nbytes(rows) == params.ubatch.n_tokens * table->nb[1];
+    }
+
+    ggml_tensor * rows = nullptr;
+    ggml_tensor * ids = nullptr;
+
+private:
+    const ggml_tensor * table;
+};
+
 llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_params & params) :
     llm_build_delta_net_base(params), model(model) {
     const int64_t hc = hparams.dsv4_hc_mult;
@@ -525,11 +559,61 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     ggml_tensor * ple_emb = nullptr;
     if (hparams.ple_n_heads > 0) {
         ple_emb = build_inp_ple(inp->mctx);
-        // make sure ple_emb and build_inp_embd are in the same graph split
-        ggml_build_forward_expand(gf, ple_emb);
     }
 
-    ggml_tensor * inpL = build_inp_embd(model.tok_embd);
+    ggml_tensor * inpL = nullptr;
+    static const bool packed_token_rows = [] {
+        const char * env = std::getenv("LLAMA_QWEN4EXP_TOKEN_ROWS");
+        return env && std::strcmp(env, "1") == 0;
+    }();
+    const auto * table = model.tok_embd;
+    // shortcut: single-CUDA-device Q3_K FlashNext prefill, extend after validating other placements and precisions.
+    if (packed_token_rows && sched && backend_cpu && !params.optimizer && params.gtype == LLM_GRAPH_TYPE_DEFAULT &&
+            n_tokens >= 512 && n_tokens <= 8192 && ubatch.token && !ubatch.embd && !ubatch.is_mixed() &&
+            !ubatch.embd_state && !ubatch.device_embd && loras->empty() && !hdmd && !exl3 &&
+            hparams.n_embd_inp() == 2560 && hparams.n_embd == 2560 && hparams.f_embedding_scale == 0.0f &&
+            static_cast<const llama_model_qwen4exp &>(model).params.stream_loader == nullptr &&
+            model.devices.size() == 1 && !backend_remote && cparams.offload_kqv &&
+            (model.split_mode() == LLAMA_SPLIT_MODE_NONE || model.split_mode() == LLAMA_SPLIT_MODE_LAYER) &&
+            table && table->type == GGML_TYPE_Q3_K && table->data && table->buffer &&
+            ggml_backend_buffer_is_host(table->buffer) && ggml_is_contiguous(table) &&
+            ggml_n_dims(table) == 2 && table->ne[0] == n_embd) {
+        const auto dev = model.devices.front().dev;
+        const auto reg = ggml_backend_dev_backend_reg(dev);
+        if (reg && std::strcmp(ggml_backend_reg_name(reg), "CUDA") == 0 &&
+                ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU &&
+                model.dev_layer(0) == dev) {
+            for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+                const auto backend = ggml_backend_sched_get_backend(sched, i);
+                if (ggml_backend_get_device(backend) != dev) {
+                    continue;
+                }
+                auto input = std::make_unique<llm_graph_input_qwen4exp_token_rows>(table);
+                input->rows = ggml_new_tensor_1d(ctx0, table->type, n_embd * n_tokens);
+                input->ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+                auto * cur = ggml_get_rows(ctx0, input->rows, input->ids);
+                if (!ggml_backend_supports_op(backend, cur)) {
+                    break;
+                }
+                ggml_set_name(input->rows, "inp_token_q3_k_flat");
+                ggml_set_name(input->ids, "inp_token_packed_index");
+                ggml_set_input(input->rows);
+                ggml_set_input(input->ids);
+                ggml_backend_sched_set_tensor_backend(sched, input->rows, backend_cpu);
+                ggml_backend_sched_set_tensor_backend(sched, input->ids, backend_cpu);
+                ggml_backend_sched_set_tensor_backend(sched, cur, backend);
+                cur = ggml_reshape_2d(ctx0, cur, n_embd, n_tokens);
+                res->add_input(std::move(input));
+                res->t_inp_embd = cur;
+                cb(cur, "embd", -1);
+                inpL = cur;
+                break;
+            }
+        }
+    }
+    if (!inpL) {
+        inpL = build_inp_embd(model.tok_embd);
+    }
     cb(inpL, "model.input_embed", -1);
     ggml_build_forward_expand(gf, inpL);
 
@@ -1431,11 +1515,15 @@ public:
     bool can_reuse(const llm_graph_params & params) override {
         mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx)->get_attn();
         const int64_t expected = (int64_t) model.hparams.ple_n_heads * params.ubatch.n_tokens;
+        if (packed) {
+            return packed->ne[0] == expected * model.hparams.ple_head_dim;
+        }
         return embd ? embd->ne[1] == expected : rows->ne[0] == expected;
     }
 
     ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]
     ggml_tensor * embd = nullptr;   // F32 [ple_head_dim, ple_n_heads * n_tokens] (EXL3 decoded on host)
+    ggml_tensor * packed = nullptr; // IQ4_NL rows concatenated into one row for CUDA dequantization
 
     const llama_model & model;
 
@@ -1619,6 +1707,22 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
 #endif
     }
 
+    if (packed) {
+        const auto * table = model.per_layer_tok_embd;
+        const size_t row_size = table->nb[1];
+        GGML_ASSERT(ggml_backend_buffer_is_host(packed->buffer));
+        GGML_ASSERT(ggml_nbytes(packed) == idx.size() * row_size);
+        auto * dst = static_cast<char *>(packed->data);
+        const auto * src = static_cast<const char *>(table->data);
+        for (size_t j = 0; j < idx.size(); ++j) {
+            GGML_ASSERT(idx[j] >= 0 && idx[j] < table->ne[1]);
+            std::memcpy(dst + j*row_size, src + size_t(idx[j])*row_size, row_size);
+        }
+        const int32_t first_row = 0;
+        ggml_backend_tensor_set(rows, &first_row, 0, sizeof(first_row));
+        return;
+    }
+
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
 }
 
@@ -1687,22 +1791,77 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
 
     const auto & qmodel = static_cast<const llama_model_qwen4exp &>(model);
     ggml_tensor * emb = nullptr;
+    bool packed_rows = false;
     if (qmodel.ple_exl3_bias) {
         ple_inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.ple_head_dim, n_heads * n_tokens);
         ggml_set_input(ple_inp->embd);
         emb = ple_inp->embd;
         res->add_input(std::move(ple_inp));
     } else {
-        ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
-        ggml_set_input(ple_inp->rows);
-        ggml_tensor * rows = ple_inp->rows;
-        res->add_input(std::move(ple_inp));
+        static const bool use_cuda_dequant = [] {
+            const char * env = std::getenv("LLAMA_PLE_CUDA_DEQUANT");
+            return env && std::strcmp(env, "1") == 0;
+        }();
+        auto * table = model.per_layer_tok_embd;
+        if (use_cuda_dequant && n_tokens > 32 && model.split_mode() != LLAMA_SPLIT_MODE_TENSOR &&
+                table->type == GGML_TYPE_IQ4_NL && model.can_prefetch.count(table) &&
+                table->data && table->buffer && ggml_backend_buffer_is_host(table->buffer) &&
+                ggml_is_contiguous(table)) {
+            for (const auto & layer : model.layers) {
+                if (!layer.ple_key || !layer.ple_value || !layer.ple_key->buffer || !layer.ple_value->buffer) {
+                    continue;
+                }
+                const auto buft = ggml_backend_buffer_get_type(layer.ple_key->buffer);
+                if (buft != ggml_backend_buffer_get_type(layer.ple_value->buffer) || ggml_backend_buft_is_host(buft)) {
+                    continue;
+                }
+                const auto dev = ggml_backend_buft_get_device(buft);
+                const auto reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+                if (!reg || std::strcmp(ggml_backend_reg_name(reg), "CUDA") != 0) {
+                    continue;
+                }
+                for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+                    const auto backend = ggml_backend_sched_get_backend(sched, i);
+                    if (ggml_backend_get_device(backend) != dev) {
+                        continue;
+                    }
+                    // Each IQ4_NL block has its own scale. Joining rows gives GET_ROWS a
+                    // super-block-aligned width even when each original row is only 160 wide.
+                    auto * packed = ggml_new_tensor_1d(ctx0, table->type, table->ne[0] * n_heads * n_tokens);
+                    auto * index = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+                    auto * dequant = ggml_get_rows(ctx0, packed, index);
+                    if (ggml_backend_supports_op(backend, dequant)) {
+                        ggml_set_input(packed);
+                        ggml_set_input(index);
+                        ggml_set_name(packed, "ple_packed_rows");
+                        ggml_set_name(index, "ple_packed_index");
+                        ggml_set_name(dequant, "ple_cuda_dequant");
+                        ggml_backend_sched_set_tensor_backend(sched, dequant, backend);
+                        ple_inp->packed = packed;
+                        ple_inp->rows = index;
+                        emb = dequant;
+                        packed_rows = true;
+                    }
+                    break;
+                }
+                break; // Qwen4Exp has one PLE layer.
+            }
+        }
 
-        // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
-        emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
+        if (!emb) {
+            ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
+            ggml_set_input(ple_inp->rows);
+            // Gather then flatten in the same head order as the reference.
+            emb = ggml_get_rows(ctx0, table, ple_inp->rows);
+        }
+        res->add_input(std::move(ple_inp));
     }
     emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);
     cb(emb, "ple_embd", -1);
+    if (!packed_rows) {
+        // Keep host PLE in the same split as host token embedding gathers.
+        ggml_build_forward_expand(gf, emb);
+    }
 
     return emb;
 }
@@ -1764,16 +1923,33 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
             ggml_reshape_3d(ctx0, normalized, hc_dim, n_seq_tokens, n_seqs),
             hist, hc_dim, il);
 
+    static const bool shared_transpose_enabled = [] {
+        const char * env = std::getenv("LLAMA_PLE_CONV_SHARED_TRANSPOSE");
+        return env && std::strcmp(env, "1") == 0;
+    }();
+    // Transpose once when the history is small enough to save copies across the taps.
+    ggml_tensor * channel_major = nullptr;
+    if (shared_transpose_enabled && kern > 2 && n_seq_tokens >= hist &&
+            qwen4exp_strata_backend_supported(model)) {
+        channel_major = ggml_cont(ctx0, ggml_transpose(ctx0, padded));
+    }
+
     ggml_tensor * conv_out = nullptr;
     for (int64_t k = 0; k < kern; ++k) {
         // tap k reads (kern-1-k)*dilation positions back
         const int64_t start = hist - (kern - 1 - k) * dil;
 
-        ggml_tensor * shifted = ggml_cont(ctx0,
-                ggml_transpose(ctx0,
-                        ggml_view_3d(ctx0, padded, n_seq_tokens, hc_dim, n_seqs,
-                                padded->nb[1], padded->nb[2],
-                                ggml_row_size(padded->type, start))));
+        ggml_tensor * shifted;
+        if (channel_major) {
+            shifted = ggml_view_3d(ctx0, channel_major, hc_dim, n_seq_tokens, n_seqs,
+                    channel_major->nb[1], channel_major->nb[2], start * channel_major->nb[1]);
+        } else {
+            shifted = ggml_cont(ctx0,
+                    ggml_transpose(ctx0,
+                            ggml_view_3d(ctx0, padded, n_seq_tokens, hc_dim, n_seqs,
+                                    padded->nb[1], padded->nb[2],
+                                    ggml_row_size(padded->type, start))));
+        }
 
         // column k of the [kern, hc_dim] kernel is one weight per channel
         ggml_tensor * wk = ggml_cont(ctx0,

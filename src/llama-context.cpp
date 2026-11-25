@@ -6424,6 +6424,7 @@ llm_graph_params llama_context::graph_params(
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
+        /*.optimizer   =*/ opt_ctx != nullptr,
     };
     if (!rkva_wavefront_fallback(result)) {
         result.wavefront_tile_size = cparams.rkva_wavefront_tile;
