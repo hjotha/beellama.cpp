@@ -12613,6 +12613,24 @@ private:
                                     const bool allow_native = native_auto_restore_enabled() && prompt_cache &&
                                         slot.task->n_tokens_shared == 0 &&
                                         native_stream_eligible(*slot.task, slot, false, native_error, true);
+                                    // Recurrent/hybrid state cannot rewind the live sequence: when the slot
+                                    // must roll back (LCP short of its tokens, or the whole prompt matches and
+                                    // a logits token is needed) the in-memory reuse is only the best checkpoint
+                                    // at or below the LCP. Gate disk restores on that, not on the raw LCP, or a
+                                    // resent prompt after a restored turn vetoes its own exact snapshot and
+                                    // cold-prefills (same rule as server_prompt_cache::load usable_prefix).
+                                    int n_keep_mem = n_past;
+                                    if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART &&
+                                            (n_past < (int) slot.prompt.n_tokens() ||
+                                             (n_past == (int) req.size() && !slot.just_restored))) {
+                                        n_keep_mem = 0;
+                                        for (const auto & c : slot.prompt.checkpoints) {
+                                            if (c->n_tokens > 0 && c->n_tokens <= n_past &&
+                                                    c->n_tokens < (int64_t) req.size() && c->pos_max < n_past) {
+                                                n_keep_mem = std::max(n_keep_mem, (int) c->n_tokens);
+                                            }
+                                        }
+                                    }
                                     if (auto cand = auto_index_lookup(req, allow_native)) {
                                         // auto_restore_into_slot may CLEAR the slot
                                         // (KV seq + prompt.tokens) and then have do_slot_restore FAIL
@@ -12628,7 +12646,7 @@ private:
                                         server_native_slot::retry_local_after_preflight(*cand,
                                             [&](const auto_cache_entry & selected) {
                                                 auto outcome = server_native_slot::automatic_restore_outcome::no_retry;
-                                                (void) auto_restore_into_slot(slot, selected, req, (int) n_past,
+                                                (void) auto_restore_into_slot(slot, selected, req, n_keep_mem,
                                                     &outcome, selected.state_path != cand->state_path);
                                                 return outcome;
                                             },
