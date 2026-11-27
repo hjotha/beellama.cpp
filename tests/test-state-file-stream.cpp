@@ -1093,6 +1093,60 @@ int main(int argc, char ** argv) {
         for (const auto & entry : std::filesystem::directory_iterator(dir)) {
             require(entry.path().filename().string().find(".tmp-") == std::string::npos, "temporary file leaked");
         }
+        {
+            const std::string cap_path = dir + "/captured-async.bin";
+            auto cap_params = llama_context_default_params();
+            cap_params.n_ctx = 512; cap_params.n_batch = cap_params.n_ubatch = 256;
+            cap_params.n_threads = cap_params.n_threads_batch = 2;
+            cap_params.type_k = cap_params.type_v = GGML_TYPE_Q4_0;
+            cap_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+            cap_params.offload_kqv = false;
+            llama_context_ptr cap_source(llama_init_from_model(model.get(), cap_params));
+            llama_context_ptr cap_dest(llama_init_from_model(model.get(), cap_params));
+            require(cap_source && cap_dest, "captured roundtrip contexts failed");
+            decode(cap_source.get(), tokens);
+            const float * cap_src_logits_ptr = llama_get_logits_ith(cap_source.get(), -1);
+            require(cap_src_logits_ptr != nullptr, "captured source logits missing");
+            const std::vector<float> cap_src_logits(cap_src_logits_ptr, cap_src_logits_ptr + n_vocab);
+            server_route_state_captured captured;
+            require(server_route_state_capture(cap_source.get(), 0, tokens, identity, cap_path,
+                    SIZE_MAX, 256, &cap_src_logits, captured),
+                    "server_route_state_capture failed");
+            require(captured.raw_state.size() >= 8 && captured.tokens == tokens,
+                    "captured snapshot state or tokens invalid");
+            const size_t cap_written = server_route_state_publish_captured(captured);
+            const auto cap_file = server_route_state_read(cap_path, SIZE_MAX, 1024, true);
+            require(cap_file.file_bytes == cap_written && cap_file.tokens == tokens &&
+                    cap_file.has_native_remote_marker && !cap_file.native_remote &&
+                    cap_file.logits_bytes == uint64_t(n_vocab) * sizeof(float),
+                    "captured snapshot manifest or checksum roundtrip failed");
+            std::vector<float> cap_restored_logits;
+            require(server_route_state_read_logits(cap_file, n_vocab, cap_restored_logits) &&
+                    cap_restored_logits == cap_src_logits,
+                    "captured snapshot logits roundtrip failed");
+            llama_tokens cap_out(tokens.size());
+            size_t cap_count = 0;
+            require(llama_state_seq_load_file_streaming(cap_dest.get(), cap_path.c_str(), 0,
+                        cap_out.data(), cap_out.size(), &cap_count,
+                        cap_file.state_bytes, cap_file.state_checksum) == cap_file.state_bytes &&
+                    cap_count == tokens.size() && cap_out == tokens,
+                    "captured snapshot streaming restore failed");
+            const llama_token cap_next = greedy(cap_source.get());
+            decode(cap_source.get(), {cap_next}, tokens.size());
+            decode(cap_dest.get(), {cap_next}, tokens.size());
+            const float * cap_live_next = llama_get_logits_ith(cap_source.get(), -1);
+            const float * cap_rest_next = llama_get_logits_ith(cap_dest.get(), -1);
+            require(cap_live_next && cap_rest_next, "captured continuation logits missing");
+            for (int i = 0; i < n_vocab; ++i) {
+                require(std::isfinite(cap_live_next[i]) && std::isfinite(cap_rest_next[i]) &&
+                        std::abs(cap_live_next[i] - cap_rest_next[i]) < 0.002f,
+                        "captured continuation logits diverged");
+            }
+            require(greedy(cap_source.get()) == greedy(cap_dest.get()),
+                    "captured continuation greedy token diverged");
+            std::filesystem::remove(cap_path);
+            std::cout << "PASS: server_route_state_capture + publish_captured roundtrip\n";
+        }
         std::cout << "PASS: corruption, truncation, incompatible layout, nonempty transaction, late I/O retry, atomic cleanup\n";
         std::cout << "Artifacts: " << dir << '\n';
         return 0;

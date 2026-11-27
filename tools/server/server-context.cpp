@@ -59,6 +59,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -3974,6 +3975,7 @@ public:
     }
 
     ~server_context_impl() {
+        stop_auto_save_worker();
         gpu_power.shutdown();
         if (!sleeping) {
             // destroy() is already called when entering sleeping state
@@ -4207,6 +4209,42 @@ private:
     // `cur_fp` is the live model fingerprint, computed once at load (only when enabled).
     auto_cache_index auto_idx;
     model_fp         cur_fp;
+
+    static constexpr size_t AUTO_SAVE_ASYNC_MAX_PENDING_JOBS = 2;
+    static constexpr size_t AUTO_SAVE_ASYNC_MAX_INFLIGHT_BYTES = 1024ULL * 1024 * 1024;
+    static constexpr size_t AUTO_SAVE_ASYNC_MAX_SINGLE_BYTES = 1536ULL * 1024 * 1024;
+
+    struct auto_save_async_job {
+        server_route_state_captured captured;
+        std::vector<uint64_t> block_hashes;
+        std::string reason;
+        std::string store_dir;
+        std::string current_model;
+        std::string current_layout;
+        int32_t max_count = 0;
+        int64_t max_bytes = 0;
+        uint64_t max_store_bytes = SIZE_MAX;
+        uint32_t max_store_tokens = 0;
+        uint32_t block = 256;
+        uint64_t workspace = 0;
+        size_t payload_bytes = 0;
+        int id_slot = -1;
+        int id_task = -1;
+        double capture_ms = 0.0;
+        bool split_prefix = false;
+    };
+
+    struct auto_save_async_state {
+        std::mutex mtx;
+        std::condition_variable cv;
+        std::deque<auto_save_async_job> queue;
+        std::unordered_set<std::string> inflight_paths;
+        size_t queued_bytes = 0;
+        size_t active_bytes = 0;
+        bool stop = false;
+        std::thread worker;
+    };
+    auto_save_async_state auto_save_async;
 
     // The ONE gate for the entire auto disk cache. When false, NO hook below does
     // any work (no scan, no hash, no alloc). This is invariant 1 - the first
@@ -4529,6 +4567,7 @@ private:
     }
 
     void destroy() {
+        stop_auto_save_worker();
         prompt_cache.reset();
         spec.reset();
         spec_init.reset();
@@ -5784,6 +5823,145 @@ private:
     // format. Calls occur at prompt checkpoints (including the synchronized
     // split-prefix prefill boundary), completion or slot release/reassign;
     // never between sampled generation tokens.
+    void ensure_auto_save_worker_started_locked() {
+        if (!auto_save_async.worker.joinable()) {
+            auto_save_async.stop = false;
+            auto_save_async.worker = std::thread([this]() {
+                auto_save_worker_loop();
+            });
+        }
+    }
+
+    void stop_auto_save_worker() {
+        std::thread to_join;
+        {
+            std::lock_guard<std::mutex> lk(auto_save_async.mtx);
+            if (!auto_save_async.worker.joinable()) {
+                return;
+            }
+            auto_save_async.stop = true;
+            auto_save_async.cv.notify_all();
+            to_join = std::move(auto_save_async.worker);
+        }
+        if (to_join.joinable()) {
+            to_join.join();
+        }
+        {
+            std::lock_guard<std::mutex> lk(auto_save_async.mtx);
+            auto_save_async.stop = false;
+        }
+    }
+
+    void auto_save_worker_loop() {
+        for (;;) {
+            auto_save_async_job job;
+            {
+                std::unique_lock<std::mutex> lk(auto_save_async.mtx);
+                auto_save_async.cv.wait(lk, [this]() {
+                    return auto_save_async.stop || !auto_save_async.queue.empty();
+                });
+                if (auto_save_async.queue.empty()) {
+                    if (auto_save_async.stop) {
+                        break;
+                    }
+                    continue;
+                }
+                job = std::move(auto_save_async.queue.front());
+                auto_save_async.queue.pop_front();
+                auto_save_async.queued_bytes -= std::min(auto_save_async.queued_bytes, job.payload_bytes);
+                auto_save_async.active_bytes += job.payload_bytes;
+            }
+
+            const auto finish_job = [&]() {
+                std::lock_guard<std::mutex> lk(auto_save_async.mtx);
+                auto_save_async.active_bytes -= std::min(auto_save_async.active_bytes, job.payload_bytes);
+                auto_save_async.inflight_paths.erase(job.captured.path);
+            };
+
+            try {
+                const int64_t io_started = ggml_time_us();
+                bool persisted = false;
+                bool index_entry = false;
+                size_t nwrite = 0;
+
+                {
+                    server_route_state_store_lock store(job.store_dir,
+                            server_route_state_store_lock_mode::exclusive);
+                    if (!store.acquired()) {
+                        SRV_WRN("auto-save async skipped: unified snapshot store is unavailable (%s)\n",
+                                job.store_dir.c_str());
+                    } else {
+                        bool already_exists = false;
+                        std::error_code exists_ec;
+                        if (std::filesystem::exists(job.captured.path, exists_ec) && !exists_ec) {
+                            try {
+                                const auto existing = server_route_state_read(
+                                        job.captured.path, job.max_store_bytes, job.max_store_tokens, false, &store);
+                                if (existing.model == job.current_model &&
+                                        common_prompt_cache_layout_reusable(existing.layout, job.current_layout) &&
+                                        existing.tokens == job.captured.tokens) {
+                                    already_exists = true;
+                                    index_entry = true;
+                                }
+                            } catch (const std::exception &) {
+                                already_exists = false;
+                            }
+                        }
+
+                        if (!already_exists) {
+                            auto limit_plan = std::make_shared<unified_snapshot_limit_plan>();
+                            limit_plan->dir = job.store_dir;
+                            limit_plan->store_lock = &store;
+                            limit_plan->just_written = job.captured.path;
+                            limit_plan->max_count = job.max_count;
+                            limit_plan->max_bytes = job.max_bytes;
+                            nwrite = server_route_state_publish_captured(job.captured,
+                                    [limit_plan](uint64_t incoming) { return limit_plan->prepare(incoming); },
+                                    [limit_plan]() { return limit_plan->commit(); }, &store, nullptr);
+                            persisted = true;
+                            index_entry = true;
+                        }
+                    }
+                }
+
+                if (index_entry) {
+                    std::lock_guard<std::mutex> lk(auto_idx.mtx);
+                    auto_cache_entry e{
+                        job.captured.path,
+                        (uint32_t) job.captured.tokens.size(),
+                        job.block,
+                        job.current_model,
+                        job.current_layout
+                    };
+                    if (!auto_idx.indexed_files.count(job.captured.path)) {
+                        for (uint64_t bh : job.block_hashes) {
+                            auto_index_insert_locked(job.block, bh, e);
+                        }
+                        auto_idx.indexed_files.insert(job.captured.path);
+                    }
+                    auto_index_drop_missing_locked();
+                    std::error_code mec;
+                    const auto dmt = std::filesystem::last_write_time(job.store_dir, mec);
+                    if (!mec) {
+                        auto_idx.dir_mtime = dmt;
+                    }
+                }
+
+                if (persisted) {
+                    LOG_INF("slot %12.*s: id %2d | task %d | auto-save: persisted unified snapshot reason=%s tokens=%zu bytes=%zu save_ms=%.3f workspace=%" PRIu64 " path=%s capture_ms=%.3f\n",
+                            12, "auto_save_sl", job.id_slot, job.id_task,
+                            job.reason.c_str(), job.captured.tokens.size(), nwrite,
+                            (ggml_time_us() - io_started) / 1000.0, job.workspace,
+                            job.captured.path.c_str(), job.capture_ms);
+                }
+            } catch (const std::exception & error) {
+                SRV_WRN("auto-save async: unified snapshot failed safely: %s\n", error.what());
+            }
+
+            finish_job();
+        }
+    }
+
     void auto_save_slot_if_useful(server_slot & slot, const char * reason = "discard",
             bool split_prefix = false) {
         if (llama_remote_native_kvarn_transient_active_seq(ctx_tgt, slot.id) ||
@@ -5867,7 +6045,105 @@ private:
                     return;
                 }
             }
+        } else {
+            std::lock_guard<std::mutex> lk(auto_idx.mtx);
+            if (auto_idx.indexed_files.count(fname)) {
+                return;
+            }
         }
+        {
+            std::lock_guard<std::mutex> lk(auto_save_async.mtx);
+            if (auto_save_async.inflight_paths.count(fname)) {
+                return;
+            }
+        }
+
+        const bool async_eligible =
+            !llama_remote_native_kvarn_transient_active(ctx_tgt) &&
+            !llama_remote_disk_snapshot_enabled(ctx_tgt);
+        if (async_eligible) {
+            const size_t est_bytes = llama_state_seq_get_size(ctx_tgt, slot.id);
+            if (est_bytes < 8) {
+                return;
+            }
+            if (est_bytes > AUTO_SAVE_ASYNC_MAX_SINGLE_BYTES) {
+                SLT_WRN(slot, "auto-save async skipped: snapshot size %zu exceeds async RAM cap\n", est_bytes);
+                return;
+            }
+            {
+                std::lock_guard<std::mutex> lk(auto_save_async.mtx);
+                while (!auto_save_async.queue.empty() &&
+                        (auto_save_async.queue.size() >= AUTO_SAVE_ASYNC_MAX_PENDING_JOBS ||
+                         auto_save_async.active_bytes + auto_save_async.queued_bytes + est_bytes > AUTO_SAVE_ASYNC_MAX_INFLIGHT_BYTES)) {
+                    auto dropped = std::move(auto_save_async.queue.front());
+                    auto_save_async.queue.pop_front();
+                    auto_save_async.queued_bytes -= std::min(auto_save_async.queued_bytes, dropped.payload_bytes);
+                    auto_save_async.inflight_paths.erase(dropped.captured.path);
+                }
+                if ((auto_save_async.active_bytes > 0 || !auto_save_async.queue.empty()) &&
+                        auto_save_async.active_bytes + auto_save_async.queued_bytes + est_bytes > AUTO_SAVE_ASYNC_MAX_INFLIGHT_BYTES) {
+                    SLT_WRN(slot, "auto-save async skipped: background writer busy (active=%zu queued=%zu incoming=%zu)\n",
+                            auto_save_async.active_bytes, auto_save_async.queued_bytes, est_bytes);
+                    return;
+                }
+            }
+            const std::vector<float> * logits =
+                !split_prefix && slot.logits_last_n_tokens == (int32_t) toks.size() && !slot.logits_last.empty()
+                    ? &slot.logits_last : nullptr;
+            auto_save_async_job job;
+            if (!server_route_state_capture(ctx_tgt, slot.id, toks, *adaptive_model_identity,
+                    fname, auto_store_max_bytes(), block, logits,
+                    job.captured, AUTO_SAVE_ASYNC_MAX_SINGLE_BYTES)) {
+                return;
+            }
+            job.capture_ms = (ggml_time_us() - save_started) / 1000.0;
+            job.block_hashes = bhs;
+            job.reason = reason ? reason : "discard";
+            job.store_dir = params_base.slot_save_path;
+            job.current_model = current_model;
+            job.current_layout = current_layout;
+            job.max_count = params_base.slot_save_max_count;
+            job.max_bytes = params_base.slot_save_max_bytes;
+            job.max_store_bytes = auto_store_max_bytes();
+            job.max_store_tokens = auto_store_max_tokens();
+            job.block = block;
+            job.workspace = workspace;
+            job.payload_bytes = job.captured.raw_state.size() + job.captured.logits.size() * sizeof(float);
+            job.id_slot = slot.id;
+            job.id_task = wtask->id;
+            job.split_prefix = split_prefix;
+            const double capture_ms = job.capture_ms;
+            const size_t payload_bytes = job.payload_bytes;
+            {
+                std::lock_guard<std::mutex> lk(auto_save_async.mtx);
+                if (auto_save_async.stop || auto_save_async.inflight_paths.count(fname)) {
+                    return;
+                }
+                while (!auto_save_async.queue.empty() &&
+                        (auto_save_async.queue.size() >= AUTO_SAVE_ASYNC_MAX_PENDING_JOBS ||
+                         auto_save_async.active_bytes + auto_save_async.queued_bytes + payload_bytes > AUTO_SAVE_ASYNC_MAX_INFLIGHT_BYTES)) {
+                    auto dropped = std::move(auto_save_async.queue.front());
+                    auto_save_async.queue.pop_front();
+                    auto_save_async.queued_bytes -= std::min(auto_save_async.queued_bytes, dropped.payload_bytes);
+                    auto_save_async.inflight_paths.erase(dropped.captured.path);
+                }
+                if ((auto_save_async.active_bytes > 0 || !auto_save_async.queue.empty()) &&
+                        auto_save_async.active_bytes + auto_save_async.queued_bytes + payload_bytes > AUTO_SAVE_ASYNC_MAX_INFLIGHT_BYTES) {
+                    SLT_WRN(slot, "auto-save async skipped: background writer busy after capture (active=%zu queued=%zu incoming=%zu)\n",
+                            auto_save_async.active_bytes, auto_save_async.queued_bytes, payload_bytes);
+                    return;
+                }
+                auto_save_async.inflight_paths.insert(fname);
+                auto_save_async.queued_bytes += payload_bytes;
+                auto_save_async.queue.push_back(std::move(job));
+                ensure_auto_save_worker_started_locked();
+            }
+            auto_save_async.cv.notify_one();
+            SLT_INF(slot, "auto-save: queued unified snapshot reason=%s tokens=%zu bytes=%zu capture_ms=%.3f workspace=%" PRIu64 " path=%s\n",
+                    reason, toks.size(), payload_bytes, capture_ms, workspace, fname.c_str());
+            return;
+        }
+
         std::error_code exists_ec;
         if (std::filesystem::exists(fname, exists_ec)) {
             if (auto existing = read_unified_snapshot(fname); existing &&

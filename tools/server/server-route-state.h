@@ -100,6 +100,37 @@ using server_route_state_staged_callback = std::function<bool(const char * stage
 using server_route_state_rotation_callback = std::function<bool(const char * staged_path,
         size_t staged_bytes, uint64_t incoming_bytes)>;
 
+struct server_route_state_captured {
+    std::string path;
+    uint64_t max_bytes = 0;
+    uint32_t index_block = 0;
+    uint32_t source_ctx = 0;
+    llama_pos position = -1;
+    llama_tokens tokens;
+    std::string layout;
+    server_model_identity identity;
+    std::vector<uint8_t> raw_state; // llama_state_seq_get_data payload (8B header + body)
+    std::vector<float> logits;      // optional copy of last-token logits
+};
+
+// Capture sequence state into RAM on the server loop thread without disk I/O.
+// Returns false when the sequence is ineligible for host-only RAM capture
+// (e.g. remote disk snapshot or native KVarN overflow active, or exceeds caps).
+bool server_route_state_capture(llama_context * ctx, llama_seq_id seq,
+        const llama_tokens & tokens, const server_model_identity & identity,
+        const std::string & path, uint64_t max_bytes, uint32_t index_block,
+        const std::vector<float> * logits,
+        server_route_state_captured & out,
+        size_t max_raw_bytes = SIZE_MAX);
+
+// Publish a previously RAM-captured snapshot to disk.
+// Thread-safe: does not access llama_context or server_slot.
+size_t server_route_state_publish_captured(const server_route_state_captured & captured,
+        const std::function<bool(uint64_t)> & before_publish = {},
+        const std::function<bool()> & after_publish = {},
+        server_route_state_store_lock * store_lock = nullptr,
+        server_route_state_lease * publication_lock = nullptr);
+
 size_t server_route_state_save(llama_context * ctx, llama_seq_id seq,
         const llama_tokens & tokens, const server_model_identity & identity,
         const std::string & path, uint64_t max_bytes, uint32_t index_block = 0,

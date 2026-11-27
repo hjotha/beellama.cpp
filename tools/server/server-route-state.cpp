@@ -122,6 +122,311 @@ static std::string publication_backup_path(const std::string & path) {
         }
     }
 }
+static bool checked_add_u64(uint64_t a, uint64_t b, uint64_t & result) {
+    if (b > UINT64_MAX - a) {
+        return false;
+    }
+    result = a + b;
+    return true;
+}
+
+static bool write_all_chunks(FILE * file, const void * data, size_t size) {
+    const char * ptr = static_cast<const char *>(data);
+    size_t left = size;
+    while (left > 0) {
+        const size_t chunk = std::min(left, buffer_size);
+        if (std::fwrite(ptr, 1, chunk, file) != chunk) {
+            return false;
+        }
+        ptr += chunk;
+        left -= chunk;
+    }
+    return true;
+}
+
+static std::string build_route_state_metadata(
+        const std::string & model_fp,
+        const std::string & layout,
+        uint32_t source_ctx,
+        llama_pos position,
+        size_t n_tokens,
+        size_t staged_bytes,
+        uint64_t state_checksum,
+        bool native_remote,
+        uint32_t native_split_p,
+        uint64_t logits_bytes,
+        uint64_t logits_checksum,
+        uint32_t logits_vocab,
+        uint32_t index_block) {
+    std::string metadata = json{
+        {"version", 1}, {"model", model_fp}, {"layout", layout},
+        {"source_ctx", source_ctx}, {"position", position}, {"n_tokens", n_tokens},
+        {"state_bytes", staged_bytes}, {"state_checksum", state_checksum},
+        {"native_remote", native_remote},
+        {"native_split_p", native_remote ? native_split_p : 0},
+        {"logits_offset", logits_bytes ? staged_bytes : 0}, {"logits_bytes", logits_bytes},
+        {"logits_checksum", logits_checksum}, {"logits_vocab", logits_vocab},
+        {"logits_tokens", logits_bytes ? n_tokens : 0},
+        {"index_block", index_block ? index_block : canonical_index_block}
+    }.dump();
+    if (metadata.size() > max_manifest) {
+        throw std::runtime_error("router manifest exceeds budget");
+    }
+    return metadata;
+}
+
+static void publish_temporary_atomically(
+        temporary_file & temporary,
+        const std::string & path,
+        const std::function<bool()> & after_publish) {
+    std::vector<publication_backup> backups;
+    bool rolled_back = false;
+    auto restore_backups = [&]() {
+        for (auto it = backups.rbegin(); it != backups.rend(); ++it) {
+            std::error_code restore_ec;
+            std::filesystem::rename(it->backup, it->original, restore_ec);
+            if (restore_ec) {
+                throw std::runtime_error("router state publication rollback failed: " + restore_ec.message());
+            }
+        }
+    };
+    auto rollback = [&]() {
+        if (rolled_back) {
+            return;
+        }
+        rolled_back = true;
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+        restore_backups();
+    };
+
+    bool retention_committed = false;
+    try {
+        for (const std::string & original : {path}) {
+            std::error_code ec;
+            if (std::filesystem::exists(original, ec)) {
+                if (ec) {
+                    throw std::runtime_error("router state publication backup inspection failed: " + ec.message());
+                }
+                publication_backup item{original, publication_backup_path(original)};
+                std::filesystem::rename(original, item.backup, ec);
+                if (ec) {
+                    throw std::runtime_error("router state publication backup failed: " + ec.message());
+                }
+                backups.push_back(std::move(item));
+            } else if (ec) {
+                throw std::runtime_error("router state publication backup inspection failed: " + ec.message());
+            }
+        }
+        publish_replace(temporary.path, path);
+        temporary.path.clear();
+        if (after_publish && !after_publish()) {
+            rollback();
+            throw std::runtime_error("router snapshot store retention commit failed");
+        }
+        retention_committed = true;
+        for (const auto & item : backups) {
+            std::error_code ec;
+            if (std::getenv("LLAMA_TEST_ROUTE_STATE_CLEANUP_FAIL")) {
+                ec = std::make_error_code(std::errc::permission_denied);
+            } else {
+                std::filesystem::remove(item.backup, ec);
+            }
+            if (ec) {
+                std::fprintf(stderr, "warning: router state committed, backup cleanup failed for %s: %s\n",
+                             item.backup.c_str(), ec.message().c_str());
+            }
+        }
+    } catch (...) {
+        if (!retention_committed && !rolled_back && !backups.empty()) {
+            rollback();
+        }
+        throw;
+    }
+}
+}
+
+bool server_route_state_capture(llama_context * ctx, llama_seq_id seq,
+        const llama_tokens & tokens, const server_model_identity & identity,
+        const std::string & path, uint64_t max_bytes, uint32_t index_block,
+        const std::vector<float> * logits,
+        server_route_state_captured & out,
+        size_t max_raw_bytes) {
+    out.raw_state.clear();
+    out.logits.clear();
+    if (!ctx || tokens.empty() || tokens.size() > UINT32_MAX) {
+        return false;
+    }
+    if (llama_remote_native_kvarn_transient_active(ctx) ||
+            llama_remote_disk_snapshot_enabled(ctx)) {
+        return false;
+    }
+    const llama_pos position = llama_memory_seq_pos_max(llama_get_memory(ctx), seq);
+    if (position < 0 || tokens.size() != size_t(position) + 1 ||
+            tokens.size() > llama_n_ctx_seq(ctx)) {
+        return false;
+    }
+    const size_t native_data = llama_state_seq_get_size(ctx, seq);
+    if (native_data < 8 || native_data > max_raw_bytes) {
+        return false;
+    }
+    uint64_t logits_bytes = 0;
+    if (logits != nullptr && !logits->empty()) {
+        if (logits->size() > UINT32_MAX || logits->size() > SIZE_MAX / sizeof(float)) {
+            return false;
+        }
+        logits_bytes = uint64_t(logits->size() * sizeof(float));
+    }
+    const uint64_t token_bytes = tokens.size() > UINT64_MAX / sizeof(llama_token)
+        ? UINT64_MAX : uint64_t(tokens.size()) * sizeof(llama_token);
+    uint64_t worst_case = native_data;
+    if (token_bytes == UINT64_MAX ||
+            !checked_add_u64(worst_case, logits_bytes, worst_case) ||
+            !checked_add_u64(worst_case, sizeof(uint32_t), worst_case) ||
+            !checked_add_u64(worst_case, token_bytes, worst_case) ||
+            !checked_add_u64(worst_case, max_manifest, worst_case) ||
+            !checked_add_u64(worst_case, footer_size, worst_case) ||
+            worst_case > max_bytes) {
+        return false;
+    }
+    out.raw_state.resize(native_data);
+    const size_t copied = llama_state_seq_get_data(ctx, out.raw_state.data(), out.raw_state.size(), seq);
+    if (copied < 8 || copied > out.raw_state.size()) {
+        out.raw_state.clear();
+        return false;
+    }
+    out.raw_state.resize(copied);
+    uint32_t got_magic = 0;
+    llama_seq_id got_seq = -1;
+    std::memcpy(&got_magic, out.raw_state.data(), sizeof(got_magic));
+    std::memcpy(&got_seq, out.raw_state.data() + sizeof(got_magic), sizeof(got_seq));
+    constexpr uint32_t expected_io_magic = 0xaf143cd8u;
+    if (got_magic != expected_io_magic || got_seq != seq) {
+        out.raw_state.clear();
+        return false;
+    }
+    out.path = path;
+    out.max_bytes = max_bytes;
+    out.index_block = index_block;
+    out.source_ctx = llama_n_ctx_seq(ctx);
+    out.position = position;
+    out.tokens = tokens;
+    out.layout = common_prompt_cache_layout(ctx);
+    out.identity = identity;
+    if (logits != nullptr && !logits->empty()) {
+        out.logits = *logits;
+    }
+    return true;
+}
+
+size_t server_route_state_publish_captured(const server_route_state_captured & captured,
+        const std::function<bool(uint64_t)> & before_publish,
+        const std::function<bool()> & after_publish,
+        server_route_state_store_lock * store_lock,
+        server_route_state_lease * publication_lock) {
+    std::unique_ptr<server_route_state_store_lock> owned_store;
+    if (store_lock == nullptr) {
+        const std::filesystem::path parent = std::filesystem::path(captured.path).parent_path();
+        owned_store = std::make_unique<server_route_state_store_lock>(parent.string());
+        store_lock = owned_store.get();
+    }
+    if (!store_lock->owns_exclusive_for(captured.path)) {
+        throw std::runtime_error("router snapshot store is busy");
+    }
+    if (!server_route_state_publication_allowed(captured.path, store_lock)) {
+        throw std::runtime_error("router cannot replace a native or unclassified snapshot");
+    }
+    if (publication_lock != nullptr && !publication_lock->acquired()) {
+        throw std::runtime_error("router state publication is busy");
+    }
+    captured.identity.verify_sources();
+    if (captured.tokens.empty() || captured.tokens.size() > UINT32_MAX ||
+            captured.raw_state.size() < 8 ||
+            captured.position < 0 || captured.tokens.size() != size_t(captured.position) + 1) {
+        throw std::runtime_error("router captured state is invalid");
+    }
+    const uint32_t file_header[3] = {
+        LLAMA_STATE_SEQ_MAGIC,
+        LLAMA_STATE_SEQ_VERSION,
+        (uint32_t) captured.tokens.size()
+    };
+    const size_t token_bytes = captured.tokens.size() * sizeof(llama_token);
+    const uint8_t * state_body = captured.raw_state.data() + 8;
+    const size_t state_body_bytes = captured.raw_state.size() - 8;
+    const size_t staged_bytes = sizeof(file_header) + token_bytes + state_body_bytes;
+
+    XXH64_state_t hash;
+    XXH64_reset(&hash, 0);
+    XXH64_update(&hash, file_header, sizeof(file_header));
+    if (token_bytes) {
+        XXH64_update(&hash, captured.tokens.data(), token_bytes);
+    }
+    if (state_body_bytes) {
+        XXH64_update(&hash, state_body, state_body_bytes);
+    }
+    const uint64_t state_checksum = XXH64_digest(&hash);
+
+    uint64_t logits_bytes = 0;
+    uint32_t logits_vocab = 0;
+    uint64_t logits_checksum = 0;
+    if (!captured.logits.empty()) {
+        if (captured.logits.size() > UINT32_MAX || captured.logits.size() > SIZE_MAX / sizeof(float)) {
+            throw std::runtime_error("router snapshot logits payload is too large");
+        }
+        logits_bytes = uint64_t(captured.logits.size() * sizeof(float));
+        logits_vocab = (uint32_t) captured.logits.size();
+        logits_checksum = XXH64(captured.logits.data(), (size_t) logits_bytes, 0);
+    }
+
+    const std::string metadata = build_route_state_metadata(
+        captured.identity.fingerprint(), captured.layout, captured.source_ctx,
+        captured.position, captured.tokens.size(), staged_bytes, state_checksum,
+        false, 0, logits_bytes, logits_checksum, logits_vocab, captured.index_block);
+
+    uint64_t admitted_total = staged_bytes;
+    if (!checked_add_u64(admitted_total, logits_bytes, admitted_total) ||
+            !checked_add_u64(admitted_total, metadata.size(), admitted_total) ||
+            !checked_add_u64(admitted_total, footer_size, admitted_total) ||
+            admitted_total > captured.max_bytes || admitted_total > SIZE_MAX) {
+        throw std::runtime_error("router state exceeds disk size budget");
+    }
+    if (before_publish && !before_publish(admitted_total)) {
+        throw std::runtime_error("router snapshot store budget rejected publication");
+    }
+
+    std::array<char, footer_size> footer;
+    put_u64(footer.data(), metadata.size());
+    put_u64(footer.data() + 8, XXH64(metadata.data(), metadata.size(), 0));
+    std::copy(magic.begin(), magic.end(), footer.begin() + 16);
+
+    temporary_file temporary(captured.path);
+    {
+        std::unique_ptr<FILE, decltype(&std::fclose)> file(ggml_fopen(temporary.path.c_str(), "wb"), &std::fclose);
+        if (!file ||
+                !write_all_chunks(file.get(), file_header, sizeof(file_header)) ||
+                (token_bytes && !write_all_chunks(file.get(), captured.tokens.data(), token_bytes)) ||
+                (state_body_bytes && !write_all_chunks(file.get(), state_body, state_body_bytes)) ||
+                (logits_bytes && !write_all_chunks(file.get(), captured.logits.data(), (size_t) logits_bytes)) ||
+                !write_all_chunks(file.get(), metadata.data(), metadata.size()) ||
+                !write_all_chunks(file.get(), footer.data(), footer.size()) ||
+                std::fflush(file.get()) != 0) {
+            throw std::runtime_error("router captured state write failed");
+        }
+#ifndef _WIN32
+        if (fsync(fileno(file.get())) != 0) { throw std::runtime_error("router state sync failed"); }
+#endif
+        if (std::fclose(file.release()) != 0) { throw std::runtime_error("router state close failed"); }
+    }
+
+    captured.identity.verify_sources();
+    if (std::getenv("LLAMA_TEST_ROUTE_STATE_PUBLISH_FAIL")) {
+        throw std::runtime_error("injected router state publication failure");
+    }
+    if (std::filesystem::file_size(temporary.path) != admitted_total || admitted_total > captured.max_bytes) {
+        throw std::runtime_error("router state file size mismatch");
+    }
+    publish_temporary_atomically(temporary, captured.path, after_publish);
+    return (size_t) admitted_total;
 }
 
 size_t server_route_state_save(llama_context * ctx, llama_seq_id seq,
@@ -321,77 +626,7 @@ size_t server_route_state_save(llama_context * ctx, llama_seq_id seq,
     // The earlier collision guard refuses every existing auxiliary pathname,
     // so no .logits/.meta/.ckpt/.ckpts sibling is moved or removed here. If
     // retention commit fails, restore the previous state.
-    std::vector<publication_backup> backups;
-    bool rolled_back = false;
-    auto restore_backups = [&]() {
-        for (auto it = backups.rbegin(); it != backups.rend(); ++it) {
-            std::error_code restore_ec;
-            std::filesystem::rename(it->backup, it->original, restore_ec);
-            if (restore_ec) {
-                throw std::runtime_error("router state publication rollback failed: " + restore_ec.message());
-            }
-        }
-    };
-    auto rollback = [&]() {
-        if (rolled_back) {
-            return;
-        }
-        rolled_back = true;
-        std::error_code ec;
-        std::filesystem::remove(path, ec);
-        restore_backups();
-    };
-
-    bool retention_committed = false;
-    try {
-        for (const std::string & original : {path}) {
-            std::error_code ec;
-            if (std::filesystem::exists(original, ec)) {
-                if (ec) {
-                    throw std::runtime_error("router state publication backup inspection failed: " + ec.message());
-                }
-                publication_backup item{original, publication_backup_path(original)};
-                std::filesystem::rename(original, item.backup, ec);
-                if (ec) {
-                    throw std::runtime_error("router state publication backup failed: " + ec.message());
-                }
-                backups.push_back(std::move(item));
-            } else if (ec) {
-                throw std::runtime_error("router state publication backup inspection failed: " + ec.message());
-            }
-        }
-        publish_replace(temporary.path, path);
-        temporary.path.clear();
-        if (after_publish && !after_publish()) {
-            rollback();
-            throw std::runtime_error("router snapshot store retention commit failed");
-        }
-        retention_committed = true;
-        for (const auto & item : backups) {
-            std::error_code ec;
-            if (std::getenv("LLAMA_TEST_ROUTE_STATE_CLEANUP_FAIL")) {
-                ec = std::make_error_code(std::errc::permission_denied);
-            } else {
-                std::filesystem::remove(item.backup, ec);
-            }
-            if (ec) {
-                // Publication and retention already committed. Report success
-                // for that state; retain the backup and block future writers
-                // until an operator inspects the unresolved artifact.
-                std::fprintf(stderr, "warning: router state committed, backup cleanup failed for %s: %s\n",
-                             item.backup.c_str(), ec.message().c_str());
-            }
-        }
-    } catch (...) {
-        // A failed rename/retention callback must restore any old object that
-        // was moved aside. Once retention has committed, cleanup of an old
-        // rollback file is housekeeping only: do not undo a valid new commit
-        // based on a second unlink failure.
-        if (!retention_committed && !rolled_back && !backups.empty()) {
-            rollback();
-        }
-        throw;
-    }
+    publish_temporary_atomically(temporary, path, after_publish);
     if (legacy_remote_disk) {
         const auto key = remote_hash.finish();
         // Standard Q4 bookkeeping is an optional accelerator: failure leaves
