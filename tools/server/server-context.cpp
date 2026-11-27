@@ -12644,6 +12644,7 @@ private:
                                                 return native_stream_eligible(*slot.task, slot, false, error, true);
                                             });
                                         n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
+                                        slot.n_prompt_tokens_lcp = n_past;
                                     }
                                 }
                                 if (slot.prompt_cleanup_failed) {
@@ -13345,6 +13346,16 @@ private:
 
                     const auto last_user_pos = spans.last_user_message_pos();
 
+                    // Divergence seam: checkpoint at the last stable boundary before the point where this
+                    // prompt diverged from the previous one. Clients that place a per-turn varying block
+                    // before a long stable tail (e.g. Claude Code system-reminders appended after the
+                    // user text) otherwise only get user-message checkpoints, which can all sit past the
+                    // divergence, so the next turn falls back to a much earlier checkpoint.
+                    const int32_t divergence_seam = [&]() {
+                        const int32_t seam = (slot.n_prompt_tokens_lcp / reuse_alignment) * reuse_alignment;
+                        return seam >= (int32_t) n_ubatch && seam < slot.task->n_tokens() ? seam : 0;
+                    }();
+
                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
                     const char * split_prefix_opt = std::getenv("LLAMA_SLOT_SAVE_SPLIT_PREFIX");
@@ -13464,6 +13475,10 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
                             }
                         }
 
+                        if (do_checkpoint && divergence_seam > 0 && slot.prompt.n_tokens() == divergence_seam) {
+                            break;
+                        }
+
                         // Split long prompts at a budgeted cadence so the durable
                         // checkpoint set covers historical edits even without
                         // structured message spans.
@@ -13535,6 +13550,7 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
                     const bool is_last_user_seam = is_user_seam &&
                             last_user_pos >= n_tokens_start && last_user_pos < n_tokens_start + reuse_alignment;
                     const bool is_last_user_message = n_tokens_start == last_user_pos;
+                    const bool is_divergence_seam = divergence_seam > 0 && n_tokens_start == divergence_seam;
                     const bool is_periodic_checkpoint = checkpoint_interval > 0 &&
                             n_tokens_start > 0 && n_tokens_start % checkpoint_interval == 0;
                     // entire prompt has been processed
@@ -13554,7 +13570,7 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
                         // message (standard caches), a group seam just before a user message (KVarN),
                         // a periodic anchor, or we are near the end of the prompt
-                        if (!is_user_start && !is_user_seam && !is_periodic_checkpoint && !near_prompt_end) {
+                        if (!is_user_start && !is_user_seam && !is_periodic_checkpoint && !near_prompt_end && !is_divergence_seam) {
                             do_checkpoint = false;
                         }
                     }
@@ -13576,13 +13592,17 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
                     // or the KVarN seam just before it
                     do_checkpoint = do_checkpoint && (
                             slot.prompt.checkpoints.empty() ||
-                            is_last_user_message || near_prompt_end || is_last_user_seam ||
+                            is_last_user_message || near_prompt_end || is_last_user_seam || is_divergence_seam ||
                             n_tokens_start >= slot.prompt.checkpoints.back()->n_tokens + checkpoint_min_step);
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
                     //       yet processed and therefore it is not part of the checkpoint.
                     if (do_checkpoint) {
+                        if (is_divergence_seam) {
+                            SLT_INF(slot, "divergence-seam checkpoint at n_tokens = %d (lcp = %d)\n",
+                                    divergence_seam, slot.n_prompt_tokens_lcp);
+                        }
                         create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
                     }
                 }
