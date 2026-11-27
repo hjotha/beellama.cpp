@@ -2883,6 +2883,24 @@ server_prompt_cache_result server_prompt_cache::load(server_prompt & prompt, con
     int best_lcp = prompt.tokens.get_common_prefix(tokens_new);
     float best_keep = prompt.tokens.empty() ? -1.0f : float(best_lcp) / prompt.tokens.size();
     bool best_complete = ctx_dft && !prompt.tokens.empty();
+    // Recurrent/hybrid state can only resume at a checkpoint at or below the LCP, so
+    // the usable prefix (not the raw LCP) is what a candidate actually saves. Without
+    // this, two snapshots with the same LCP tie and the older one (with fewer, earlier
+    // checkpoints) wins.
+    const auto usable_prefix = [&](const server_prompt & p, int lcp, bool host_only) -> int64_t {
+        if (lcp < p.n_tokens() || lcp == (int) tokens_new.size()) {
+            int64_t best_ck = 0;
+            for (const auto & c : p.checkpoints) {
+                if ((!host_only || c->host_only()) && c->n_tokens > 0 && c->n_tokens <= lcp &&
+                        c->n_tokens < (int64_t) tokens_new.size() && c->pos_max < lcp) {
+                    best_ck = std::max(best_ck, c->n_tokens);
+                }
+            }
+            return best_ck;
+        }
+        return lcp;
+    };
+    int64_t best_usable = info.managed ? usable_prefix(prompt, best_lcp, false) : best_lcp;
     const std::string target_layout = common_prompt_cache_layout(ctx_tgt);
     const std::string draft_layout = ctx_dft ? common_prompt_cache_layout(ctx_dft) : "";
     int rejected_lcp = -1;
@@ -2933,13 +2951,10 @@ server_prompt_cache_result server_prompt_cache::load(server_prompt & prompt, con
                 continue;
             }
         }
+        int64_t usable = lcp;
         if (!convertible_candidate && info.managed && (lcp < it->prompt.n_tokens() || lcp == (int) tokens_new.size())) {
-            const bool can_rewind = std::any_of(it->prompt.checkpoints.begin(), it->prompt.checkpoints.end(),
-                [&](const auto & c) {
-                    return c->host_only() && c->n_tokens > 0 && c->n_tokens <= lcp &&
-                        c->n_tokens < (int64_t) tokens_new.size() && c->pos_max < lcp;
-                });
-            if (!can_rewind) {
+            usable = usable_prefix(it->prompt, lcp, true);
+            if (usable == 0) {
                 reject("matching recurrent prefix has no usable checkpoint");
                 continue;
             }
@@ -2956,9 +2971,11 @@ server_prompt_cache_result server_prompt_cache::load(server_prompt & prompt, con
         }
         // Reuse the longest compatible prefix first; complete MTP state only breaks
         // ties so a short speculative entry cannot hide a much longer bootstrap hit.
-        if (lcp > best_lcp || (lcp == best_lcp && complete && !best_complete)) {
+        if (usable > best_usable || (usable == best_usable &&
+                (lcp > best_lcp || (lcp == best_lcp && complete && !best_complete)))) {
             best = it;
             best_lcp = lcp;
+            best_usable = usable;
             best_complete = complete;
         }
     }
