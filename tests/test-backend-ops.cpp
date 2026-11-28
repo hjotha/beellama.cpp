@@ -11101,6 +11101,10 @@ static const ggml_type other_types[] = {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // Native tiled Q4_0 KV loading for a one-query Ada GQA-6 decode.
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 8192, 1, true,
+        false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+
     for (int k : {5120, 12288, 17408}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 129, 1, k, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat_vec_fusion(

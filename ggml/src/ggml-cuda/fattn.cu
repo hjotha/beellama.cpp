@@ -1,3 +1,4 @@
+#include <atomic>
 #include "common.cuh"
 #include "fattn.cuh"
 #include "fattn-common.cuh"
@@ -411,6 +412,16 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
 }
 
 static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (ggml_cuda_fattn_native_q4_ada(ctx.device, dst)) {
+        static const bool trace = std::getenv("GGML_CUDA_FA_Q4_TRACE") != nullptr;
+        static std::atomic_flag traced = ATOMIC_FLAG_INIT;
+        if (trace && !traced.test_and_set()) {
+            std::fprintf(stderr, "CUDA native Q4 MMA active\n");
+        }
+        ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 1, 8>(ctx, dst);
+        return;
+    }
+
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const ggml_tensor * KQV  = dst;
     const ggml_tensor * Q    = dst->src[0];
@@ -993,6 +1004,55 @@ static bool ggml_cuda_q4_lse_geometry_supported(const ggml_tensor * dst) {
     return true;
 }
 
+bool ggml_cuda_fattn_native_q4_ada(int device, const ggml_tensor * dst) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED(device);
+    GGML_UNUSED(dst);
+    return false;
+#else
+    static const char * env = std::getenv("GGML_CUDA_FA_Q4_ADA");
+    if (!env || std::atoi(env) == 0 || ggml_cuda_batch_invariant() ||
+        ggml_cuda_info().devices[device].cc != GGML_CUDA_CC_ADA_LOVELACE ||
+        !dst || dst->op != GGML_OP_FLASH_ATTN_EXT || ggml_flash_attn_ext_has_lse_out(dst) ||
+        ggml_get_op_params_i32(dst, GGML_CUDA_FATTN_OP_PARAM_FORCE_VEC) ||
+        ggml_get_op_params_i32(dst, 4) != 0) {
+        return false;
+    }
+    const ggml_tensor * q = dst->src[0];
+    const ggml_tensor * k = dst->src[1];
+    const ggml_tensor * v = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+    if (!q || !k || !v || !mask || q->type != GGML_TYPE_F32 || q->ne[0] != 256 ||
+        q->ne[1] != 1 || q->ne[2] != 24 || q->ne[3] != 1 ||
+        k->ne[0] != 256 || k->ne[1] < 8192 || k->ne[1] % FATTN_KQ_STRIDE != 0 ||
+        k->ne[2] != 4 || k->ne[3] != 1 || !ggml_are_same_shape(k, v) ||
+        !ggml_cuda_block_tensor_valid(k, GGML_TYPE_Q4_0, sizeof(block_q4_0), 4) ||
+        !ggml_cuda_block_tensor_valid(v, GGML_TYPE_Q4_0, sizeof(block_q4_0), 4) ||
+        mask->type != GGML_TYPE_F16 || mask->ne[0] != k->ne[1] || mask->ne[1] < 1 ||
+        mask->ne[2] != 1 || mask->ne[3] != 1 || dst->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(dst) || v->view_src == k ||
+        (v->view_src && v->view_src == k->view_src && v->view_offs == k->view_offs)) {
+        return false;
+    }
+    for (int i = 4; i < GGML_MAX_SRC; ++i) {
+        if (dst->src[i]) {
+            return false;
+        }
+    }
+    for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+        if (q->nb[i] % 16 || mask->nb[i] % 16 || k->nb[i] % 4 || v->nb[i] % 4 ||
+            q->nb[i] > INT32_MAX || mask->nb[i] > INT32_MAX ||
+            k->nb[i] > INT32_MAX || v->nb[i] > INT32_MAX) {
+            return false;
+        }
+    }
+    float max_bias, softcap;
+    memcpy(&max_bias, reinterpret_cast<const char *>(dst->op_params) + sizeof(float), sizeof(float));
+    memcpy(&softcap, reinterpret_cast<const char *>(dst->op_params) + 2*sizeof(float), sizeof(float));
+    return max_bias == 0.0f && softcap == 0.0f;
+#endif
+}
+
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
     GGML_UNUSED(device); GGML_UNUSED(dst);
@@ -1150,6 +1210,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     if (mask && mask->ne[2] != 1) {
         return BEST_FATTN_KERNEL_NONE;
+    }
+
+    if (ggml_cuda_fattn_native_q4_ada(device, dst)) {
+        return BEST_FATTN_KERNEL_MMA_F16;
     }
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
@@ -1337,7 +1401,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
         case BEST_FATTN_KERNEL_MMA_F16:
             // The sparse Q8_0 kernel consumes the packed cache directly; every
             // other MMA case still needs the dense F16 conversion buffers.
-            if (!ggml_cuda_flash_attn_ext_uses_sparse_q8(device, dst)) {
+            if (!ggml_cuda_flash_attn_ext_uses_sparse_q8(device, dst) && !ggml_cuda_fattn_native_q4_ada(device, dst)) {
                 need_f16_K = true;
                 need_f16_V = true;
             }

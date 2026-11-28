@@ -1,3 +1,4 @@
+#include <atomic>
 #include "gated_delta_net.cuh"
 #include "../ggml-prefill-reference.h"
 #include "gated-delta-net-mma.cuh"
@@ -456,6 +457,12 @@ static void ggml_cuda_op_gated_delta_net_impl(
     // rows-indexed state read (src[6]): when set, src[5] is a 2D cache view and each
     // sequence reads its live state at row rows[seq] (stride = src_state->nb[1]).
     const ggml_tensor * src_rows = dst->src[6];
+    if (src_rows && std::getenv("GGML_CUDA_GDN_CONV_TRACE")) {
+        static std::atomic_flag traced = ATOMIC_FLAG_INIT;
+        if (!traced.test_and_set()) {
+            std::fprintf(stderr, "CUDA GDN direct state row active; fused_write=%d\n", int(cache != nullptr));
+        }
+    }
     const int *   rows_d         = src_rows ? (const int *) src_rows->data : nullptr;
     const int64_t state_row_size = src_rows ? (int64_t) (src_state->nb[1] / sizeof(float)) : 0;
     GGML_ASSERT(src_rows == nullptr || src_rows->type == GGML_TYPE_I32);

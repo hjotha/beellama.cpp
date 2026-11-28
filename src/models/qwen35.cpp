@@ -1162,7 +1162,12 @@ ggml_tensor * llama_model_qwen35::graph_base::build_layer_attn_linear(
     // GPU device in the model is Metal.
     static const bool gdn_state_rows_env = getenv("GGML_GDN_STATE_GATHER") == nullptr;
 
-    const bool gdn_state_rows = gdn_state_rows_env && gdn_state_rows_dev_ok && cparams.n_rs_seq > 0;
+    static const char * state_direct = std::getenv("GGML_GDN_CUDA_SINGLE_ROW");
+    const bool single_row_decode = state_direct && std::atoi(state_direct) != 0 &&
+        cparams.fused_gdn_ar && n_seq_tokens == 1 && n_seqs == 1 && mctx_cur->get_n_rs() == 1 &&
+        !tile_chain && model.layers[il].ffn_gate && model.layers[il].ffn_gate->type == GGML_TYPE_PTQ1_0;
+    const bool gdn_state_rows = gdn_state_rows_env && gdn_state_rows_dev_ok &&
+        (cparams.n_rs_seq > 0 || single_row_decode);
 
     ggml_tensor * state;
     if (gdn_state_rows) {

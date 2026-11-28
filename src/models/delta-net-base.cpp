@@ -583,9 +583,9 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 
     const bool keep = cparams.n_rs_seq > 0;
 
-    GGML_ASSERT(state_rows == nullptr || keep); // rows mode is a ring-path optimization
+    GGML_ASSERT(state_rows == nullptr || keep || (n_seqs == 1 && n_seq_tokens == 1));
 
-    if (!keep) {
+    if (!keep && !state_rows) {
         auto attn_out = build_delta_net(q, k, v, g, b, s, il);
         ggml_tensor * output    = attn_out.first;
         ggml_tensor * new_state = attn_out.second;
@@ -604,7 +604,9 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int64_t D = S_v * S_v * H_v;
     const int64_t K = cparams.n_rs_seq + 1;
     const int64_t n_written = std::min<int64_t>(n_seq_tokens, K);
-    build_rs_history(inp, ssm_states_all, hparams.n_embd_s(), n_written);
+    if (keep) {
+        build_rs_history(inp, ssm_states_all, hparams.n_embd_s(), n_written);
+    }
 
     const bool raw = gdn_raw_beta && gdn_raw_alpha && gdn_raw_dt_bias && gdn_raw_a;
     ggml_tensor * gg = raw ? gdn_raw_alpha : g;
@@ -646,7 +648,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 
     // op writes the last min(n_seq_tokens, K) snapshots; older slots were carried above
 
-    if (state_rows) {
+    if (state_rows && keep) {
         // rows mode: scatter the compact snapshot region [D, n_written*n_seqs]
         // (slot-major, starting right after the attention scores) into the
         // cache rows slot*mem_size + kv_head + seq -- same destinations as the

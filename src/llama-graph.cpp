@@ -8123,6 +8123,10 @@ ggml_tensor * llm_graph_context::build_rs_cache_view(
     // ordering), which is a graph-dependency refactor left as follow-up.
     llama_build_recurrent_zero(ctx0, gf, states, state_size, rs_zero);
 
+    if (n_rs == uint32_t(n_seqs)) {
+        return states;
+    }
+
     ggml_tensor * states_extra = ggml_get_rows(ctx0, states, inp->s_copy_extra);
     ggml_build_forward_expand(gf,
         ggml_cpy(ctx0,
