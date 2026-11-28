@@ -8015,6 +8015,15 @@ ggml_tensor * llm_graph_context::build_rs(
 
     ggml_tensor * states_all = ggml_get_rows(ctx0, states, state_copy);
 
+    // A single gathered row already has the requested shape. The convolution
+    // fusion can consume it directly when there are no extra states to copy.
+    static const char * gdn_conv = std::getenv("GGML_CUDA_GDN_CONV");
+    if (gdn_conv && std::atoi(gdn_conv) != 0 && !get_state_rows &&
+            n_rs == 1 && n_seqs == 1 && state_copy->ne[0] == 1) {
+        ggml_build_forward_expand(gf, states_all);
+        return states_all;
+    }
+
     ggml_tensor * output_states = get_state_rows ?
         get_state_rows(ctx0, states, state_copy_main) :
         ggml_view_2d(ctx0, states_all, state_size, n_seqs, states_all->nb[1], 0);

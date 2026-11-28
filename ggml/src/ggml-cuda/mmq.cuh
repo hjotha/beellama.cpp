@@ -926,7 +926,11 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
         case GGML_TYPE_PTQ1_0:
             return ggml_cuda_mmq_util_funcs(
                 -1, ggml_cuda_mmq_load_tiles_ptq1_0<type, J, fallback, false>,
+#ifdef TURING_MMA_AVAILABLE
+                ggml_cuda_mmq_vec_dot_ptq1_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>,
+#else
                 ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>,
+#endif
                 ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1, false>);
 #endif
         case GGML_TYPE_Q4_0:

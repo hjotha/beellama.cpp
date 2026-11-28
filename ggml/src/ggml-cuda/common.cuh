@@ -1599,6 +1599,7 @@ struct ggml_backend_cuda_context {
     std::string name;
     cudaEvent_t copy_event = nullptr;
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    std::unordered_map<const ggml_tensor *, const void *> ptq1_ada_q8_inputs;
     cudaStream_t moe_upload_stream = nullptr;
     cudaEvent_t moe_upload_reuse = nullptr;
     cudaEvent_t moe_upload_ready = nullptr;

@@ -1,5 +1,6 @@
 #include "mmvq.cuh"
 #include "mmvq-ptq1_0.cuh"
+#include "mmvq-ptq1-ada.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -1873,6 +1874,37 @@ void ggml_cuda_mul_mat_vec_q(
             CUDA_CHECK(cudaMemsetAsync((char *) src0->data + size_data, 0, size_alloc - size_data, stream));
         }
     }
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    // SoA has its own producer and consumer. Scaled, split, batched and
+    // batch-invariant calls continue through the existing PTQ1_0 layouts.
+    if (ggml_cuda_ptq1_ada_enabled(ctx) && src0->type == GGML_TYPE_PTQ1_0 && !ids && !input_scale &&
+        !(fusion && fusion->gate_input_scale) && ne11 == 1 && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
+        ne00 % QK_PTQ1_0 == 0) {
+        const auto quantized = ctx.ptq1_ada_q8_inputs.find(src1);
+        const int padded_cols = GGML_PAD(ne10, GGML_CUDA_PTQ1_K_PAD);
+        ggml_cuda_pool_alloc<block_q8_1> activation(ctx.pool());
+        const block_q8_1 * q8_input;
+        if (quantized != ctx.ptq1_ada_q8_inputs.end()) {
+            q8_input = static_cast<const block_q8_1 *>(quantized->second);
+        } else {
+            activation.alloc(padded_cols / QK8_1);
+            constexpr int threads = 256;
+            quantize_ptq1_0_ada<<<(padded_cols + threads - 1) / threads, threads, 0, stream>>>(
+                src1_d, reinterpret_cast<int32_t *>(activation.get()), ne10, padded_cols);
+            q8_input = activation.get();
+        }
+        const auto * weights = static_cast<const block_ptq1_0 *>(src0->data);
+        if (ne10 / QK_PTQ1_0 < 4 * WARP_SIZE) {
+            launch_ptq1_0_ada<true>(weights, q8_input, fusion_local, dst_d,
+                                   ne00 / QK_PTQ1_0, nb01 / ts_src0, ne01, stream);
+        } else {
+            launch_ptq1_0_ada<false>(weights, q8_input, fusion_local, dst_d,
+                                    ne00 / QK_PTQ1_0, nb01 / ts_src0, ne01, stream);
+        }
+        return;
+    }
+#endif
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
     const bool paired_input = fusion && fusion->gate_input_scale;

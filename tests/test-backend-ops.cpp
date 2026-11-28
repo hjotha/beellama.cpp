@@ -11100,6 +11100,16 @@ static const ggml_type other_types[] = {
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    for (int k : {5120, 12288, 17408}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 129, 1, k, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(
+            GGML_TYPE_PTQ1_0, GGML_GLU_OP_SWIGLU, 129, 1, k, false, 1, 1, false, true, true, false, {1, 1}));
+    }
+
+    // Exercise both PTQ1_0 MMQ tail tiles and a full Ada tile.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 129, 17, 5120, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 256, 128, 5120, {1, 1}, {1, 1}));
     const auto & standard_cache_types = common_kv_cache_types();
     std::default_random_engine rng(0);
 

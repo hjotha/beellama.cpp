@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "fwht.cuh"
+#include "ptq1-ada-q8.cuh"
 
 #include <cstdlib>
 
@@ -134,10 +135,10 @@ __global__ void fwht_cuda_smem(const T * src, float * dst, const int64_t n_rows,
 // Both leave most of the GPU idle at these shapes.
 #define FWHT_BLOCK_THREADS 256
 
-template <int N, int NT, typename T, bool has_signs>
+template <int N, int NT, typename T, bool has_signs, bool q8 = false>
 __launch_bounds__(NT, 1)
 __global__ void fwht_cuda_block(const T * src, float * dst, const int64_t n_rows, const float scale,
-                                const float * signs, const int n_blk) {
+                                const float * signs, const int n_blk, const int64_t real_rows = 0) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int NE        = N / NT;
     static_assert(NE >= 1 && N % NT == 0 && NT % warp_size == 0, "bad FWHT block shape");
@@ -150,7 +151,9 @@ __global__ void fwht_cuda_block(const T * src, float * dst, const int64_t n_rows
     }
 
     src += r * N;
-    dst += r * N;
+    if constexpr (!q8) {
+        dst += r * N;
+    }
 
     const int tid  = threadIdx.x;
     const int lane = tid % warp_size;
@@ -161,9 +164,11 @@ __global__ void fwht_cuda_block(const T * src, float * dst, const int64_t n_rows
     float reg[NE];
 #pragma unroll
     for (int i = 0; i < NE; ++i) {
-        reg[i] = fwht_load(src[i * NT + tid]) * scale;
+        reg[i] = (!q8 || r < real_rows) ? fwht_load(src[i * NT + tid]) * scale : 0.0f;
         if (has_signs) {
-            reg[i] *= signs_row[i * NT + tid];
+            if (!q8 || r < real_rows) {
+                reg[i] *= signs_row[i * NT + tid];
+            }
         }
     }
 
@@ -213,7 +218,14 @@ __global__ void fwht_cuda_block(const T * src, float * dst, const int64_t n_rows
 
 #pragma unroll
     for (int i = 0; i < NE; ++i) {
-        dst[i * NT + tid] = reg[i];
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        if constexpr (q8) {
+            ggml_cuda_store_ptq1_ada_q8(reg[i], reinterpret_cast<int32_t *>(dst), r*N + i*NT + tid);
+        } else
+#endif
+        {
+            dst[i * NT + tid] = reg[i];
+        }
     }
 }
 
@@ -259,16 +271,28 @@ static bool fwht_launch(ggml_backend_cuda_context & ctx, const T * src_d, float 
             } \
             return true; \
         }
-#define FWHT_BLOCK_CASE(NN) \
-        case NN: { \
-            const dim3 g((unsigned) rows, 1, 1), b(FWHT_BLOCK_THREADS, 1, 1); \
+#define FWHT_BLOCK_LAUNCH(NN, NTT) { \
+            const dim3 g((unsigned) rows, 1, 1), b(NTT, 1, 1); \
             const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(g, b, 0, stream); \
             if (signs) { \
-                ggml_cuda_kernel_launch(fwht_cuda_block<NN, FWHT_BLOCK_THREADS, T, true>,  lp, src_d, dst_d, rows, scale, signs, n_blk); \
+                ggml_cuda_kernel_launch(fwht_cuda_block<NN, NTT, T, true>,  lp, src_d, dst_d, rows, scale, signs, n_blk, int64_t(0)); \
             } else { \
-                ggml_cuda_kernel_launch(fwht_cuda_block<NN, FWHT_BLOCK_THREADS, T, false>, lp, src_d, dst_d, rows, scale, nullptr, 1); \
+                ggml_cuda_kernel_launch(fwht_cuda_block<NN, NTT, T, false>, lp, src_d, dst_d, rows, scale, nullptr, 1, int64_t(0)); \
             } \
             return true; \
+        }
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    const int nt = cc == GGML_CUDA_CC_ADA_LOVELACE ?
+        ggml_cuda_fwht_block_threads(n, rows) : FWHT_BLOCK_THREADS;
+#define FWHT_BLOCK_CASE(NN) \
+        case NN: { \
+            if constexpr (NN >= 1024) { \
+                if (nt == 1024) FWHT_BLOCK_LAUNCH(NN, 1024) \
+            } \
+            if constexpr (NN >= 512) { \
+                if (nt == 512) FWHT_BLOCK_LAUNCH(NN, 512) \
+            } \
+            FWHT_BLOCK_LAUNCH(NN, FWHT_BLOCK_THREADS) \
         }
     static const bool legacy = getenv("GGML_CUDA_FWHT_LEGACY") != nullptr;
     if (legacy) {
@@ -291,6 +315,7 @@ static bool fwht_launch(ggml_backend_cuda_context & ctx, const T * src_d, float 
 #undef FWHT_CASE
 #undef FWHT_SMEM_CASE
 #undef FWHT_BLOCK_CASE
+#undef FWHT_BLOCK_LAUNCH
         default:
             return false;
     }
@@ -327,6 +352,26 @@ static bool fwht_dispatch(ggml_backend_cuda_context & ctx, const ggml_tensor * s
     }
     return fwht_launch<half>(ctx, (const half *) src->data, dst_d, n, rows, scale, signs, n_blk);
 }
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+void ggml_cuda_fwht_ptq1_ada_q8(ggml_backend_cuda_context & ctx, const ggml_tensor * src,
+                               const ggml_tensor * signs, ggml_tensor * dst, int64_t k) {
+    constexpr int width = 1024;
+    const int64_t rows = k / width;
+    const int64_t padded_rows = GGML_PAD(k, GGML_CUDA_PTQ1_K_PAD) / width;
+    auto lp = ggml_cuda_kernel_launch_params(dim3(padded_rows), dim3(512), 0, ctx.stream());
+    constexpr float scale = 1.0f / 32.0f;
+    if (signs) {
+        ggml_cuda_kernel_launch(fwht_cuda_block<width, 512, float, true, true>, lp,
+            (const float *) src->data, (float *) dst->data, padded_rows, scale,
+            (const float *) signs->data, int(rows), rows);
+    } else {
+        ggml_cuda_kernel_launch(fwht_cuda_block<width, 512, float, false, true>, lp,
+            (const float *) src->data, (float *) dst->data, padded_rows, scale,
+            (const float *) nullptr, 1, rows);
+    }
+}
+#endif
 
 bool ggml_cuda_op_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * src, ggml_tensor * dst) {
     GGML_ASSERT(ggml_are_same_shape(src, dst));
